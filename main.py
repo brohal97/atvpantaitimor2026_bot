@@ -30,11 +30,11 @@ async def handle_photo(client, message):
     tarikh = now.strftime("%d/%m/%Y")
     jam = now.strftime("%I:%M %p").lower()   # contoh: 04:26 pm
 
-    # Gabungkan caption asal + tarikh/jam
+    # Gabungkan caption asal + Tarikh/Jam (dalam caption gambar)
     if caption_asal.strip():
-        caption_baru = f"{caption_asal}\n\nTarikh terkini : {tarikh}\nJam : {jam}"
+        caption_baru = f"{caption_asal}\n\nTarikh : {tarikh}\nJam : {jam}"
     else:
-        caption_baru = f"Tarikh terkini : {tarikh}\nJam : {jam}"
+        caption_baru = f"Tarikh : {tarikh}\nJam : {jam}"
 
     # Padam gambar asal (kalau boleh)
     try:
@@ -44,7 +44,7 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
-    # Hantar semula gambar DENGAN caption (tarikh/jam bergabung)
+    # Hantar semula gambar DENGAN caption (bergabung)
     await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_id,
@@ -53,4 +53,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
