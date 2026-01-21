@@ -1,8 +1,8 @@
 import os
 from copy import deepcopy
 from datetime import datetime
-
 import pytz
+
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -97,7 +97,7 @@ def keyboard_harga_125():
             temp = []
     if temp:
         rows.append(temp)
-    rows.append([InlineKeyboardButton("❌ BATAL", callback_data="cancel")])
+    rows.append([InlineKeyboardButton("❌ BATAL", callback_data="cancel_harga")])
     return InlineKeyboardMarkup(rows)
 
 # ================= CALLBACKS =================
@@ -115,10 +115,20 @@ async def pilih_qty(_, cb):
     await cb.message.edit_reply_markup(keyboard_qty(key))
     await cb.answer()
 
+@bot.on_callback_query(filters.regex("^back$"))
+async def back_to_produk(_, cb):
+    state = ORDER_STATE.get(cb.message.id)
+    if not state:
+        return await cb.answer("Rekod tiada", show_alert=True)
+    await cb.message.edit_reply_markup(keyboard_produk(state["items"]))
+    await cb.answer()
+
 @bot.on_callback_query(filters.regex("^qty_"))
 async def simpan_qty(client, cb):
     msg = cb.message
-    state = ORDER_STATE[msg.id]
+    state = ORDER_STATE.get(msg.id)
+    if not state:
+        return await cb.answer("State hilang", show_alert=True)
 
     _, key, qty = cb.data.split("_")
     state["items"][key] = int(qty)
@@ -133,11 +143,11 @@ async def simpan_qty(client, cb):
     await msg.delete()
     ORDER_STATE[new.id] = clone_state(state)
     ORDER_STATE.pop(msg.id)
-    await cb.answer("OK")
+    await cb.answer("Kuantiti disimpan")
 
 @bot.on_callback_query(filters.regex("^submit$"))
 async def submit(client, cb):
-    state = ORDER_STATE[cb.message.id]
+    state = ORDER_STATE.get(cb.message.id)
 
     new = await client.send_photo(
         chat_id=state["chat_id"],
@@ -153,7 +163,7 @@ async def submit(client, cb):
 
 @bot.on_callback_query(filters.regex("^harga_125_FULL$"))
 async def buka_harga_125(_, cb):
-    state = ORDER_STATE[cb.message.id]
+    state = ORDER_STATE.get(cb.message.id)
     qty = state["items"]["125_FULL"]
 
     await cb.message.edit_caption(
@@ -164,7 +174,7 @@ async def buka_harga_125(_, cb):
 
 @bot.on_callback_query(filters.regex("^harga_pilih_125_FULL_"))
 async def simpan_harga(client, cb):
-    state = ORDER_STATE[cb.message.id]
+    state = ORDER_STATE.get(cb.message.id)
     harga = cb.data.split("_")[-1]
     state["prices"]["125_FULL"] = f"RM{harga}"
 
@@ -179,6 +189,14 @@ async def simpan_harga(client, cb):
     ORDER_STATE[new.id] = clone_state(state)
     ORDER_STATE.pop(cb.message.id)
     await cb.answer("Harga disimpan")
+
+@bot.on_callback_query(filters.regex("^cancel_harga$"))
+async def cancel_harga(_, cb):
+    state = ORDER_STATE.get(cb.message.id)
+    await cb.message.edit_reply_markup(
+        keyboard_harga(state["items"], state["prices"])
+    )
+    await cb.answer("Batal")
 
 # ================= FOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
