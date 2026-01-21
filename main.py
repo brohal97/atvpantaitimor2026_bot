@@ -23,13 +23,6 @@ bot = Client(
 )
 
 # ================= TEMP STATE (RAM) =================
-# key = bot_message_id (mesej gambar yang bot hantar)
-# value = {
-#   "chat_id": int,
-#   "photo_id": str,
-#   "base_caption": str,   # hari | tarikh | jam
-#   "items": {produk_key: qty_int}
-# }
 ORDER_STATE = {}
 
 PRODUK_LIST = {
@@ -44,16 +37,13 @@ PRODUK_LIST = {
 }
 
 def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
-    """Butang produk yang belum dipilih"""
     rows = []
     for key, name in PRODUK_LIST.items():
         if key not in items_dict:
             rows.append([InlineKeyboardButton(name, callback_data=f"produk_{key}")])
-    # jika semua dah dipilih, tiada butang (return markup kosong / None di caller)
     return InlineKeyboardMarkup(rows)
 
 def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
-    """Butang kuantiti untuk produk tertentu"""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
@@ -67,16 +57,15 @@ def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
     ])
 
 def build_caption(base_caption: str, items_dict: dict) -> str:
-    """Caption akhir: base + senarai item"""
     lines = [base_caption]
     if items_dict:
-        lines.append("")  # line kosong
+        lines.append("")
         for k, q in items_dict.items():
             lines.append(f"{PRODUK_LIST.get(k, k)} | {q}")
     return "\n".join(lines)
 
 # ====== STEP A: tekan NAMA PRODUK ======
-@bot.on_callback_query(filters.regex("^hantar_detail$"))
+@bot.on_callback_query(filters.regex(r"^hantar_detail$"))
 async def senarai_produk(client, callback):
     msg_id = callback.message.id
     state = ORDER_STATE.get(msg_id)
@@ -89,7 +78,7 @@ async def senarai_produk(client, callback):
     await callback.answer()
 
 # ====== STEP B: tekan produk -> keluar kuantiti ======
-@bot.on_callback_query(filters.regex("^produk_"))
+@bot.on_callback_query(filters.regex(r"^produk_"))
 async def pilih_kuantiti(client, callback):
     msg_id = callback.message.id
     state = ORDER_STATE.get(msg_id)
@@ -97,12 +86,12 @@ async def pilih_kuantiti(client, callback):
         await callback.answer("Rekod tidak dijumpai. Sila hantar gambar semula.", show_alert=True)
         return
 
-    produk_key = callback.data.replace("produk_", "")
+    produk_key = callback.data.replace("produk_", "", 1)
     await callback.message.edit_reply_markup(reply_markup=build_qty_keyboard(produk_key))
     await callback.answer("Pilih kuantiti")
 
 # ====== STEP C: tekan kuantiti -> PADAM & HANTAR SEMULA ======
-@bot.on_callback_query(filters.regex("^qty_"))
+@bot.on_callback_query(filters.regex(r"^qty_"))
 async def simpan_qty_repost(client, callback):
     msg = callback.message
     old_msg_id = msg.id
@@ -112,9 +101,14 @@ async def simpan_qty_repost(client, callback):
         await callback.answer("Rekod tidak dijumpai. Sila hantar gambar semula.", show_alert=True)
         return
 
-    # parse qty data: qty_{produk_key}_{n}
-    _, produk_key, qty_str = callback.data.split("_", 2)
-    qty = int(qty_str)
+    # ✅ FIX: parse dari belakang supaya produk_key boleh ada underscore
+    try:
+        payload = callback.data[len("qty_"):]          # contoh: "125_FULL_2"
+        produk_key, qty_str = payload.rsplit("_", 1)   # => ("125_FULL", "2")
+        qty = int(qty_str)
+    except Exception:
+        await callback.answer("Format kuantiti tidak sah. Cuba tekan semula.", show_alert=True)
+        return
 
     # simpan item dipilih
     state["items"][produk_key] = qty
@@ -126,16 +120,16 @@ async def simpan_qty_repost(client, callback):
     keyboard_produk = build_produk_keyboard(state["items"])
     reply_markup = keyboard_produk if keyboard_produk.inline_keyboard else None
 
-    # cepat jawab callback dulu (elak loading lama)
+    # jawab callback cepat
     await callback.answer("Dikemaskini")
 
-    # padam mesej lama (mesej bot)
+    # padam mesej lama
     try:
         await msg.delete()
     except Exception:
         pass
 
-    # hantar semula mesej baru
+    # hantar semula
     new_msg = await client.send_photo(
         chat_id=state["chat_id"],
         photo=state["photo_id"],
@@ -143,35 +137,33 @@ async def simpan_qty_repost(client, callback):
         reply_markup=reply_markup
     )
 
-    # pindahkan state dari old_msg_id -> new_msg.id
+    # pindah state
     ORDER_STATE[new_msg.id] = {
         "chat_id": state["chat_id"],
         "photo_id": state["photo_id"],
         "base_caption": state["base_caption"],
-        "items": dict(state["items"])  # copy
+        "items": dict(state["items"])
     }
-    # buang state lama
     ORDER_STATE.pop(old_msg_id, None)
 
-# ================= FOTO (staff hantar gambar) =================
+# ================= FOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
     photo_id = message.photo.file_id
 
-    # Masa Malaysia
     tz = pytz.timezone("Asia/Kuala_Lumpur")
     now = datetime.now(tz)
 
     hari = ["Isnin", "Selasa", "Rabu", "Khamis", "Jumaat", "Sabtu", "Ahad"][now.weekday()]
-    tarikh = f"{now.day}/{now.month}/{now.year}"          # 1/1/2026
-    jam = now.strftime("%I:%M%p").lower()                 # 06:05pm
+    tarikh = f"{now.day}/{now.month}/{now.year}"
+    jam = now.strftime("%I:%M%p").lower()
     base_caption = f"{hari} | {tarikh} | {jam}"
 
     keyboard_awal = InlineKeyboardMarkup([
         [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]
     ])
 
-    # Padam gambar asal (jika ada permission)
+    # padam gambar asal
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -179,7 +171,6 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
-    # Repost gambar (mesej bot)
     sent = await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_id,
@@ -187,7 +178,6 @@ async def handle_photo(client, message):
         reply_markup=keyboard_awal
     )
 
-    # simpan state untuk mesej bot tersebut
     ORDER_STATE[sent.id] = {
         "chat_id": message.chat.id,
         "photo_id": photo_id,
