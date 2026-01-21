@@ -54,19 +54,18 @@ HARGA_PER_PAGE = 15  # 3 baris x 5 butang
 
 def build_caption(base_caption: str, items_dict: dict, prices_dict: dict | None = None) -> str:
     """
-    Caption akan jadi:
+    Caption:
     HARI | TARIKH | JAM
 
-    NAMA PRODUK | KUANTITI | HARGA
-    125 FULL SPEC | 2 | 2840
-    ...
+    125 FULL SPEC | 5 | 2840
+    125 BIG BODY | 2 | 2600
+    (TIADA header "NAMA PRODUK | KUANTITI | HARGA")
     """
     prices_dict = prices_dict or {}
 
     lines = [base_caption]
     if items_dict:
         lines.append("")
-        lines.append("NAMA PRODUK | KUANTITI | HARGA")
         for k, q in items_dict.items():
             nama = PRODUK_LIST.get(k, k)
             harga = prices_dict.get(k, "-")
@@ -449,5 +448,6 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
 
 
