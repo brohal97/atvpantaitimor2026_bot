@@ -188,4 +188,12 @@ async def handle_photo(client, message):
     )
 
     # simpan state untuk mesej bot tersebut
-    ORDER_ST_
+    ORDER_STATE[sent.id] = {
+        "chat_id": message.chat.id,
+        "photo_id": photo_id,
+        "base_caption": base_caption,
+        "items": {}
+    }
+
+if __name__ == "__main__":
+    bot.run()
