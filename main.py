@@ -4,6 +4,7 @@ from datetime import datetime
 import pytz
 from pyrogram import Client, filters
 from pyrogram.errors import MessageDeleteForbidden, ChatAdminRequired
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ================= ENV =================
 API_ID = int(os.getenv("API_ID", "0"))
@@ -30,29 +31,31 @@ async def handle_photo(client, message):
     tz = pytz.timezone("Asia/Kuala_Lumpur")
     now = datetime.now(tz)
 
-    # Nama hari dalam Bahasa Melayu
     hari_map = {
         0: "Isnin",
         1: "Selasa",
         2: "Rabu",
-        3: "khamis",
+        3: "Khamis",
         4: "Jumaat",
         5: "Sabtu",
         6: "Ahad"
     }
     hari = hari_map[now.weekday()]
 
-    # Tarikh & jam
     tarikh = now.strftime("%-d/%-m/%Y")      # 1/1/2026
     jam = now.strftime("%I:%M%p").lower()    # 10:10am
 
-    # Caption akhir
     cap_masa = f"{hari} | {tarikh} | {jam}"
 
     if caption_asal.strip():
         caption_baru = f"{caption_asal}\n\n{cap_masa}"
     else:
         caption_baru = cap_masa
+
+    # BUTANG sahaja (fungsi tekan buat kemudian)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("HANTAR DETAIL", callback_data="hantar_detail")]
+    ])
 
     # Padam gambar asal (jika ada permission)
     try:
@@ -62,13 +65,15 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
-    # Hantar semula gambar + caption
+    # Hantar semula gambar + caption + butang
     await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_id,
-        caption=caption_baru
+        caption=caption_baru,
+        reply_markup=keyboard
     )
 
 if __name__ == "__main__":
     bot.run()
+
 
