@@ -1,6 +1,5 @@
 import os
 import re
-import copy
 from datetime import datetime
 
 import pytz
@@ -25,7 +24,7 @@ bot = Client(
 )
 
 # ================= STATE =================
-# ORDER_STATE key = bot_message_id (mesej gambar bot)
+# ORDER_STATE key = bot_message_id (mesej GAMBAR yang bot hantar)
 # value = {
 #   "chat_id": int,
 #   "photo_id": str,
@@ -36,8 +35,8 @@ bot = Client(
 # }
 ORDER_STATE = {}
 
-# PENDING_PRICE key = prompt_message_id
-# value = {"bot_msg_id": int, "produk_key": str}
+# PENDING_PRICE key = prompt_message_id (mesej prompt ForceReply)
+# value = {"photo_msg_id": int, "produk_key": str}
 PENDING_PRICE = {}
 
 PRODUK_LIST = {
@@ -55,14 +54,13 @@ PRODUK_LIST = {
 def normalize_price(text: str) -> str:
     s = (text or "").strip()
     digits = re.sub(r"[^\d]", "", s)
-    return digits  # contoh: "RM2,950" -> "2950"
+    return digits
 
-def build_caption(base_caption: str, items_dict: dict, prices_dict: dict, stage: str) -> str:
+def build_caption(base_caption: str, items_dict: dict, prices_dict: dict, header: str = "") -> str:
     lines = []
-    if stage == "harga":
-        lines.append("[HARGA]")
+    if header:
+        lines.append(header)
         lines.append("")
-
     lines.append(base_caption)
 
     if items_dict:
@@ -73,7 +71,6 @@ def build_caption(base_caption: str, items_dict: dict, prices_dict: dict, stage:
                 lines.append(f"{nama} | {q} | {prices_dict[k]}")
             else:
                 lines.append(f"{nama} | {q}")
-
     return "\n".join(lines)
 
 def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
@@ -113,12 +110,8 @@ def build_harga_keyboard(items_dict: dict, prices_dict: dict) -> InlineKeyboardM
     return InlineKeyboardMarkup(rows)
 
 async def repost_photo(client, old_msg, state: dict, reply_markup):
-    caption_baru = build_caption(
-        state["base_caption"],
-        state["items"],
-        state["prices"],
-        state.get("stage", "produk")
-    )
+    header = "[HARGA]" if state.get("stage") == "harga" else ""
+    caption_baru = build_caption(state["base_caption"], state["items"], state["prices"], header=header)
 
     try:
         await old_msg.delete()
@@ -133,18 +126,8 @@ async def repost_photo(client, old_msg, state: dict, reply_markup):
     )
     return new_msg
 
-def deep_state(state: dict) -> dict:
-    # elak shared reference dict
-    return {
-        "chat_id": state["chat_id"],
-        "photo_id": state["photo_id"],
-        "base_caption": state["base_caption"],
-        "items": dict(state.get("items", {})),
-        "prices": dict(state.get("prices", {})),
-        "stage": state.get("stage", "produk"),
-    }
-
 # ================= CALLBACKS =================
+
 @bot.on_callback_query(filters.regex(r"^hantar_detail$"))
 async def senarai_produk(client, callback):
     msg_id = callback.message.id
@@ -153,7 +136,8 @@ async def senarai_produk(client, callback):
         await callback.answer("Rekod tidak dijumpai. Sila hantar gambar semula.", show_alert=True)
         return
 
-    await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
+    keyboard = build_produk_keyboard(state["items"])
+    await callback.message.edit_reply_markup(reply_markup=keyboard)
     await callback.answer()
 
 @bot.on_callback_query(filters.regex(r"^back_produk$"))
@@ -164,7 +148,8 @@ async def back_produk(client, callback):
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
 
-    await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
+    keyboard = build_produk_keyboard(state["items"])
+    await callback.message.edit_reply_markup(reply_markup=keyboard)
     await callback.answer()
 
 @bot.on_callback_query(filters.regex(r"^produk_"))
@@ -184,6 +169,7 @@ async def simpan_qty_repost(client, callback):
     msg = callback.message
     old_msg_id = msg.id
     state = ORDER_STATE.get(old_msg_id)
+
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
@@ -199,10 +185,12 @@ async def simpan_qty_repost(client, callback):
     state["items"][produk_key] = qty
     await callback.answer("Dikemaskini")
 
-    kb = build_produk_keyboard(state["items"])
-    new_msg = await repost_photo(client, msg, state, kb)
+    keyboard_produk = build_produk_keyboard(state["items"])
+    reply_markup = keyboard_produk if keyboard_produk.inline_keyboard else None
 
-    ORDER_STATE[new_msg.id] = deep_state(state)
+    new_msg = await repost_photo(client, msg, state, reply_markup)
+
+    ORDER_STATE[new_msg.id] = {**state}
     ORDER_STATE.pop(old_msg_id, None)
 
 @bot.on_callback_query(filters.regex(r"^submit$"))
@@ -210,6 +198,7 @@ async def submit_order(client, callback):
     msg = callback.message
     old_msg_id = msg.id
     state = ORDER_STATE.get(old_msg_id)
+
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
@@ -219,12 +208,14 @@ async def submit_order(client, callback):
         return
 
     state["stage"] = "harga"
-    await callback.answer("Isi harga…")
+    await callback.answer("Sila isi harga")
 
-    kb = build_harga_keyboard(state["items"], state["prices"])
-    new_msg = await repost_photo(client, msg, state, kb)
+    harga_keyboard = build_harga_keyboard(state["items"], state["prices"])
+    reply_markup = harga_keyboard if harga_keyboard.inline_keyboard else None
 
-    ORDER_STATE[new_msg.id] = deep_state(state)
+    new_msg = await repost_photo(client, msg, state, reply_markup)
+
+    ORDER_STATE[new_msg.id] = {**state}
     ORDER_STATE.pop(old_msg_id, None)
 
 @bot.on_callback_query(filters.regex(r"^harga_cancel$"))
@@ -235,31 +226,34 @@ async def harga_cancel(client, callback):
 async def harga_done(client, callback):
     await callback.answer("Semua harga sudah diisi.")
 
-# ===== Tekan HARGA -> bot hantar prompt (reply kepada gambar) + ForceReply =====
+# ===== Tekan HARGA -> bot hantar prompt reply kepada GAMBAR + ForceReply =====
 @bot.on_callback_query(filters.regex(r"^harga_"))
 async def minta_harga(client, callback):
-    bot_msg_id = callback.message.id
-    state = ORDER_STATE.get(bot_msg_id)
+    photo_msg_id = callback.message.id
+    state = ORDER_STATE.get(photo_msg_id)
+
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
 
     produk_key = callback.data.replace("harga_", "", 1)
     nama = PRODUK_LIST.get(produk_key, produk_key)
-    qty = state["items"].get(produk_key, 0)
+    qty = state["items"].get(produk_key, "")
 
-    # ✅ prompt reply kepada gambar + ForceReply (auto keluar reply bar)
+    # Prompt ini REPLY kepada GAMBAR (jadi thread jelas)
     prompt = await client.send_message(
         chat_id=state["chat_id"],
-        reply_to_message_id=bot_msg_id,   # reply pada gambar (ini yang buat UI nampak jelas)
         text=f"Sila taip harga untuk: {nama} | {qty} unit\nContoh: 2950 atau RM2950",
-        reply_markup=ForceReply()         # <-- jangan selective, lebih konsisten dalam group
+        reply_to_message_id=photo_msg_id,
+        reply_markup=ForceReply(selective=True)
     )
 
-    PENDING_PRICE[prompt.id] = {"bot_msg_id": bot_msg_id, "produk_key": produk_key}
-    await callback.answer("Sila taip harga…")
+    # Simpan mapping prompt -> gambar + produk
+    PENDING_PRICE[prompt.id] = {"photo_msg_id": photo_msg_id, "produk_key": produk_key}
 
-# ===== Terima harga (mesti reply pada prompt bot tadi) =====
+    await callback.answer("Taip harga (auto reply)")
+
+# ================= TERIMA HARGA (reply kepada prompt) =================
 @bot.on_message(filters.text & ~filters.bot)
 async def terima_harga(client, message):
     if not message.reply_to_message:
@@ -270,9 +264,10 @@ async def terima_harga(client, message):
     if not pending:
         return
 
-    bot_msg_id = pending["bot_msg_id"]
+    photo_msg_id = pending["photo_msg_id"]
     produk_key = pending["produk_key"]
-    state = ORDER_STATE.get(bot_msg_id)
+
+    state = ORDER_STATE.get(photo_msg_id)
     if not state:
         PENDING_PRICE.pop(prompt_id, None)
         return
@@ -283,7 +278,7 @@ async def terima_harga(client, message):
 
     state["prices"][produk_key] = harga
 
-    # padam mesej staff + prompt (kalau bot ada permission)
+    # padam mesej staff + prompt (kalau bot admin)
     try:
         await message.delete()
     except Exception:
@@ -294,20 +289,21 @@ async def terima_harga(client, message):
     except Exception:
         pass
 
-    # repost gambar terbaru
-    kb = build_harga_keyboard(state["items"], state["prices"])
-    reply_markup = kb if kb.inline_keyboard else None
+    # repost gambar dengan caption update & butang tinggal yang belum isi harga
+    harga_keyboard = build_harga_keyboard(state["items"], state["prices"])
+    reply_markup = harga_keyboard if harga_keyboard.inline_keyboard else None
 
     try:
-        old_photo_msg = await client.get_messages(state["chat_id"], bot_msg_id)
+        old_photo_msg = await client.get_messages(state["chat_id"], photo_msg_id)
     except Exception:
         PENDING_PRICE.pop(prompt_id, None)
         return
 
     new_msg = await repost_photo(client, old_photo_msg, state, reply_markup)
 
-    ORDER_STATE[new_msg.id] = deep_state(state)
-    ORDER_STATE.pop(bot_msg_id, None)
+    ORDER_STATE[new_msg.id] = {**state}
+    ORDER_STATE.pop(photo_msg_id, None)
+
     PENDING_PRICE.pop(prompt_id, None)
 
 # ================= FOTO =================
@@ -327,7 +323,6 @@ async def handle_photo(client, message):
         [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]
     ])
 
-    # padam gambar asal (jika bot ada permission)
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -353,4 +348,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
