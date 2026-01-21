@@ -22,8 +22,14 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ================= TEMP STORAGE =================
-# key = message_id, value = {"items": {produk: qty}}
+# ================= TEMP STATE (RAM) =================
+# key = bot_message_id (mesej gambar yang bot hantar)
+# value = {
+#   "chat_id": int,
+#   "photo_id": str,
+#   "base_caption": str,   # hari | tarikh | jam
+#   "items": {produk_key: qty_int}
+# }
 ORDER_STATE = {}
 
 PRODUK_LIST = {
@@ -34,35 +40,21 @@ PRODUK_LIST = {
     "HAMMER_ARM": "HAMMER ARMOUR",
     "BIG_HAMMER": "BIG HAMMER",
     "TROLI_BESI": "TROLI BESI",
-    "TROLI_PLASTIK": "TROLI PLASTIK"
+    "TROLI_PLASTIK": "TROLI PLASTIK",
 }
 
-# ====== STEP A ======
-@bot.on_callback_query(filters.regex("^hantar_detail$"))
-async def senarai_produk(client, callback):
-    msg_id = callback.message.id
-    ORDER_STATE.setdefault(msg_id, {"items": {}})
+def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
+    """Butang produk yang belum dipilih"""
+    rows = []
+    for key, name in PRODUK_LIST.items():
+        if key not in items_dict:
+            rows.append([InlineKeyboardButton(name, callback_data=f"produk_{key}")])
+    # jika semua dah dipilih, tiada butang (return markup kosong / None di caller)
+    return InlineKeyboardMarkup(rows)
 
-    items = ORDER_STATE[msg_id]["items"]
-
-    keyboard = [
-        [InlineKeyboardButton(name, callback_data=f"produk_{key}")]
-        for key, name in PRODUK_LIST.items()
-        if key not in items
-    ]
-
-    await callback.message.edit_reply_markup(
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    await callback.answer()
-
-# ====== STEP B ======
-@bot.on_callback_query(filters.regex("^produk_"))
-async def pilih_kuantiti(client, callback):
-    produk_key = callback.data.replace("produk_", "")
-    callback.message._selected_produk = produk_key  # simpan sementara
-
-    keyboard_qty = InlineKeyboardMarkup([
+def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
+    """Butang kuantiti untuk produk tertentu"""
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
             InlineKeyboardButton("2", callback_data=f"qty_{produk_key}_2"),
@@ -71,73 +63,129 @@ async def pilih_kuantiti(client, callback):
         [
             InlineKeyboardButton("4", callback_data=f"qty_{produk_key}_4"),
             InlineKeyboardButton("5", callback_data=f"qty_{produk_key}_5"),
-        ]
+        ],
     ])
 
-    await callback.message.edit_reply_markup(reply_markup=keyboard_qty)
+def build_caption(base_caption: str, items_dict: dict) -> str:
+    """Caption akhir: base + senarai item"""
+    lines = [base_caption]
+    if items_dict:
+        lines.append("")  # line kosong
+        for k, q in items_dict.items():
+            lines.append(f"{PRODUK_LIST.get(k, k)} | {q}")
+    return "\n".join(lines)
+
+# ====== STEP A: tekan NAMA PRODUK ======
+@bot.on_callback_query(filters.regex("^hantar_detail$"))
+async def senarai_produk(client, callback):
+    msg_id = callback.message.id
+    state = ORDER_STATE.get(msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai. Sila hantar gambar semula.", show_alert=True)
+        return
+
+    keyboard = build_produk_keyboard(state["items"])
+    await callback.message.edit_reply_markup(reply_markup=keyboard)
+    await callback.answer()
+
+# ====== STEP B: tekan produk -> keluar kuantiti ======
+@bot.on_callback_query(filters.regex("^produk_"))
+async def pilih_kuantiti(client, callback):
+    msg_id = callback.message.id
+    state = ORDER_STATE.get(msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai. Sila hantar gambar semula.", show_alert=True)
+        return
+
+    produk_key = callback.data.replace("produk_", "")
+    await callback.message.edit_reply_markup(reply_markup=build_qty_keyboard(produk_key))
     await callback.answer("Pilih kuantiti")
 
-# ====== STEP C ======
+# ====== STEP C: tekan kuantiti -> PADAM & HANTAR SEMULA ======
 @bot.on_callback_query(filters.regex("^qty_"))
-async def simpan_item(client, callback):
-    _, produk_key, qty = callback.data.split("_")
+async def simpan_qty_repost(client, callback):
     msg = callback.message
-    msg_id = msg.id
+    old_msg_id = msg.id
 
-    ORDER_STATE.setdefault(msg_id, {"items": {}})
-    ORDER_STATE[msg_id]["items"][produk_key] = int(qty)
+    state = ORDER_STATE.get(old_msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai. Sila hantar gambar semula.", show_alert=True)
+        return
 
-    # bina caption baru
-    base_caption = msg.caption.split("\n\n")[0]
-    lines = [base_caption, ""]
+    # parse qty data: qty_{produk_key}_{n}
+    _, produk_key, qty_str = callback.data.split("_", 2)
+    qty = int(qty_str)
 
-    for k, q in ORDER_STATE[msg_id]["items"].items():
-        lines.append(f"{PRODUK_LIST[k]} | {q}")
+    # simpan item dipilih
+    state["items"][produk_key] = qty
 
-    caption_baru = "\n".join(lines)
+    # caption baru
+    caption_baru = build_caption(state["base_caption"], state["items"])
 
-    # bina butang produk yang BELUM dipilih
-    keyboard = [
-        [InlineKeyboardButton(name, callback_data=f"produk_{key}")]
-        for key, name in PRODUK_LIST.items()
-        if key not in ORDER_STATE[msg_id]["items"]
-    ]
+    # keyboard produk balik semula (produk dipilih hilang)
+    keyboard_produk = build_produk_keyboard(state["items"])
+    reply_markup = keyboard_produk if keyboard_produk.inline_keyboard else None
 
-    await msg.edit_caption(
+    # cepat jawab callback dulu (elak loading lama)
+    await callback.answer("Dikemaskini")
+
+    # padam mesej lama (mesej bot)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    # hantar semula mesej baru
+    new_msg = await client.send_photo(
+        chat_id=state["chat_id"],
+        photo=state["photo_id"],
         caption=caption_baru,
-        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+        reply_markup=reply_markup
     )
 
-    await callback.answer("Produk ditambah")
+    # pindahkan state dari old_msg_id -> new_msg.id
+    ORDER_STATE[new_msg.id] = {
+        "chat_id": state["chat_id"],
+        "photo_id": state["photo_id"],
+        "base_caption": state["base_caption"],
+        "items": dict(state["items"])  # copy
+    }
+    # buang state lama
+    ORDER_STATE.pop(old_msg_id, None)
 
-# ================= FOTO =================
+# ================= FOTO (staff hantar gambar) =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
+    photo_id = message.photo.file_id
+
+    # Masa Malaysia
     tz = pytz.timezone("Asia/Kuala_Lumpur")
     now = datetime.now(tz)
 
-    hari = ["Isnin","Selasa","Rabu","Khamis","Jumaat","Sabtu","Ahad"][now.weekday()]
-    tarikh = now.strftime("%-d/%-m/%Y")
-    jam = now.strftime("%I:%M%p").lower()
+    hari = ["Isnin", "Selasa", "Rabu", "Khamis", "Jumaat", "Sabtu", "Ahad"][now.weekday()]
+    tarikh = f"{now.day}/{now.month}/{now.year}"          # 1/1/2026
+    jam = now.strftime("%I:%M%p").lower()                 # 06:05pm
+    base_caption = f"{hari} | {tarikh} | {jam}"
 
-    caption = f"{hari} | {tarikh} | {jam}"
-
-    keyboard = InlineKeyboardMarkup([
+    keyboard_awal = InlineKeyboardMarkup([
         [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]
     ])
 
+    # Padam gambar asal (jika ada permission)
     try:
         await message.delete()
-    except:
+    except (MessageDeleteForbidden, ChatAdminRequired):
+        pass
+    except Exception:
         pass
 
-    await client.send_photo(
+    # Repost gambar (mesej bot)
+    sent = await client.send_photo(
         chat_id=message.chat.id,
-        photo=message.photo.file_id,
-        caption=caption,
-        reply_markup=keyboard
+        photo=photo_id,
+        caption=base_caption,
+        reply_markup=keyboard_awal
     )
 
-if __name__ == "__main__":
-    bot.run()
-
+    # simpan state untuk mesej bot tersebut
+    ORDER_ST_
