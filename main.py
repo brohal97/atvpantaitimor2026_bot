@@ -22,6 +22,20 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
+# ====== STEP A: tekan NAMA PRODUK ======
+@bot.on_callback_query(filters.regex("^hantar_detail$"))
+async def pilih_produk(client, callback_query):
+    keyboard_produk = InlineKeyboardMarkup([
+        [InlineKeyboardButton("ATV 125cc Small Bull", callback_data="produk_125")],
+        [InlineKeyboardButton("ATV 200cc DTL", callback_data="produk_200")],
+        [InlineKeyboardButton("ATV XBL", callback_data="produk_xbl")],
+        [InlineKeyboardButton("Lain-lain", callback_data="produk_lain")]
+    ])
+
+    await callback_query.message.edit_reply_markup(reply_markup=keyboard_produk)
+    await callback_query.answer()
+
+# ================= FOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
     photo_id = message.photo.file_id
@@ -42,8 +56,8 @@ async def handle_photo(client, message):
     }
     hari = hari_map[now.weekday()]
 
-    tarikh = now.strftime("%-d/%-m/%Y")      # 1/1/2026
-    jam = now.strftime("%I:%M%p").lower()    # 10:10am
+    tarikh = now.strftime("%-d/%-m/%Y")
+    jam = now.strftime("%I:%M%p").lower()
 
     cap_masa = f"{hari} | {tarikh} | {jam}"
 
@@ -52,12 +66,12 @@ async def handle_photo(client, message):
     else:
         caption_baru = cap_masa
 
-    # BUTANG (tukaran teks kepada "NAMA PRODUK")
-    keyboard = InlineKeyboardMarkup([
+    # Butang awal
+    keyboard_awal = InlineKeyboardMarkup([
         [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]
     ])
 
-    # Padam gambar asal (jika ada permission)
+    # Padam gambar asal
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -65,14 +79,15 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
-    # Hantar semula gambar + caption + butang
+    # Repost gambar
     await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_id,
         caption=caption_baru,
-        reply_markup=keyboard
+        reply_markup=keyboard_awal
     )
 
 if __name__ == "__main__":
     bot.run()
+
 
