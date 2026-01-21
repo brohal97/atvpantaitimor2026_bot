@@ -16,22 +16,18 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-@bot.on_message(filters.photo)
+@bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
-    # 1) ambil file_id gambar + caption asal
     photo_id = message.photo.file_id
     caption = message.caption or ""
 
-    # 2) cuba padam gambar asal (akan gagal jika bot tiada permission / private chat limit)
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
-        # tak ada permission -> kita terus repost je tanpa delete
         pass
     except Exception:
         pass
 
-    # 3) hantar semula gambar yang sama
     await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_id,
@@ -40,3 +36,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
