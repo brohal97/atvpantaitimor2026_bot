@@ -29,7 +29,7 @@ bot = Client(
 #   "photo_id": str,
 #   "base_caption": str,   # hari | tarikh | jam
 #   "items": {produk_key: qty_int},
-#   "prices": {produk_key: harga_int}
+#   "prices": {produk_key: unit_price_int}   # <-- simpan harga SEUNIT
 # }
 ORDER_STATE = {}
 
@@ -57,8 +57,8 @@ def build_caption(base_caption: str, items_dict: dict, prices_dict: dict | None 
     Caption:
     HARI | TARIKH | JAM
 
-    125 FULL SPEC | 1 | 2540
-    YAMA SPORT | 1 | -
+    125 FULL SPEC | 2 | RM5100   (2550 x 2)
+    YAMA SPORT | 1 | RM2500      (2500 x 1)
     """
     prices_dict = prices_dict or {}
 
@@ -67,17 +67,24 @@ def build_caption(base_caption: str, items_dict: dict, prices_dict: dict | None 
         lines.append("")
         for k, q in items_dict.items():
             nama = PRODUK_LIST.get(k, k)
-            harga = prices_dict.get(k, "-")
-            lines.append(f"{nama} | {q} | {harga}")
+
+            unit_price = prices_dict.get(k)  # harga seunit
+            if unit_price is None:
+                harga_display = "-"
+            else:
+                try:
+                    total = int(unit_price) * int(q)
+                except Exception:
+                    total = unit_price  # fallback (kalau jadi pelik)
+                harga_display = f"RM{total}"
+
+            lines.append(f"{nama} | {q} | {harga_display}")
+
     return "\n".join(lines)
 
 
 def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
-    """
-    Papar butang produk yang belum dipilih + butang SUBMIT paling bawah (jika ada item dipilih).
-    """
     rows = []
-
     for key, name in PRODUK_LIST.items():
         if key not in items_dict:
             rows.append([InlineKeyboardButton(name, callback_data=f"produk_{key}")])
@@ -113,14 +120,12 @@ def build_harga_keyboard(items_dict: dict, prices_dict: dict | None = None) -> I
     prices_dict = prices_dict or {}
     rows = []
 
-    # hanya item belum ada harga
     for k in items_dict.keys():
         if k in prices_dict:
-            continue  # sorokkan butang harga untuk item yang dah dipilih
+            continue  # dah pilih harga -> sorok
         nama = PRODUK_LIST.get(k, k)
         rows.append([InlineKeyboardButton(f"HARGA - {nama}", callback_data=f"harga_{k}")])
 
-    # kalau semua item dah ada harga, tunjuk butang SIAP
     if items_dict and all(k in prices_dict for k in items_dict.keys()):
         rows.append([InlineKeyboardButton("✅ SIAP", callback_data="harga_done")])
 
@@ -129,9 +134,6 @@ def build_harga_keyboard(items_dict: dict, prices_dict: dict | None = None) -> I
 
 
 def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboardMarkup:
-    """
-    Tunjuk senarai harga 2500-3000 (step 10) dengan pagination.
-    """
     total = len(HARGA_LIST)
     start = page * HARGA_PER_PAGE
     end = start + HARGA_PER_PAGE
@@ -157,12 +159,7 @@ def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboar
     return InlineKeyboardMarkup(rows)
 
 
-async def repost_message(
-    client: Client,
-    old_msg,
-    state: dict,
-    reply_markup: InlineKeyboardMarkup | None
-):
+async def repost_message(client: Client, old_msg, state: dict, reply_markup: InlineKeyboardMarkup | None):
     caption_baru = build_caption(state["base_caption"], state["items"], state.get("prices", {}))
 
     try:
@@ -353,7 +350,7 @@ async def set_harga(client, callback):
     payload = callback.data[len("setharga_"):]
     try:
         produk_key, harga_str = payload.rsplit("_", 1)
-        harga = int(harga_str)
+        harga = int(harga_str)  # <-- harga seunit
     except Exception:
         await callback.answer("Format harga tidak sah.", show_alert=True)
         return
@@ -361,10 +358,9 @@ async def set_harga(client, callback):
     if "prices" not in state:
         state["prices"] = {}
 
-    state["prices"][produk_key] = harga
-    await callback.answer(f"Harga diset: {harga}")
+    state["prices"][produk_key] = harga  # simpan unit price
+    await callback.answer("Harga diset")
 
-    # lepas set harga -> balik menu harga (yang tinggal hanya item belum set)
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
     reply_markup = kb if kb.inline_keyboard else None
 
