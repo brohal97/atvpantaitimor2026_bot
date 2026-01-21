@@ -28,7 +28,8 @@ bot = Client(
 #   "chat_id": int,
 #   "photo_id": str,
 #   "base_caption": str,   # hari | tarikh | jam
-#   "items": {produk_key: qty_int}
+#   "items": {produk_key: qty_int},
+#   "prices": {produk_key: harga_int}
 # }
 ORDER_STATE = {}
 
@@ -43,13 +44,35 @@ PRODUK_LIST = {
     "TROLI_PLASTIK": "TROLI PLASTIK",
 }
 
-def build_caption(base_caption: str, items_dict: dict) -> str:
+# ================= HARGA LIST =================
+HARGA_START = 2500
+HARGA_END = 3000
+HARGA_STEP = 10
+HARGA_LIST = list(range(HARGA_START, HARGA_END + 1, HARGA_STEP))
+HARGA_PER_PAGE = 15  # 3 baris x 5 butang
+
+
+def build_caption(base_caption: str, items_dict: dict, prices_dict: dict | None = None) -> str:
+    """
+    Caption akan jadi:
+    HARI | TARIKH | JAM
+
+    NAMA PRODUK | KUANTITI | HARGA
+    125 FULL SPEC | 2 | 2840
+    ...
+    """
+    prices_dict = prices_dict or {}
+
     lines = [base_caption]
     if items_dict:
         lines.append("")
+        lines.append("NAMA PRODUK | KUANTITI | HARGA")
         for k, q in items_dict.items():
-            lines.append(f"{PRODUK_LIST.get(k, k)} | {q}")
+            nama = PRODUK_LIST.get(k, k)
+            harga = prices_dict.get(k, "-")
+            lines.append(f"{nama} | {q} | {harga}")
     return "\n".join(lines)
+
 
 def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
     """
@@ -68,6 +91,7 @@ def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(rows)
 
+
 def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -84,16 +108,56 @@ def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
         ]
     ])
 
-def build_harga_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
+
+def build_harga_keyboard(items_dict: dict, prices_dict: dict | None = None) -> InlineKeyboardMarkup:
     """
     Lepas SUBMIT: papar butang harga ikut item yang dipilih.
-    (Harga sebenar kita buat kemudian — sekarang placeholder)
+    Akan tunjuk ✅ jika harga item tu dah dipilih.
     """
+    prices_dict = prices_dict or {}
     rows = []
+
     for k in items_dict.keys():
         nama = PRODUK_LIST.get(k, k)
-        rows.append([InlineKeyboardButton(f"HARGA - {nama}", callback_data=f"harga_{k}")])
+        tanda = "✅ " if k in prices_dict else ""
+        rows.append([InlineKeyboardButton(f"{tanda}HARGA - {nama}", callback_data=f"harga_{k}")])
+
+    # kalau semua item dah ada harga, tunjuk butang SIAP
+    if items_dict and all(k in prices_dict for k in items_dict.keys()):
+        rows.append([InlineKeyboardButton("✅ SIAP", callback_data="harga_done")])
+
+    rows.append([InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboardMarkup:
+    """
+    Tunjuk senarai harga 2500-3000 (step 10) dengan pagination.
+    """
+    total = len(HARGA_LIST)
+    start = page * HARGA_PER_PAGE
+    end = start + HARGA_PER_PAGE
+    chunk = HARGA_LIST[start:end]
+
+    rows = []
+    for i in range(0, len(chunk), 5):
+        row_prices = chunk[i:i + 5]
+        rows.append([
+            InlineKeyboardButton(str(p), callback_data=f"setharga_{produk_key}_{p}")
+            for p in row_prices
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ PREV", callback_data=f"harga_page_{produk_key}_{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("NEXT ➡️", callback_data=f"harga_page_{produk_key}_{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("⬅️ BACK (HARGA MENU)", callback_data="back_harga_menu")])
+    return InlineKeyboardMarkup(rows)
+
 
 async def repost_message(
     client: Client,
@@ -105,7 +169,7 @@ async def repost_message(
     Padam mesej lama + hantar semula gambar dengan caption terkini + reply_markup.
     Return new message.
     """
-    caption_baru = build_caption(state["base_caption"], state["items"])
+    caption_baru = build_caption(state["base_caption"], state["items"], state.get("prices", {}))
 
     try:
         await old_msg.delete()
@@ -120,6 +184,7 @@ async def repost_message(
     )
     return new_msg
 
+
 # ====== STEP A: tekan NAMA PRODUK ======
 @bot.on_callback_query(filters.regex(r"^hantar_detail$"))
 async def senarai_produk(client, callback):
@@ -132,6 +197,7 @@ async def senarai_produk(client, callback):
     keyboard = build_produk_keyboard(state["items"])
     await callback.message.edit_reply_markup(reply_markup=keyboard)
     await callback.answer()
+
 
 # ====== BACK dari qty -> balik ke senarai produk ======
 @bot.on_callback_query(filters.regex(r"^back_produk$"))
@@ -146,6 +212,7 @@ async def back_produk(client, callback):
     await callback.message.edit_reply_markup(reply_markup=keyboard)
     await callback.answer()
 
+
 # ====== STEP B: tekan produk -> keluar kuantiti ======
 @bot.on_callback_query(filters.regex(r"^produk_"))
 async def pilih_kuantiti(client, callback):
@@ -158,6 +225,7 @@ async def pilih_kuantiti(client, callback):
     produk_key = callback.data.replace("produk_", "", 1)
     await callback.message.edit_reply_markup(reply_markup=build_qty_keyboard(produk_key))
     await callback.answer("Pilih kuantiti")
+
 
 # ====== STEP C: tekan kuantiti -> PADAM & HANTAR SEMULA (kembali ke senarai produk + SUBMIT) ======
 @bot.on_callback_query(filters.regex(r"^qty_"))
@@ -193,9 +261,11 @@ async def simpan_qty_repost(client, callback):
         "chat_id": state["chat_id"],
         "photo_id": state["photo_id"],
         "base_caption": state["base_caption"],
-        "items": dict(state["items"])
+        "items": dict(state["items"]),
+        "prices": dict(state.get("prices", {})),
     }
     ORDER_STATE.pop(old_msg_id, None)
+
 
 # ====== STEP D: tekan SUBMIT -> PADAM & HANTAR SEMULA + BUTANG HARGA ======
 @bot.on_callback_query(filters.regex(r"^submit$"))
@@ -215,7 +285,7 @@ async def submit_order(client, callback):
     await callback.answer("Submit...")
 
     # Lepas submit: tukar kepada butang HARGA ikut item dipilih
-    harga_keyboard = build_harga_keyboard(state["items"])
+    harga_keyboard = build_harga_keyboard(state["items"], state.get("prices", {}))
     reply_markup = harga_keyboard if harga_keyboard.inline_keyboard else None
 
     new_msg = await repost_message(client, msg, state, reply_markup)
@@ -225,9 +295,116 @@ async def submit_order(client, callback):
         "chat_id": state["chat_id"],
         "photo_id": state["photo_id"],
         "base_caption": state["base_caption"],
-        "items": dict(state["items"])
+        "items": dict(state["items"]),
+        "prices": dict(state.get("prices", {})),
     }
     ORDER_STATE.pop(old_msg_id, None)
+
+
+# ====== STEP E: tekan HARGA - {produk} -> keluar senarai harga 2500-3000 ======
+@bot.on_callback_query(filters.regex(r"^harga_"))
+async def buka_senarai_harga(client, callback):
+    msg_id = callback.message.id
+    state = ORDER_STATE.get(msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    produk_key = callback.data.replace("harga_", "", 1)
+    await callback.message.edit_reply_markup(reply_markup=build_select_harga_keyboard(produk_key, page=0))
+    await callback.answer("Pilih harga")
+
+
+# ====== Pagination harga ======
+@bot.on_callback_query(filters.regex(r"^harga_page_"))
+async def harga_pagination(client, callback):
+    msg_id = callback.message.id
+    state = ORDER_STATE.get(msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    # format: harga_page_{produk_key}_{page}
+    payload = callback.data[len("harga_page_"):]
+    try:
+        produk_key, page_str = payload.rsplit("_", 1)
+        page = int(page_str)
+    except Exception:
+        await callback.answer("Pagination tidak sah.", show_alert=True)
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=build_select_harga_keyboard(produk_key, page=page))
+    await callback.answer()
+
+
+# ====== BACK dari senarai harga -> balik ke menu harga ======
+@bot.on_callback_query(filters.regex(r"^back_harga_menu$"))
+async def back_harga_menu(client, callback):
+    msg_id = callback.message.id
+    state = ORDER_STATE.get(msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+
+# ====== pilih harga -> PADAM & HANTAR SEMULA (caption update + balik menu harga) ======
+@bot.on_callback_query(filters.regex(r"^setharga_"))
+async def set_harga(client, callback):
+    msg = callback.message
+    old_msg_id = msg.id
+
+    state = ORDER_STATE.get(old_msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    # format: setharga_{produk_key}_{harga}
+    payload = callback.data[len("setharga_"):]
+    try:
+        produk_key, harga_str = payload.rsplit("_", 1)
+        harga = int(harga_str)
+    except Exception:
+        await callback.answer("Format harga tidak sah.", show_alert=True)
+        return
+
+    if "prices" not in state:
+        state["prices"] = {}
+
+    state["prices"][produk_key] = harga
+    await callback.answer(f"Harga diset: {harga}")
+
+    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
+    reply_markup = kb if kb.inline_keyboard else None
+
+    new_msg = await repost_message(client, msg, state, reply_markup)
+
+    # pindah state ke message baru
+    ORDER_STATE[new_msg.id] = {
+        "chat_id": state["chat_id"],
+        "photo_id": state["photo_id"],
+        "base_caption": state["base_caption"],
+        "items": dict(state["items"]),
+        "prices": dict(state.get("prices", {})),
+    }
+    ORDER_STATE.pop(old_msg_id, None)
+
+
+# ====== SIAP (optional) ======
+@bot.on_callback_query(filters.regex(r"^harga_done$"))
+async def harga_done(client, callback):
+    msg_id = callback.message.id
+    state = ORDER_STATE.get(msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Siap ✅")
+
 
 # ================= FOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
@@ -265,9 +442,12 @@ async def handle_photo(client, message):
         "chat_id": message.chat.id,
         "photo_id": photo_id,
         "base_caption": base_caption,
-        "items": {}
+        "items": {},
+        "prices": {}
     }
+
 
 if __name__ == "__main__":
     bot.run()
+
 
