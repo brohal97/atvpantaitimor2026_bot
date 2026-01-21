@@ -1,12 +1,10 @@
 import os
-import re
 from copy import deepcopy
 from datetime import datetime
 
 import pytz
 from pyrogram import Client, filters
-from pyrogram.errors import MessageDeleteForbidden, ChatAdminRequired
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ================= ENV =================
 API_ID = int(os.getenv("API_ID", "0"))
@@ -14,7 +12,7 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
-    raise RuntimeError("Missing API_ID / API_HASH / BOT_TOKEN")
+    raise RuntimeError("Missing API credentials")
 
 # ================= BOT =================
 bot = Client(
@@ -24,10 +22,7 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ================= STATE =================
-ORDER_STATE = {}
-PENDING_PRICE = {}
-
+# ================= DATA =================
 PRODUK_LIST = {
     "125_FULL": "125 FULL SPEC",
     "125_BIG": "125 BIG BODY",
@@ -35,33 +30,32 @@ PRODUK_LIST = {
     "GY6": "GY6 200CC",
 }
 
-# ================= HELPERS =================
-def normalize_price(text: str) -> str:
-    digits = re.sub(r"[^\d]", "", text or "")
-    return f"RM{digits}" if digits else ""
+HARGA_125_FULL = [str(x) for x in range(2500, 3001, 10)]
 
-def build_caption(base_caption, items, prices):
-    lines = [base_caption, ""]
+ORDER_STATE = {}
+
+# ================= HELPERS =================
+def clone_state(s):
+    return {
+        "chat_id": s["chat_id"],
+        "photo_id": s["photo_id"],
+        "base_caption": s["base_caption"],
+        "items": deepcopy(s["items"]),
+        "prices": deepcopy(s["prices"]),
+    }
+
+def build_caption(base, items, prices):
+    lines = [base, ""]
     for k, q in items.items():
-        nama = PRODUK_LIST.get(k, k)
+        nama = PRODUK_LIST[k]
         if k in prices:
             lines.append(f"{nama} | {q} | {prices[k]}")
         else:
             lines.append(f"{nama} | {q}")
     return "\n".join(lines)
 
-def clone_state(state):
-    return {
-        "chat_id": state["chat_id"],
-        "photo_id": state["photo_id"],
-        "base_caption": state["base_caption"],
-        "items": deepcopy(state["items"]),
-        "prices": deepcopy(state["prices"]),
-        "stage": state["stage"],
-    }
-
 # ================= KEYBOARDS =================
-def produk_keyboard(items):
+def keyboard_produk(items):
     rows = []
     for k, n in PRODUK_LIST.items():
         if k not in items:
@@ -70,37 +64,55 @@ def produk_keyboard(items):
         rows.append([InlineKeyboardButton("✅ SUBMIT", callback_data="submit")])
     return InlineKeyboardMarkup(rows)
 
-def qty_keyboard(key):
+def keyboard_qty(k):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1", callback_data=f"qty_{key}_1"),
-         InlineKeyboardButton("2", callback_data=f"qty_{key}_2"),
-         InlineKeyboardButton("3", callback_data=f"qty_{key}_3")],
-        [InlineKeyboardButton("⬅️ KEMBALI", callback_data="back_produk")]
+        [
+            InlineKeyboardButton("1", callback_data=f"qty_{k}_1"),
+            InlineKeyboardButton("2", callback_data=f"qty_{k}_2"),
+            InlineKeyboardButton("3", callback_data=f"qty_{k}_3"),
+        ],
+        [InlineKeyboardButton("⬅️ KEMBALI", callback_data="back")]
     ])
 
-def harga_keyboard(items, prices):
+def keyboard_harga(items, prices):
     rows = []
     for k in items:
         if k not in prices:
-            rows.append([InlineKeyboardButton(
-                f"HARGA - {PRODUK_LIST.get(k)}",
-                callback_data=f"harga_{k}"
-            )])
+            rows.append([
+                InlineKeyboardButton(
+                    f"HARGA - {PRODUK_LIST[k]}",
+                    callback_data=f"harga_{k}"
+                )
+            ])
+    return InlineKeyboardMarkup(rows)
+
+def keyboard_harga_125():
+    rows, temp = [], []
+    for h in HARGA_125_FULL:
+        temp.append(
+            InlineKeyboardButton(f"RM{h}", callback_data=f"harga_pilih_125_FULL_{h}")
+        )
+        if len(temp) == 3:
+            rows.append(temp)
+            temp = []
+    if temp:
+        rows.append(temp)
+    rows.append([InlineKeyboardButton("❌ BATAL", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
 
 # ================= CALLBACKS =================
 @bot.on_callback_query(filters.regex("^hantar_detail$"))
-async def list_produk(_, cb):
+async def buka_produk(_, cb):
     state = ORDER_STATE.get(cb.message.id)
     if not state:
         return await cb.answer("Rekod tiada", show_alert=True)
-    await cb.message.edit_reply_markup(produk_keyboard(state["items"]))
+    await cb.message.edit_reply_markup(keyboard_produk(state["items"]))
     await cb.answer()
 
 @bot.on_callback_query(filters.regex("^produk_"))
 async def pilih_qty(_, cb):
     key = cb.data.replace("produk_", "")
-    await cb.message.edit_reply_markup(qty_keyboard(key))
+    await cb.message.edit_reply_markup(keyboard_qty(key))
     await cb.answer()
 
 @bot.on_callback_query(filters.regex("^qty_"))
@@ -108,33 +120,30 @@ async def simpan_qty(client, cb):
     msg = cb.message
     state = ORDER_STATE[msg.id]
 
-    payload = cb.data.replace("qty_", "")
-    key, qty = payload.rsplit("_", 1)
+    _, key, qty = cb.data.split("_")
     state["items"][key] = int(qty)
-
-    await cb.answer("OK")
 
     new = await client.send_photo(
         chat_id=state["chat_id"],
         photo=state["photo_id"],
         caption=build_caption(state["base_caption"], state["items"], state["prices"]),
-        reply_markup=produk_keyboard(state["items"])
+        reply_markup=keyboard_produk(state["items"])
     )
 
     await msg.delete()
     ORDER_STATE[new.id] = clone_state(state)
     ORDER_STATE.pop(msg.id)
+    await cb.answer("OK")
 
 @bot.on_callback_query(filters.regex("^submit$"))
-async def submit(_, cb):
+async def submit(client, cb):
     state = ORDER_STATE[cb.message.id]
-    state["stage"] = "harga"
 
-    new = await cb.message._client.send_photo(
+    new = await client.send_photo(
         chat_id=state["chat_id"],
         photo=state["photo_id"],
         caption=build_caption(state["base_caption"], state["items"], state["prices"]),
-        reply_markup=harga_keyboard(state["items"], state["prices"])
+        reply_markup=keyboard_harga(state["items"], state["prices"])
     )
 
     await cb.message.delete()
@@ -142,65 +151,34 @@ async def submit(_, cb):
     ORDER_STATE.pop(cb.message.id)
     await cb.answer()
 
-# ================= 🔥 FORCE REPLY TRIK =================
-@bot.on_callback_query(filters.regex("^harga_"))
-async def harga_prompt(client, cb):
-    bot_msg_id = cb.message.id
-    state = ORDER_STATE[bot_msg_id]
+@bot.on_callback_query(filters.regex("^harga_125_FULL$"))
+async def buka_harga_125(_, cb):
+    state = ORDER_STATE[cb.message.id]
+    qty = state["items"]["125_FULL"]
 
-    key = cb.data.replace("harga_", "")
-    nama = PRODUK_LIST[key]
-    qty = state["items"][key]
-
-    prompt = await client.send_message(
-        chat_id=state["chat_id"],
-        text=f"Masukkan harga:\n{nama} | {qty} unit",
-        reply_to_message_id=bot_msg_id,   # 🔥 ATTACH KE GAMBAR
-        reply_markup=ForceReply(selective=False)
+    await cb.message.edit_caption(
+        caption=f"{state['base_caption']}\n\nPilih harga:\n125 FULL SPEC | {qty} unit",
+        reply_markup=keyboard_harga_125()
     )
-
-    PENDING_PRICE[prompt.id] = {
-        "bot_msg_id": bot_msg_id,
-        "produk_key": key
-    }
-
     await cb.answer()
 
-# ================= TERIMA HARGA =================
-@bot.on_message(filters.text & ~filters.bot)
-async def terima_harga(client, msg):
-    if not msg.reply_to_message:
-        return
+@bot.on_callback_query(filters.regex("^harga_pilih_125_FULL_"))
+async def simpan_harga(client, cb):
+    state = ORDER_STATE[cb.message.id]
+    harga = cb.data.split("_")[-1]
+    state["prices"]["125_FULL"] = f"RM{harga}"
 
-    pending = PENDING_PRICE.get(msg.reply_to_message.id)
-    if not pending:
-        return
-
-    state = ORDER_STATE[pending["bot_msg_id"]]
-    harga = normalize_price(msg.text)
-    if not harga:
-        return
-
-    state["prices"][pending["produk_key"]] = harga
-
-    try:
-        await msg.delete()
-        await msg.reply_to_message.delete()
-    except:
-        pass
-
-    old = await client.get_messages(state["chat_id"], pending["bot_msg_id"])
     new = await client.send_photo(
         chat_id=state["chat_id"],
         photo=state["photo_id"],
         caption=build_caption(state["base_caption"], state["items"], state["prices"]),
-        reply_markup=harga_keyboard(state["items"], state["prices"])
+        reply_markup=keyboard_harga(state["items"], state["prices"])
     )
 
-    await old.delete()
+    await cb.message.delete()
     ORDER_STATE[new.id] = clone_state(state)
-    ORDER_STATE.pop(pending["bot_msg_id"])
-    PENDING_PRICE.pop(msg.reply_to_message.id)
+    ORDER_STATE.pop(cb.message.id)
+    await cb.answer("Harga disimpan")
 
 # ================= FOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
@@ -230,10 +208,7 @@ async def handle_photo(_, msg):
         "base_caption": base,
         "items": {},
         "prices": {},
-        "stage": "produk",
     }
 
 # ================= RUN =================
 bot.run()
-
-
