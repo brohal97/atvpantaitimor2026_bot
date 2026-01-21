@@ -22,9 +22,21 @@ bot = Client(
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
     photo_id = message.photo.file_id
-    caption = message.caption or ""
+    caption_asal = message.caption or ""
 
-    # 1) cuba padam gambar asal
+    # Masa Malaysia
+    tz = pytz.timezone("Asia/Kuala_Lumpur")
+    now = datetime.now(tz)
+    tarikh = now.strftime("%d/%m/%Y")
+    jam = now.strftime("%I:%M %p").lower()   # contoh: 04:26 pm
+
+    # Gabungkan caption asal + tarikh/jam
+    if caption_asal.strip():
+        caption_baru = f"{caption_asal}\n\nTarikh terkini : {tarikh}\nJam : {jam}"
+    else:
+        caption_baru = f"Tarikh terkini : {tarikh}\nJam : {jam}"
+
+    # Padam gambar asal (kalau boleh)
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -32,24 +44,13 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
-    # 2) repost gambar
+    # Hantar semula gambar DENGAN caption (tarikh/jam bergabung)
     await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_id,
-        caption=caption
-    )
-
-    # 3) hantar tarikh & jam terkini (Malaysia)
-    tz = pytz.timezone("Asia/Kuala_Lumpur")
-    now = datetime.now(tz)
-
-    tarikh = now.strftime("%d/%m/%Y")
-    jam = now.strftime("%I:%M %p").lower()   # contoh: 04:25 pm
-
-    await client.send_message(
-        chat_id=message.chat.id,
-        text=f"Tarikh terkini : {tarikh}\nJam : {jam}"
+        caption=caption_baru
     )
 
 if __name__ == "__main__":
     bot.run()
+
