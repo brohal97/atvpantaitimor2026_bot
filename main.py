@@ -32,6 +32,7 @@ bot = Client(
 #   "items": {produk_key: qty_int},
 #   "prices": {produk_key: price_str},
 #   "stage": "produk" | "harga",
+#   "awaiting": {"produk_key": str} | None     # optional (untuk cancel)
 # }
 ORDER_STATE = {}
 
@@ -51,10 +52,22 @@ PRODUK_LIST = {
 }
 
 # ================= HELPERS =================
+def copy_state(state: dict) -> dict:
+    """Copy deep-ish supaya bila pindah message_id tak kacau dict asal."""
+    return {
+        "chat_id": state["chat_id"],
+        "photo_id": state["photo_id"],
+        "base_caption": state["base_caption"],
+        "items": dict(state.get("items", {})),
+        "prices": dict(state.get("prices", {})),
+        "stage": state.get("stage", "produk"),
+        "awaiting": dict(state["awaiting"]) if state.get("awaiting") else None
+    }
+
 def normalize_price(text: str) -> str:
     s = (text or "").strip()
     digits = re.sub(r"[^\d]", "", s)
-    return digits
+    return digits  # kalau nak auto RM, tukar: return f"RM{digits}"
 
 def build_caption(base_caption: str, items_dict: dict, prices_dict: dict, header: str = "") -> str:
     lines = []
@@ -110,7 +123,6 @@ def build_harga_keyboard(items_dict: dict, prices_dict: dict) -> InlineKeyboardM
     return InlineKeyboardMarkup(rows)
 
 async def repost_photo(client, old_msg, state: dict, reply_markup):
-    # Paparkan header [HARGA] bila stage == harga
     header = "[HARGA]" if state.get("stage") == "harga" else ""
     caption_baru = build_caption(state["base_caption"], state["items"], state["prices"], header=header)
 
@@ -191,7 +203,7 @@ async def simpan_qty_repost(client, callback):
 
     new_msg = await repost_photo(client, msg, state, reply_markup)
 
-    ORDER_STATE[new_msg.id] = {**state}
+    ORDER_STATE[new_msg.id] = copy_state(state)
     ORDER_STATE.pop(old_msg_id, None)
 
 @bot.on_callback_query(filters.regex(r"^submit$"))
@@ -209,6 +221,7 @@ async def submit_order(client, callback):
         return
 
     state["stage"] = "harga"
+    state["awaiting"] = None
 
     await callback.answer("Sila isi harga")
 
@@ -217,19 +230,22 @@ async def submit_order(client, callback):
 
     new_msg = await repost_photo(client, msg, state, reply_markup)
 
-    ORDER_STATE[new_msg.id] = {**state}
+    ORDER_STATE[new_msg.id] = copy_state(state)
     ORDER_STATE.pop(old_msg_id, None)
 
 @bot.on_callback_query(filters.regex(r"^harga_cancel$"))
 async def harga_cancel(client, callback):
+    msg_id = callback.message.id
+    state = ORDER_STATE.get(msg_id)
+    if state:
+        state["awaiting"] = None
     await callback.answer("Batal")
-    # tiada perubahan, cuma biar user tekan harga semula
 
 @bot.on_callback_query(filters.regex(r"^harga_done$"))
 async def harga_done(client, callback):
     await callback.answer("Semua harga sudah diisi.")
 
-# ===== Tekan HARGA -> bot auto buka reply mode (ForceReply) =====
+# ===== Tekan HARGA -> bot reply kepada gambar + ForceReply auto buka =====
 @bot.on_callback_query(filters.regex(r"^harga_"))
 async def minta_harga(client, callback):
     bot_msg_id = callback.message.id
@@ -240,18 +256,30 @@ async def minta_harga(client, callback):
         return
 
     produk_key = callback.data.replace("harga_", "", 1)
-    nama = PRODUK_LIST.get(produk_key, produk_key)
 
-    # ✅ Ini kunci: bot hantar prompt yg REPLY kepada gambar + ForceReply
-    prompt = await client.send_message(
-        chat_id=state["chat_id"],
-        text=f"Taip harga untuk: {nama}\nContoh: 2950 atau RM2950",
-        reply_to_message_id=bot_msg_id,                  # reply kepada gambar
-        reply_markup=ForceReply(selective=True)          # auto buka reply UI
+    # ✅ pastikan qty wujud
+    qty = state["items"].get(produk_key)
+    if qty is None:
+        await callback.answer("Kuantiti belum dipilih untuk produk ini.", show_alert=True)
+        return
+
+    nama = PRODUK_LIST.get(produk_key, produk_key)
+    unit_text = "unit"
+
+    prompt_text = (
+        f"Sila taip harga untuk: {nama} ({qty} {unit_text})\n"
+        f"Contoh: 2950 atau RM2950"
     )
 
-    # simpan pending: bila staff send harga (reply kepada prompt), kita tahu produk mana
+    prompt = await client.send_message(
+        chat_id=state["chat_id"],
+        text=prompt_text,
+        reply_to_message_id=bot_msg_id,
+        reply_markup=ForceReply(selective=True)
+    )
+
     PENDING_PRICE[prompt.id] = {"bot_msg_id": bot_msg_id, "produk_key": produk_key}
+    state["awaiting"] = {"produk_key": produk_key}
 
     await callback.answer("Sila taip harga (auto reply)")
 
@@ -279,6 +307,7 @@ async def terima_harga(client, message):
         return
 
     state["prices"][produk_key] = harga
+    state["awaiting"] = None
 
     # padam mesej staff (jika bot admin)
     try:
@@ -304,11 +333,9 @@ async def terima_harga(client, message):
 
     new_msg = await repost_photo(client, old_photo_msg, state, reply_markup)
 
-    # pindah state ke message baru
-    ORDER_STATE[new_msg.id] = {**state}
+    ORDER_STATE[new_msg.id] = copy_state(state)
     ORDER_STATE.pop(bot_msg_id, None)
 
-    # buang pending
     PENDING_PRICE.pop(prompt_id, None)
 
 # ================= FOTO =================
@@ -349,7 +376,9 @@ async def handle_photo(client, message):
         "items": {},
         "prices": {},
         "stage": "produk",
+        "awaiting": None,
     }
 
 if __name__ == "__main__":
     bot.run()
+
