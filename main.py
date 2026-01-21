@@ -30,14 +30,29 @@ async def handle_photo(client, message):
     tz = pytz.timezone("Asia/Kuala_Lumpur")
     now = datetime.now(tz)
 
-    tarikh = now.strftime("%-d/%-m/%Y")   # 1/1/2025
-    jam = now.strftime("%I:%M %p").lower()  # 01:10 pm
+    # Nama hari dalam Bahasa Melayu
+    hari_map = {
+        0: "isnin",
+        1: "selasa",
+        2: "rabu",
+        3: "khamis",
+        4: "jumaat",
+        5: "sabtu",
+        6: "ahad"
+    }
+    hari = hari_map[now.weekday()]
 
-    # Caption akhir (ringkas)
+    # Tarikh & jam
+    tarikh = now.strftime("%-d/%-m/%Y")      # 1/1/2026
+    jam = now.strftime("%I:%M%p").lower()    # 10:10am
+
+    # Caption akhir
+    cap_masa = f"{hari} | {tarikh} | {jam}"
+
     if caption_asal.strip():
-        caption_baru = f"{caption_asal}\n\n{tarikh} | {jam}"
+        caption_baru = f"{caption_asal}\n\n{cap_masa}"
     else:
-        caption_baru = f"{tarikh} | {jam}"
+        caption_baru = cap_masa
 
     # Padam gambar asal (jika ada permission)
     try:
