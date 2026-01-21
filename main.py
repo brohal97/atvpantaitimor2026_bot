@@ -57,9 +57,8 @@ def build_caption(base_caption: str, items_dict: dict, prices_dict: dict | None 
     Caption:
     HARI | TARIKH | JAM
 
-    125 FULL SPEC | 5 | 2840
-    125 BIG BODY | 2 | 2600
-    (TIADA header "NAMA PRODUK | KUANTITI | HARGA")
+    125 FULL SPEC | 1 | 2540
+    YAMA SPORT | 1 | -
     """
     prices_dict = prices_dict or {}
 
@@ -79,12 +78,10 @@ def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
     """
     rows = []
 
-    # butang produk (yang belum dipilih)
     for key, name in PRODUK_LIST.items():
         if key not in items_dict:
             rows.append([InlineKeyboardButton(name, callback_data=f"produk_{key}")])
 
-    # SUBMIT (hanya muncul bila sekurang-kurangnya ada 1 item dipilih)
     if items_dict:
         rows.append([InlineKeyboardButton("✅ SUBMIT", callback_data="submit")])
 
@@ -110,16 +107,18 @@ def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
 
 def build_harga_keyboard(items_dict: dict, prices_dict: dict | None = None) -> InlineKeyboardMarkup:
     """
-    Lepas SUBMIT: papar butang harga ikut item yang dipilih.
-    Akan tunjuk ✅ jika harga item tu dah dipilih.
+    Lepas SUBMIT: papar butang harga HANYA untuk item yang belum dipilih harganya.
+    Jika semua dah ada harga -> hanya keluar ✅ SIAP.
     """
     prices_dict = prices_dict or {}
     rows = []
 
+    # hanya item belum ada harga
     for k in items_dict.keys():
+        if k in prices_dict:
+            continue  # sorokkan butang harga untuk item yang dah dipilih
         nama = PRODUK_LIST.get(k, k)
-        tanda = "✅ " if k in prices_dict else ""
-        rows.append([InlineKeyboardButton(f"{tanda}HARGA - {nama}", callback_data=f"harga_{k}")])
+        rows.append([InlineKeyboardButton(f"HARGA - {nama}", callback_data=f"harga_{k}")])
 
     # kalau semua item dah ada harga, tunjuk butang SIAP
     if items_dict and all(k in prices_dict for k in items_dict.keys()):
@@ -164,10 +163,6 @@ async def repost_message(
     state: dict,
     reply_markup: InlineKeyboardMarkup | None
 ):
-    """
-    Padam mesej lama + hantar semula gambar dengan caption terkini + reply_markup.
-    Return new message.
-    """
     caption_baru = build_caption(state["base_caption"], state["items"], state.get("prices", {}))
 
     try:
@@ -226,7 +221,7 @@ async def pilih_kuantiti(client, callback):
     await callback.answer("Pilih kuantiti")
 
 
-# ====== STEP C: tekan kuantiti -> PADAM & HANTAR SEMULA (kembali ke senarai produk + SUBMIT) ======
+# ====== STEP C: tekan kuantiti -> PADAM & HANTAR SEMULA ======
 @bot.on_callback_query(filters.regex(r"^qty_"))
 async def simpan_qty_repost(client, callback):
     msg = callback.message
@@ -237,10 +232,9 @@ async def simpan_qty_repost(client, callback):
         await callback.answer("Rekod tidak dijumpai. Sila hantar gambar semula.", show_alert=True)
         return
 
-    # parse: qty_{produk_key}_{n} (produk_key boleh ada underscore)
     try:
-        payload = callback.data[len("qty_"):]          # contoh: "125_FULL_2"
-        produk_key, qty_str = payload.rsplit("_", 1)   # => ("125_FULL", "2")
+        payload = callback.data[len("qty_"):]
+        produk_key, qty_str = payload.rsplit("_", 1)
         qty = int(qty_str)
     except Exception:
         await callback.answer("Format kuantiti tidak sah. Cuba tekan semula.", show_alert=True)
@@ -249,13 +243,11 @@ async def simpan_qty_repost(client, callback):
     state["items"][produk_key] = qty
     await callback.answer("Dikemaskini")
 
-    # selepas pilih qty -> repost balik dengan senarai produk (yang tinggal) + SUBMIT
     keyboard_produk = build_produk_keyboard(state["items"])
     reply_markup = keyboard_produk if keyboard_produk.inline_keyboard else None
 
     new_msg = await repost_message(client, msg, state, reply_markup)
 
-    # pindah state ke message baru
     ORDER_STATE[new_msg.id] = {
         "chat_id": state["chat_id"],
         "photo_id": state["photo_id"],
@@ -283,13 +275,11 @@ async def submit_order(client, callback):
 
     await callback.answer("Submit...")
 
-    # Lepas submit: tukar kepada butang HARGA ikut item dipilih
     harga_keyboard = build_harga_keyboard(state["items"], state.get("prices", {}))
     reply_markup = harga_keyboard if harga_keyboard.inline_keyboard else None
 
     new_msg = await repost_message(client, msg, state, reply_markup)
 
-    # pindah state ke message baru
     ORDER_STATE[new_msg.id] = {
         "chat_id": state["chat_id"],
         "photo_id": state["photo_id"],
@@ -300,7 +290,7 @@ async def submit_order(client, callback):
     ORDER_STATE.pop(old_msg_id, None)
 
 
-# ====== STEP E: tekan HARGA - {produk} -> keluar senarai harga 2500-3000 ======
+# ====== STEP E: tekan HARGA - {produk} -> keluar senarai harga ======
 @bot.on_callback_query(filters.regex(r"^harga_"))
 async def buka_senarai_harga(client, callback):
     msg_id = callback.message.id
@@ -323,7 +313,6 @@ async def harga_pagination(client, callback):
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
 
-    # format: harga_page_{produk_key}_{page}
     payload = callback.data[len("harga_page_"):]
     try:
         produk_key, page_str = payload.rsplit("_", 1)
@@ -350,7 +339,7 @@ async def back_harga_menu(client, callback):
     await callback.answer()
 
 
-# ====== pilih harga -> PADAM & HANTAR SEMULA (caption update + balik menu harga) ======
+# ====== pilih harga -> PADAM & HANTAR SEMULA ======
 @bot.on_callback_query(filters.regex(r"^setharga_"))
 async def set_harga(client, callback):
     msg = callback.message
@@ -361,7 +350,6 @@ async def set_harga(client, callback):
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
 
-    # format: setharga_{produk_key}_{harga}
     payload = callback.data[len("setharga_"):]
     try:
         produk_key, harga_str = payload.rsplit("_", 1)
@@ -376,12 +364,12 @@ async def set_harga(client, callback):
     state["prices"][produk_key] = harga
     await callback.answer(f"Harga diset: {harga}")
 
+    # lepas set harga -> balik menu harga (yang tinggal hanya item belum set)
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
     reply_markup = kb if kb.inline_keyboard else None
 
     new_msg = await repost_message(client, msg, state, reply_markup)
 
-    # pindah state ke message baru
     ORDER_STATE[new_msg.id] = {
         "chat_id": state["chat_id"],
         "photo_id": state["photo_id"],
@@ -422,7 +410,6 @@ async def handle_photo(client, message):
         [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]
     ])
 
-    # padam gambar asal (jika ada permission)
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -448,6 +435,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
-
 
