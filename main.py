@@ -5,7 +5,7 @@ async def handle_photo(client, message):
     import pytz
     
     # Set masa Malaysia
-    kl_pytz = pytz.timezone('Asia/Kuala Lumpur')
+   kl_pytz = pytz.timezone('Asia/Kuala_Lumpur')
     tarikh_sekarang = datetime.now(kl_pytz).strftime('%d/%m/%Y %H:%M')
     
     # Padam gambar asal
