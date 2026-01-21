@@ -27,9 +27,10 @@ bot = Client(
 # value = {
 #   "chat_id": int,
 #   "photo_id": str,
-#   "base_caption": str,   # hari | tarikh | jam
+#   "base_caption": str,         # hari | tarikh | jam
 #   "items": {produk_key: qty_int},
-#   "prices": {produk_key: unit_price_int}   # <-- simpan harga SEUNIT
+#   "prices": {produk_key: unit_price_int},  # simpan harga SEUNIT
+#   "dest": str | None
 # }
 ORDER_STATE = {}
 
@@ -51,14 +52,34 @@ HARGA_STEP = 10
 HARGA_LIST = list(range(HARGA_START, HARGA_END + 1, HARGA_STEP))
 HARGA_PER_PAGE = 15  # 3 baris x 5 butang
 
+# ================= DESTINASI LIST =================
+DEST_LIST = [
+    "JOHOR",
+    "KEDAH",
+    "KELANTAN",
+    "MELAKA",
+    "NEGERI SEMBILAN",
+    "PAHANG",
+    "PERAK",
+    "PERLIS",
+    "PULAU PINANG",
+    "SELANGOR",
+    "TERENGGANU",
+    "LANGKAWI",
+    "PICKUP SENDIRI",
+    "LORI KITA HANTAR",
+]
 
-def build_caption(base_caption: str, items_dict: dict, prices_dict: dict | None = None) -> str:
+
+def build_caption(base_caption: str, items_dict: dict, prices_dict: dict | None = None, dest: str | None = None) -> str:
     """
     Caption:
-    HARI | TARIKH | JAM
+    Rabu | 21/1/2026 | 11:18pm
 
-    125 FULL SPEC | 2 | RM5100   (2550 x 2)
-    YAMA SPORT | 1 | RM2500      (2500 x 1)
+    125 FULL SPEC | 2 | RM5140
+    YAMA SPORT | 1 | RM2560
+
+    Destinasi : JOHOR
     """
     prices_dict = prices_dict or {}
 
@@ -68,17 +89,21 @@ def build_caption(base_caption: str, items_dict: dict, prices_dict: dict | None 
         for k, q in items_dict.items():
             nama = PRODUK_LIST.get(k, k)
 
-            unit_price = prices_dict.get(k)  # harga seunit
+            unit_price = prices_dict.get(k)
             if unit_price is None:
                 harga_display = "-"
             else:
                 try:
                     total = int(unit_price) * int(q)
                 except Exception:
-                    total = unit_price  # fallback (kalau jadi pelik)
+                    total = unit_price
                 harga_display = f"RM{total}"
 
             lines.append(f"{nama} | {q} | {harga_display}")
+
+    if dest:
+        lines.append("")
+        lines.append(f"Destinasi : {dest}")
 
     return "\n".join(lines)
 
@@ -114,20 +139,21 @@ def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
 
 def build_harga_keyboard(items_dict: dict, prices_dict: dict | None = None) -> InlineKeyboardMarkup:
     """
-    Lepas SUBMIT: papar butang harga HANYA untuk item yang belum dipilih harganya.
-    Jika semua dah ada harga -> hanya keluar ✅ SIAP.
+    Lepas SUBMIT:
+    - Butang harga hanya untuk item yang belum dipilih
+    - Bila semua item ada harga -> muncul 📍 DESTINASI
     """
     prices_dict = prices_dict or {}
     rows = []
 
     for k in items_dict.keys():
         if k in prices_dict:
-            continue  # dah pilih harga -> sorok
+            continue
         nama = PRODUK_LIST.get(k, k)
         rows.append([InlineKeyboardButton(f"HARGA - {nama}", callback_data=f"harga_{k}")])
 
     if items_dict and all(k in prices_dict for k in items_dict.keys()):
-        rows.append([InlineKeyboardButton("✅ SIAP", callback_data="harga_done")])
+        rows.append([InlineKeyboardButton("📍 DESTINASI", callback_data="destinasi")])
 
     rows.append([InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")])
     return InlineKeyboardMarkup(rows)
@@ -159,8 +185,43 @@ def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboar
     return InlineKeyboardMarkup(rows)
 
 
+def build_dest_keyboard() -> InlineKeyboardMarkup:
+    """
+    Senarai destinasi (susun 2 lajur).
+    callback: setdest_<index>
+    """
+    rows = []
+    for i in range(0, len(DEST_LIST), 2):
+        left = InlineKeyboardButton(DEST_LIST[i], callback_data=f"setdest_{i}")
+        if i + 1 < len(DEST_LIST):
+            right = InlineKeyboardButton(DEST_LIST[i + 1], callback_data=f"setdest_{i + 1}")
+            rows.append([left, right])
+        else:
+            rows.append([left])
+
+    rows.append([InlineKeyboardButton("⬅️ BACK (HARGA MENU)", callback_data="back_harga_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_after_dest_keyboard() -> InlineKeyboardMarkup:
+    """
+    Lepas pilih destinasi:
+    - keluar butang KOS PENGHANTARAN
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚚 KOS PENGHANTARAN", callback_data="kos_penghantaran")],
+        [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
+        [InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")]
+    ])
+
+
 async def repost_message(client: Client, old_msg, state: dict, reply_markup: InlineKeyboardMarkup | None):
-    caption_baru = build_caption(state["base_caption"], state["items"], state.get("prices", {}))
+    caption_baru = build_caption(
+        state["base_caption"],
+        state["items"],
+        state.get("prices", {}),
+        state.get("dest")
+    )
 
     try:
         await old_msg.delete()
@@ -174,6 +235,17 @@ async def repost_message(client: Client, old_msg, state: dict, reply_markup: Inl
         reply_markup=reply_markup
     )
     return new_msg
+
+
+def clone_state_for_new_msg(state: dict) -> dict:
+    return {
+        "chat_id": state["chat_id"],
+        "photo_id": state["photo_id"],
+        "base_caption": state["base_caption"],
+        "items": dict(state.get("items", {})),
+        "prices": dict(state.get("prices", {})),
+        "dest": state.get("dest"),
+    }
 
 
 # ====== STEP A: tekan NAMA PRODUK ======
@@ -190,7 +262,7 @@ async def senarai_produk(client, callback):
     await callback.answer()
 
 
-# ====== BACK dari qty -> balik ke senarai produk ======
+# ====== BACK ke senarai produk ======
 @bot.on_callback_query(filters.regex(r"^back_produk$"))
 async def back_produk(client, callback):
     msg_id = callback.message.id
@@ -245,13 +317,7 @@ async def simpan_qty_repost(client, callback):
 
     new_msg = await repost_message(client, msg, state, reply_markup)
 
-    ORDER_STATE[new_msg.id] = {
-        "chat_id": state["chat_id"],
-        "photo_id": state["photo_id"],
-        "base_caption": state["base_caption"],
-        "items": dict(state["items"]),
-        "prices": dict(state.get("prices", {})),
-    }
+    ORDER_STATE[new_msg.id] = clone_state_for_new_msg(state)
     ORDER_STATE.pop(old_msg_id, None)
 
 
@@ -277,13 +343,7 @@ async def submit_order(client, callback):
 
     new_msg = await repost_message(client, msg, state, reply_markup)
 
-    ORDER_STATE[new_msg.id] = {
-        "chat_id": state["chat_id"],
-        "photo_id": state["photo_id"],
-        "base_caption": state["base_caption"],
-        "items": dict(state["items"]),
-        "prices": dict(state.get("prices", {})),
-    }
+    ORDER_STATE[new_msg.id] = clone_state_for_new_msg(state)
     ORDER_STATE.pop(old_msg_id, None)
 
 
@@ -350,7 +410,7 @@ async def set_harga(client, callback):
     payload = callback.data[len("setharga_"):]
     try:
         produk_key, harga_str = payload.rsplit("_", 1)
-        harga = int(harga_str)  # <-- harga seunit
+        harga = int(harga_str)  # harga seunit
     except Exception:
         await callback.answer("Format harga tidak sah.", show_alert=True)
         return
@@ -358,7 +418,7 @@ async def set_harga(client, callback):
     if "prices" not in state:
         state["prices"] = {}
 
-    state["prices"][produk_key] = harga  # simpan unit price
+    state["prices"][produk_key] = harga
     await callback.answer("Harga diset")
 
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
@@ -366,27 +426,61 @@ async def set_harga(client, callback):
 
     new_msg = await repost_message(client, msg, state, reply_markup)
 
-    ORDER_STATE[new_msg.id] = {
-        "chat_id": state["chat_id"],
-        "photo_id": state["photo_id"],
-        "base_caption": state["base_caption"],
-        "items": dict(state["items"]),
-        "prices": dict(state.get("prices", {})),
-    }
+    ORDER_STATE[new_msg.id] = clone_state_for_new_msg(state)
     ORDER_STATE.pop(old_msg_id, None)
 
 
-# ====== SIAP (optional) ======
-@bot.on_callback_query(filters.regex(r"^harga_done$"))
-async def harga_done(client, callback):
+# ====== DESTINASI: buka pilihan destinasi ======
+@bot.on_callback_query(filters.regex(r"^destinasi$"))
+async def buka_destinasi(client, callback):
     msg_id = callback.message.id
     state = ORDER_STATE.get(msg_id)
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
 
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Siap ✅")
+    # pastikan semua harga dah ada (safety)
+    if not (state.get("items") and all(k in state.get("prices", {}) for k in state["items"].keys())):
+        await callback.answer("Sila lengkapkan harga dulu.", show_alert=True)
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=build_dest_keyboard())
+    await callback.answer("Pilih destinasi")
+
+
+# ====== SET DESTINASI -> PADAM & HANTAR SEMULA + BUTANG KOS PENGHANTARAN ======
+@bot.on_callback_query(filters.regex(r"^setdest_"))
+async def set_destinasi(client, callback):
+    msg = callback.message
+    old_msg_id = msg.id
+
+    state = ORDER_STATE.get(old_msg_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    try:
+        idx = int(callback.data.replace("setdest_", "", 1))
+        dest = DEST_LIST[idx]
+    except Exception:
+        await callback.answer("Destinasi tidak sah.", show_alert=True)
+        return
+
+    state["dest"] = dest
+    await callback.answer(f"Destinasi: {dest}")
+
+    reply_markup = build_after_dest_keyboard()
+    new_msg = await repost_message(client, msg, state, reply_markup)
+
+    ORDER_STATE[new_msg.id] = clone_state_for_new_msg(state)
+    ORDER_STATE.pop(old_msg_id, None)
+
+
+# ====== KOS PENGHANTARAN (placeholder) ======
+@bot.on_callback_query(filters.regex(r"^kos_penghantaran$"))
+async def kos_penghantaran(client, callback):
+    # Fungsi kos akan kita sambung lepas ini (senarai harga/angka kos, dll)
+    await callback.answer("Fungsi KOS PENGHANTARAN belum diaktifkan lagi.", show_alert=True)
 
 
 # ================= FOTO =================
@@ -425,10 +519,10 @@ async def handle_photo(client, message):
         "photo_id": photo_id,
         "base_caption": base_caption,
         "items": {},
-        "prices": {}
+        "prices": {},
+        "dest": None,
     }
 
 
 if __name__ == "__main__":
     bot.run()
-
