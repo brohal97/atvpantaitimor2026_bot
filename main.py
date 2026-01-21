@@ -52,9 +52,9 @@ async def handle_photo(client, message):
     else:
         caption_baru = cap_masa
 
-    # BUTANG sahaja (fungsi tekan buat kemudian)
+    # BUTANG (tukaran teks kepada "NAMA PRODUK")
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("HANTAR DETAIL", callback_data="hantar_detail")]
+        [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]
     ])
 
     # Padam gambar asal (jika ada permission)
@@ -75,5 +75,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
 
