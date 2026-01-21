@@ -52,15 +52,17 @@ def normalize_price(text: str) -> str:
     digits = re.sub(r"[^\d]", "", s)
     if not digits:
         return ""
-    # pastikan output jadi RMxxxx
     return f"RM{digits}"
 
-def build_caption(base_caption: str, items_dict: dict, prices_dict: dict, header: str = "") -> str:
-    lines = []
-    if header:
-        lines.append(header)
-        lines.append("")
-    lines.append(base_caption)
+def build_caption(base_caption: str, items_dict: dict, prices_dict: dict) -> str:
+    """
+    Format final yang awak nak:
+
+    Rabu | 21/1/2026 | 08:31pm
+
+    125 FULL SPEC | 1 | RM4000
+    """
+    lines = [base_caption]
 
     if items_dict:
         lines.append("")
@@ -109,8 +111,7 @@ def build_harga_keyboard(items_dict: dict, prices_dict: dict) -> InlineKeyboardM
     return InlineKeyboardMarkup(rows)
 
 async def repost_photo(client, old_msg, state: dict, reply_markup):
-    header = "[HARGA]" if state.get("stage") == "harga" else ""
-    caption_baru = build_caption(state["base_caption"], state["items"], state["prices"], header=header)
+    caption_baru = build_caption(state["base_caption"], state["items"], state["prices"])
 
     try:
         await old_msg.delete()
@@ -126,7 +127,6 @@ async def repost_photo(client, old_msg, state: dict, reply_markup):
     return new_msg
 
 def clone_state(state: dict) -> dict:
-    # elak masalah shallow copy untuk dict items/prices
     return {
         "chat_id": state["chat_id"],
         "photo_id": state["photo_id"],
@@ -215,7 +215,7 @@ async def harga_cancel(client, callback):
 async def harga_done(client, callback):
     await callback.answer("Semua harga sudah diisi.")
 
-# ===== Tekan HARGA -> prompt REPLY kepada GAMBAR + ForceReply auto buka reply bar (phone) =====
+# ===== Tekan HARGA -> TRIK RESIT: ForceReply + reply_to_message_id + pending map =====
 @bot.on_callback_query(filters.regex(r"^harga_"))
 async def minta_harga(client, callback):
     bot_msg_id = callback.message.id
@@ -227,17 +227,23 @@ async def minta_harga(client, callback):
     nama = PRODUK_LIST.get(produk_key, produk_key)
     qty = state["items"].get(produk_key, 1)
 
-    # ✅ Prompt ini reply kepada GAMBAR (jadi thread jelas)
-    # ✅ ForceReply buat reply bar auto terbuka di telefon
+    # ✅ Ini yang buat "Reply UI" auto keluar di telefon
+    # ✅ Trik: text prompt dibuat macam quote/caption (supaya staff nampak macam reply pada gambar)
+    # ✅ Arahan letak dalam placeholder (tak kacau preview quote)
+    quote_like_text = f"{state['base_caption']}\n{nama} | {qty}"
+
     prompt = await client.send_message(
         chat_id=state["chat_id"],
-        text=f"Sila taip harga untuk: {nama} | {qty} unit\nContoh: 4000 atau RM4000",
-        reply_to_message_id=bot_msg_id,
-        reply_markup=ForceReply(selective=False)
+        text=quote_like_text,
+        reply_to_message_id=bot_msg_id,  # reply kepada GAMBAR
+        reply_markup=ForceReply(
+            selective=False,
+            input_field_placeholder=f"Taip harga untuk {nama} | {qty} unit (contoh: 4000 / RM4000)"
+        )
     )
 
     PENDING_PRICE[prompt.id] = {"bot_msg_id": bot_msg_id, "produk_key": produk_key}
-    await callback.answer("Taip harga sekarang")
+    await callback.answer("Sila taip harga")
 
 # ================= TERIMA HARGA (mesti reply pada prompt ForceReply) =================
 @bot.on_message(filters.text & ~filters.bot)
@@ -277,7 +283,6 @@ async def terima_harga(client, message):
 
     # repost gambar dengan caption update
     harga_keyboard = build_harga_keyboard(state["items"], state["prices"])
-    reply_markup = harga_keyboard if harga_keyboard.inline_keyboard else None
 
     try:
         old_photo_msg = await client.get_messages(state["chat_id"], bot_msg_id)
@@ -285,7 +290,7 @@ async def terima_harga(client, message):
         PENDING_PRICE.pop(prompt_id, None)
         return
 
-    new_msg = await repost_photo(client, old_photo_msg, state, reply_markup)
+    new_msg = await repost_photo(client, old_photo_msg, state, harga_keyboard)
 
     ORDER_STATE[new_msg.id] = clone_state(state)
     ORDER_STATE.pop(bot_msg_id, None)
@@ -333,3 +338,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
