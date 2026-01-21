@@ -1,4 +1,7 @@
 import os
+from datetime import datetime
+
+import pytz
 from pyrogram import Client, filters
 from pyrogram.errors import MessageDeleteForbidden, ChatAdminRequired
 
@@ -21,6 +24,7 @@ async def handle_photo(client, message):
     photo_id = message.photo.file_id
     caption = message.caption or ""
 
+    # 1) cuba padam gambar asal
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -28,12 +32,24 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
+    # 2) repost gambar
     await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_id,
         caption=caption
     )
 
+    # 3) hantar tarikh & jam terkini (Malaysia)
+    tz = pytz.timezone("Asia/Kuala_Lumpur")
+    now = datetime.now(tz)
+
+    tarikh = now.strftime("%d/%m/%Y")
+    jam = now.strftime("%I:%M %p").lower()   # contoh: 04:25 pm
+
+    await client.send_message(
+        chat_id=message.chat.id,
+        text=f"Tarikh terkini : {tarikh}\nJam : {jam}"
+    )
+
 if __name__ == "__main__":
     bot.run()
-
