@@ -32,13 +32,13 @@ async def handle_photo(client, message):
 
     # Nama hari dalam Bahasa Melayu
     hari_map = {
-        0: "isnin",
-        1: "selasa",
-        2: "rabu",
+        0: "Isnin",
+        1: "Selasa",
+        2: "Rabu",
         3: "khamis",
-        4: "jumaat",
-        5: "sabtu",
-        6: "ahad"
+        4: "Jumaat",
+        5: "Sabtu",
+        6: "Ahad"
     }
     hari = hari_map[now.weekday()]
 
