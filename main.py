@@ -5,6 +5,7 @@ import pytz
 from pyrogram import Client, filters
 from pyrogram.errors import MessageDeleteForbidden, ChatAdminRequired
 
+# ================= ENV =================
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -12,6 +13,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Missing API_ID / API_HASH / BOT_TOKEN in Railway Variables")
 
+# ================= BOT =================
 bot = Client(
     "atv_bot_2026",
     api_id=API_ID,
@@ -27,16 +29,17 @@ async def handle_photo(client, message):
     # Masa Malaysia
     tz = pytz.timezone("Asia/Kuala_Lumpur")
     now = datetime.now(tz)
-    tarikh = now.strftime("%d/%m/%Y")
-    jam = now.strftime("%I:%M %p").lower()   # contoh: 04:26 pm
 
-    # Gabungkan caption asal + Tarikh/Jam (dalam caption gambar)
+    tarikh = now.strftime("%-d/%-m/%Y")   # 1/1/2025
+    jam = now.strftime("%I:%M %p").lower()  # 01:10 pm
+
+    # Caption akhir (ringkas)
     if caption_asal.strip():
-        caption_baru = f"{caption_asal}\n\nTarikh : {tarikh}\nJam : {jam}"
+        caption_baru = f"{caption_asal}\n\n{tarikh} | {jam}"
     else:
-        caption_baru = f"Tarikh : {tarikh}\nJam : {jam}"
+        caption_baru = f"{tarikh} | {jam}"
 
-    # Padam gambar asal (kalau boleh)
+    # Padam gambar asal (jika ada permission)
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -44,7 +47,7 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
-    # Hantar semula gambar DENGAN caption (bergabung)
+    # Hantar semula gambar + caption
     await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_id,
@@ -53,3 +56,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
