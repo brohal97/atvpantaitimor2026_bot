@@ -24,16 +24,39 @@ bot = Client(
 
 # ====== STEP A: tekan NAMA PRODUK ======
 @bot.on_callback_query(filters.regex("^hantar_detail$"))
-async def pilih_produk(client, callback_query):
+async def senarai_produk(client, callback_query):
     keyboard_produk = InlineKeyboardMarkup([
-        [InlineKeyboardButton("ATV 125cc Small Bull", callback_data="produk_125")],
-        [InlineKeyboardButton("ATV 200cc DTL", callback_data="produk_200")],
-        [InlineKeyboardButton("ATV XBL", callback_data="produk_xbl")],
-        [InlineKeyboardButton("Lain-lain", callback_data="produk_lain")]
+        [InlineKeyboardButton("125 FULL SPEC", callback_data="produk_125_full")],
+        [InlineKeyboardButton("125 BIG BODY", callback_data="produk_125_big")],
+        [InlineKeyboardButton("YAMA SPORT", callback_data="produk_yama")],
+        [InlineKeyboardButton("GY6 200CC", callback_data="produk_gy6")],
+        [InlineKeyboardButton("HAMMER ARMOUR", callback_data="produk_hammer_arm")],
+        [InlineKeyboardButton("BIG HAMMER", callback_data="produk_big_hammer")],
+        [InlineKeyboardButton("TROLI BESI", callback_data="produk_troli_besi")],
+        [InlineKeyboardButton("TROLI PLASTIK", callback_data="produk_troli_plastik")]
     ])
 
     await callback_query.message.edit_reply_markup(reply_markup=keyboard_produk)
     await callback_query.answer()
+
+# ====== STEP B: tekan SALAH SATU PRODUK ======
+@bot.on_callback_query(filters.regex("^produk_"))
+async def pilih_kuantiti(client, callback_query):
+    keyboard_qty = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1", callback_data="qty_1"),
+            InlineKeyboardButton("2", callback_data="qty_2"),
+            InlineKeyboardButton("3", callback_data="qty_3"),
+        ],
+        [
+            InlineKeyboardButton("4", callback_data="qty_4"),
+            InlineKeyboardButton("5", callback_data="qty_5"),
+        ]
+    ])
+
+    # fungsi reply / respon (supaya jelas “fungsi wujud”)
+    await callback_query.answer("Sila pilih kuantiti", show_alert=False)
+    await callback_query.message.edit_reply_markup(reply_markup=keyboard_qty)
 
 # ================= FOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
@@ -66,7 +89,6 @@ async def handle_photo(client, message):
     else:
         caption_baru = cap_masa
 
-    # Butang awal
     keyboard_awal = InlineKeyboardMarkup([
         [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]
     ])
