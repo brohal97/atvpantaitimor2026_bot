@@ -5,7 +5,7 @@ from datetime import datetime
 import pytz
 from pyrogram import Client, filters
 from pyrogram.errors import MessageDeleteForbidden, ChatAdminRequired
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
 
 # ================= ENV =================
 API_ID = int(os.getenv("API_ID", "0"))
@@ -28,13 +28,16 @@ bot = Client(
 # value = {
 #   "chat_id": int,
 #   "photo_id": str,
-#   "base_caption": str,     # hari | tarikh | jam
+#   "base_caption": str,
 #   "items": {produk_key: qty_int},
 #   "prices": {produk_key: price_str},
-#   "stage": "produk" | "harga",          # mode semasa
-#   "await_price_for": produk_key|None,   # jika sedang tunggu harga produk mana
+#   "stage": "produk" | "harga",
 # }
 ORDER_STATE = {}
+
+# PENDING_PRICE key = prompt_message_id
+# value = {"bot_msg_id": int, "produk_key": str}
+PENDING_PRICE = {}
 
 PRODUK_LIST = {
     "125_FULL": "125 FULL SPEC",
@@ -48,8 +51,18 @@ PRODUK_LIST = {
 }
 
 # ================= HELPERS =================
-def build_caption(base_caption: str, items_dict: dict, prices_dict: dict, hint: str = "") -> str:
-    lines = [base_caption]
+def normalize_price(text: str) -> str:
+    s = (text or "").strip()
+    digits = re.sub(r"[^\d]", "", s)
+    return digits
+
+def build_caption(base_caption: str, items_dict: dict, prices_dict: dict, header: str = "") -> str:
+    lines = []
+    if header:
+        lines.append(header)
+        lines.append("")
+    lines.append(base_caption)
+
     if items_dict:
         lines.append("")
         for k, q in items_dict.items():
@@ -58,9 +71,6 @@ def build_caption(base_caption: str, items_dict: dict, prices_dict: dict, hint: 
                 lines.append(f"{nama} | {q} | {prices_dict[k]}")
             else:
                 lines.append(f"{nama} | {q}")
-    if hint:
-        lines.append("")
-        lines.append(hint)
     return "\n".join(lines)
 
 def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
@@ -93,36 +103,16 @@ def build_harga_keyboard(items_dict: dict, prices_dict: dict) -> InlineKeyboardM
             nama = PRODUK_LIST.get(k, k)
             rows.append([InlineKeyboardButton(f"HARGA - {nama}", callback_data=f"harga_{k}")])
 
-    # kalau semua harga siap, letak butang siap (optional)
     if not rows and items_dict:
         rows = [[InlineKeyboardButton("✅ SEMUA HARGA SIAP", callback_data="harga_done")]]
 
-    # butang cancel input harga (akan wujud bila sedang input)
     rows.append([InlineKeyboardButton("❌ BATAL", callback_data="harga_cancel")])
     return InlineKeyboardMarkup(rows)
 
-def normalize_price(text: str) -> str:
-    """
-    Terima input macam:
-    - 2950
-    - RM2950
-    - rm 2,950
-    - 2 950
-    Output: 2950 atau RM2950 (awak boleh ubah style di sini)
-    """
-    s = text.strip()
-
-    # ambil nombor sahaja (buang rm, koma, space)
-    digits = re.sub(r"[^\d]", "", s)
-    if not digits:
-        return ""
-
-    # contoh: auto letak RM (kalau awak nak)
-    # return f"RM{digits}"
-    return digits  # kekal nombor sahaja
-
-async def repost_photo(client, old_msg, state: dict, reply_markup, hint: str = ""):
-    caption_baru = build_caption(state["base_caption"], state["items"], state["prices"], hint=hint)
+async def repost_photo(client, old_msg, state: dict, reply_markup):
+    # Paparkan header [HARGA] bila stage == harga
+    header = "[HARGA]" if state.get("stage") == "harga" else ""
+    caption_baru = build_caption(state["base_caption"], state["items"], state["prices"], header=header)
 
     try:
         await old_msg.delete()
@@ -219,35 +209,31 @@ async def submit_order(client, callback):
         return
 
     state["stage"] = "harga"
-    state["await_price_for"] = None
 
     await callback.answer("Sila isi harga")
 
     harga_keyboard = build_harga_keyboard(state["items"], state["prices"])
     reply_markup = harga_keyboard if harga_keyboard.inline_keyboard else None
 
-    new_msg = await repost_photo(client, msg, state, reply_markup, hint="Tekan butang HARGA, kemudian taip harga dan send.")
+    new_msg = await repost_photo(client, msg, state, reply_markup)
 
     ORDER_STATE[new_msg.id] = {**state}
     ORDER_STATE.pop(old_msg_id, None)
 
 @bot.on_callback_query(filters.regex(r"^harga_cancel$"))
 async def harga_cancel(client, callback):
-    await callback.answer("Batal input harga")
-    # tak buat apa-apa, cuma clear mode menunggu harga
-    msg_id = callback.message.id
-    state = ORDER_STATE.get(msg_id)
-    if state:
-        state["await_price_for"] = None
+    await callback.answer("Batal")
+    # tiada perubahan, cuma biar user tekan harga semula
 
 @bot.on_callback_query(filters.regex(r"^harga_done$"))
 async def harga_done(client, callback):
     await callback.answer("Semua harga sudah diisi.")
 
+# ===== Tekan HARGA -> bot auto buka reply mode (ForceReply) =====
 @bot.on_callback_query(filters.regex(r"^harga_"))
 async def minta_harga(client, callback):
-    msg_id = callback.message.id
-    state = ORDER_STATE.get(msg_id)
+    bot_msg_id = callback.message.id
+    state = ORDER_STATE.get(bot_msg_id)
 
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
@@ -256,78 +242,74 @@ async def minta_harga(client, callback):
     produk_key = callback.data.replace("harga_", "", 1)
     nama = PRODUK_LIST.get(produk_key, produk_key)
 
-    # set mode tunggu harga
-    state["stage"] = "harga"
-    state["await_price_for"] = produk_key
+    # ✅ Ini kunci: bot hantar prompt yg REPLY kepada gambar + ForceReply
+    prompt = await client.send_message(
+        chat_id=state["chat_id"],
+        text=f"Taip harga untuk: {nama}\nContoh: 2950 atau RM2950",
+        reply_to_message_id=bot_msg_id,                  # reply kepada gambar
+        reply_markup=ForceReply(selective=True)          # auto buka reply UI
+    )
 
-    await callback.answer(f"Taip harga untuk {nama}")
+    # simpan pending: bila staff send harga (reply kepada prompt), kita tahu produk mana
+    PENDING_PRICE[prompt.id] = {"bot_msg_id": bot_msg_id, "produk_key": produk_key}
 
-    # update caption hint supaya staff nampak arahan terus dalam gambar
-    harga_keyboard = build_harga_keyboard(state["items"], state["prices"])
-    hint = f"➡️ Taip harga untuk: {nama} (contoh 2950) dan SEND."
-    try:
-        await callback.message.edit_caption(
-            caption=build_caption(state["base_caption"], state["items"], state["prices"], hint=hint),
-            reply_markup=harga_keyboard
-        )
-    except Exception:
-        pass
+    await callback.answer("Sila taip harga (auto reply)")
 
-# ================= CAPTURE TEKS (harga) =================
+# ================= TERIMA HARGA (mesti reply prompt) =================
 @bot.on_message(filters.text & ~filters.bot)
-async def tangkap_harga(client, message):
-    # cari state yang sedang menunggu harga dalam chat ini
-    # (kita ambil state latest untuk chat itu)
-    chat_id = message.chat.id
-
-    # cari state message_id paling baru dalam ORDER_STATE yang chat_id sama
-    # (simple approach: loop semua)
-    bot_msg_id = None
-    state = None
-    for mid, st in ORDER_STATE.items():
-        if st.get("chat_id") == chat_id and st.get("stage") == "harga" and st.get("await_price_for"):
-            bot_msg_id = mid
-            state = st
-            break
-
-    if not state:
-        return  # bukan input harga
-
-    produk_key = state["await_price_for"]
-    price_norm = normalize_price(message.text or "")
-    if not price_norm:
+async def terima_harga(client, message):
+    if not message.reply_to_message:
         return
 
-    # simpan harga & clear awaiting
-    state["prices"][produk_key] = price_norm
-    state["await_price_for"] = None
+    prompt_id = message.reply_to_message.id
+    pending = PENDING_PRICE.get(prompt_id)
+    if not pending:
+        return
 
-    # cuba padam mesej staff (kalau bot admin)
+    bot_msg_id = pending["bot_msg_id"]
+    produk_key = pending["produk_key"]
+
+    state = ORDER_STATE.get(bot_msg_id)
+    if not state:
+        PENDING_PRICE.pop(prompt_id, None)
+        return
+
+    harga = normalize_price(message.text)
+    if not harga:
+        return
+
+    state["prices"][produk_key] = harga
+
+    # padam mesej staff (jika bot admin)
     try:
         await message.delete()
     except Exception:
         pass
 
-    # repost gambar: caption update + butang harga tinggal yang belum diisi
+    # padam prompt bot
+    try:
+        await message.reply_to_message.delete()
+    except Exception:
+        pass
+
+    # repost gambar dengan caption update & butang tinggal yang belum isi harga
     harga_keyboard = build_harga_keyboard(state["items"], state["prices"])
     reply_markup = harga_keyboard if harga_keyboard.inline_keyboard else None
 
-    # ambil mesej gambar bot lama
     try:
-        old_photo_msg = await client.get_messages(chat_id, bot_msg_id)
+        old_photo_msg = await client.get_messages(state["chat_id"], bot_msg_id)
     except Exception:
+        PENDING_PRICE.pop(prompt_id, None)
         return
 
-    new_msg = await repost_photo(
-        client,
-        old_photo_msg,
-        state,
-        reply_markup,
-        hint="Tekan butang HARGA seterusnya, kemudian taip harga dan SEND."
-    )
+    new_msg = await repost_photo(client, old_photo_msg, state, reply_markup)
 
+    # pindah state ke message baru
     ORDER_STATE[new_msg.id] = {**state}
     ORDER_STATE.pop(bot_msg_id, None)
+
+    # buang pending
+    PENDING_PRICE.pop(prompt_id, None)
 
 # ================= FOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
@@ -367,9 +349,7 @@ async def handle_photo(client, message):
         "items": {},
         "prices": {},
         "stage": "produk",
-        "await_price_for": None,
     }
 
 if __name__ == "__main__":
     bot.run()
-
