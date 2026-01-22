@@ -27,9 +27,9 @@ bot = Client(
 )
 
 # ================= TEMP STATE (RAM) =================
-# KEY RULE (kemas):
-# - sebelum album (sebelum resit pertama): key = anchor_msg_id (mesej order photo selepas LAST SUBMIT)
-# - selepas album (resit pertama dan seterusnya): key = album_first_id (mesej pertama album yg ada caption + button)
+# KEY ORDER_STATE:
+# - sebelum album: key = anchor_msg_id (photo order selepas dipost)
+# - selepas album: key = album_first_id (photo pertama album yang ada caption + button)
 #
 # state = {
 #   "chat_id": int,
@@ -39,18 +39,21 @@ bot = Client(
 #   "prices": {produk_key: unit_price_int},
 #   "dest": str | None,
 #   "ship_cost": int | None,
-#   "receipts": [file_id, ...],         # simpan semua resit (kita display last 9)
+#
+#   "receipts": [file_id, ...],     # resit file_id (max last 9 utk album)
 #   "paid": bool,
 #   "paid_at": str | None,
 #   "paid_by": int | None,
 #   "locked": bool,
-#   "anchor_msg_id": int | None,        # mesej order photo (selepas LAST SUBMIT, sebelum album)
-#   "album_msg_ids": [int, ...] | None, # mesej-mesej album semasa (order+resit...)
-#   "album_first_id": int | None,       # mesej pertama album (caption + button)
+#
+#   "anchor_msg_id": int | None,    # mesej order single (masa belum album)
+#   "album_msg_ids": [int, ...] | None,
+#   "album_first_id": int | None,
 # }
 ORDER_STATE = {}
 
-# Mapping reply untuk album image -> album_first_id (supaya reply mana2 gambar boleh tambah resit)
+# Mapping reply untuk mana-mana message album -> album_first_id (key)
+# key = album_message_id -> value = album_first_id
 REPLY_MAP = {}
 
 # ================= DATA =================
@@ -97,7 +100,8 @@ KOS_PER_PAGE = 15  # 3 baris x 5 butang
 # Telegram album max 10 media: 1 order + max 9 resit
 MAX_RECEIPTS_IN_ALBUM = 9
 
-# ================= STYLE (bold cantik) =================
+
+# ================= UTIL (BOLD + CAPTION RINGKAS) =================
 BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
@@ -108,11 +112,12 @@ BOLD_MAP = str.maketrans(
 def bold(text: str) -> str:
     return text.translate(BOLD_MAP)
 
-# ================= UTIL =================
+
 def is_all_prices_done(items_dict: dict, prices_dict: dict) -> bool:
     if not items_dict:
         return False
     return all(k in prices_dict for k in items_dict.keys())
+
 
 def calc_products_total(items_dict: dict, prices_dict: dict) -> int:
     total = 0
@@ -126,6 +131,7 @@ def calc_products_total(items_dict: dict, prices_dict: dict) -> int:
             pass
     return total
 
+
 def build_caption(
     base_caption: str,
     items_dict: dict,
@@ -136,17 +142,14 @@ def build_caption(
     receipts_count: int = 0,
 ) -> str:
     """
-    Ikut kehendak kamu:
-    - tiada ayat panjang
-    - tiada 'resit: 3 keping' / emoji tambahan
-    - hanya 1 line arahan:
-        - 0 resit: ⬅️SLIDE KIRI UPLOAD RESIT (bold)
-        - >=1 resit: ⬅️SLIDE KIRI TAMBAH RESIT (bold)
+    Ikut kehendak:
+    - Ayat ringkas sahaja
+    - Tiada info '3 keping resit'
+    - Tiada status paid dalam caption (paid hanya pada butang)
     """
     prices_dict = prices_dict or {}
     lines = [base_caption]
 
-    # list produk
     if items_dict:
         lines.append("")
         for k, q in items_dict.items():
@@ -162,7 +165,6 @@ def build_caption(
                     harga_display = f"RM{unit_price}"
             lines.append(f"{nama} | {q} | {harga_display}")
 
-    # destinasi + kos
     if dest:
         lines.append("")
         if ship_cost is None:
@@ -170,14 +172,12 @@ def build_caption(
         else:
             lines.append(f"Destinasi : {dest} | RM{int(ship_cost)}")
 
-    # total keseluruhan
     if items_dict and is_all_prices_done(items_dict, prices_dict) and ship_cost is not None:
         prod_total = calc_products_total(items_dict, prices_dict)
         grand_total = prod_total + int(ship_cost)
         lines.append("")
         lines.append(f"TOTAL KESELURUHAN : RM{grand_total}")
 
-    # arahan ringkas (1 baris sahaja)
     if locked:
         lines.append("")
         if receipts_count <= 0:
@@ -187,10 +187,13 @@ def build_caption(
 
     return "\n".join(lines)
 
+
 def build_payment_keyboard(paid: bool) -> InlineKeyboardMarkup:
+    # ikut kehendak: tiada emoji tambahan
     if paid:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("✅ PAYMENT SETTLED", callback_data="noop")]])
-    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ PAYMENT SETTLE", callback_data="pay_settle")]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("PAYMENT SETTLED", callback_data="noop")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("PAYMENT SETTLE", callback_data="pay_settle")]])
+
 
 async def safe_delete(client: Client, chat_id: int, message_id: int):
     try:
@@ -198,12 +201,12 @@ async def safe_delete(client: Client, chat_id: int, message_id: int):
     except Exception:
         pass
 
+
 async def delete_bundle(client: Client, state: dict):
     """
-    Padam:
+    Padam SEMUA bundle semasa:
     - album (jika ada)
-    - anchor (jika ada)
-    NOTE: tiada lagi "control message", so kotak merah memang hilang.
+    - anchor single photo (jika ada)
     """
     chat_id = state["chat_id"]
 
@@ -214,19 +217,19 @@ async def delete_bundle(client: Client, state: dict):
     if state.get("anchor_msg_id"):
         await safe_delete(client, chat_id, state["anchor_msg_id"])
 
+
 async def send_or_rebuild_album(client: Client, state: dict) -> int:
     """
-    Hantar / rebuild album:
-    - order + semua resit (display last 9)
-    - caption pada gambar order
-    - button PAYMENT SETTLE dilekatkan TERUS pada gambar order (album_first_id)
-      (JADI: tiada mesej extra -> tiada kotak merah)
-    Return: album_first_id (jadi KEY baru ORDER_STATE)
+    Hantar/rebuild album:
+    - order + semua resit (last 9)
+    - caption ringkas pada gambar pertama album
+    - BUTANG PAYMENT dilekatkan TERUS pada gambar pertama album
+      (TIADA control message -> tiada kotak merah/ayat tambahan bawah)
+    Return: album_first_id (jadi key ORDER_STATE)
     """
     chat_id = state["chat_id"]
 
-    receipts = list(state.get("receipts", []))
-    receipts = receipts[-MAX_RECEIPTS_IN_ALBUM:]
+    receipts = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
     state["receipts"] = receipts
 
     caption = build_caption(
@@ -257,20 +260,21 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
     except Exception:
         pass
 
-    # mapping: reply kepada mana2 gambar dalam album -> album_first_id
+    # reply mana2 gambar album -> kita map ke album_first_id
     for mid in album_ids:
         REPLY_MAP[mid] = album_first_id
 
     state["album_msg_ids"] = album_ids
     state["album_first_id"] = album_first_id
-    state["anchor_msg_id"] = None  # dah bukan single
+    state["anchor_msg_id"] = None
 
     return album_first_id
 
+
 async def update_album_caption_only(client: Client, state: dict):
     """
-    Update caption hanya pada album_first_id.
-    (Caption kita ringkas, tiada 'payment settled' dll sebab kamu tak mahu ayat tambahan.)
+    Bila tambah resit, caption perlu update ayat:
+    - upload -> tambah
     """
     if not state.get("album_first_id"):
         return
@@ -282,7 +286,7 @@ async def update_album_caption_only(client: Client, state: dict):
         state.get("dest"),
         state.get("ship_cost"),
         locked=True,
-        receipts_count=len(state.get("receipts", [])[-MAX_RECEIPTS_IN_ALBUM:]),
+        receipts_count=len(state.get("receipts", [])),
     )
     try:
         await client.edit_message_caption(
@@ -293,6 +297,7 @@ async def update_album_caption_only(client: Client, state: dict):
     except Exception:
         pass
 
+
 async def deny_if_locked(state: dict, callback, allow_when_locked: bool = False) -> bool:
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
@@ -301,6 +306,7 @@ async def deny_if_locked(state: dict, callback, allow_when_locked: bool = False)
         await callback.answer("Order ini sudah LAST SUBMIT (LOCK).", show_alert=True)
         return False
     return True
+
 
 # ================= KEYBOARDS (SEBELUM LOCK) =================
 def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
@@ -311,6 +317,7 @@ def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
     if items_dict:
         rows.append([InlineKeyboardButton("✅ SUBMIT", callback_data="submit")])
     return InlineKeyboardMarkup(rows)
+
 
 def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -326,6 +333,7 @@ def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ KEMBALI", callback_data="back_produk")]
     ])
 
+
 def build_harga_keyboard(items_dict: dict, prices_dict: dict | None = None) -> InlineKeyboardMarkup:
     prices_dict = prices_dict or {}
     rows = []
@@ -340,6 +348,7 @@ def build_harga_keyboard(items_dict: dict, prices_dict: dict | None = None) -> I
 
     rows.append([InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")])
     return InlineKeyboardMarkup(rows)
+
 
 def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboardMarkup:
     total = len(HARGA_LIST)
@@ -366,6 +375,7 @@ def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboar
     rows.append([InlineKeyboardButton("⬅️ BACK (HARGA MENU)", callback_data="back_harga_menu")])
     return InlineKeyboardMarkup(rows)
 
+
 def build_dest_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for i in range(0, len(DEST_LIST), 2):
@@ -379,12 +389,14 @@ def build_dest_keyboard() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ BACK (HARGA MENU)", callback_data="back_harga_menu")])
     return InlineKeyboardMarkup(rows)
 
+
 def build_after_dest_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚚 KOS PENGHANTARAN", callback_data="kos_penghantaran")],
         [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
         [InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")]
     ])
+
 
 def build_select_kos_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     total = len(KOS_LIST)
@@ -411,6 +423,7 @@ def build_select_kos_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ BACK (MENU DESTINASI)", callback_data="back_after_dest")])
     return InlineKeyboardMarkup(rows)
 
+
 def build_after_cost_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ LAST SUBMIT", callback_data="last_submit")],
@@ -418,6 +431,7 @@ def build_after_cost_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
         [InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")],
     ])
+
 
 # ================= CALLBACKS =================
 @bot.on_callback_query(filters.regex(r"^hantar_detail$"))
@@ -428,6 +442,7 @@ async def senarai_produk(client, callback):
     await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
     await callback.answer()
 
+
 @bot.on_callback_query(filters.regex(r"^back_produk$"))
 async def back_produk(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -435,6 +450,7 @@ async def back_produk(client, callback):
         return
     await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
     await callback.answer()
+
 
 @bot.on_callback_query(filters.regex(r"^produk_"))
 async def pilih_kuantiti(client, callback):
@@ -444,6 +460,7 @@ async def pilih_kuantiti(client, callback):
     produk_key = callback.data.replace("produk_", "", 1)
     await callback.message.edit_reply_markup(reply_markup=build_qty_keyboard(produk_key))
     await callback.answer("Pilih kuantiti")
+
 
 @bot.on_callback_query(filters.regex(r"^qty_"))
 async def simpan_qty_repost(client, callback):
@@ -486,9 +503,12 @@ async def simpan_qty_repost(client, callback):
         reply_markup=build_produk_keyboard(state["items"]),
     )
 
-    # key ikut message baru
-    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
+    ORDER_STATE[new_msg.id] = {
+        **state,
+        "anchor_msg_id": new_msg.id if not state.get("locked") else state.get("anchor_msg_id"),
+    }
     ORDER_STATE.pop(old_id, None)
+
 
 @bot.on_callback_query(filters.regex(r"^submit$"))
 async def submit_order(client, callback):
@@ -509,8 +529,8 @@ async def submit_order(client, callback):
         state.get("prices", {}),
         state.get("dest"),
         state.get("ship_cost"),
-        locked=False,
-        receipts_count=0,
+        locked=bool(state.get("locked")),
+        receipts_count=len(state.get("receipts", [])),
     )
 
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
@@ -530,6 +550,7 @@ async def submit_order(client, callback):
     ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
+
 @bot.on_callback_query(filters.regex(r"^harga_"))
 async def buka_senarai_harga(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -538,6 +559,7 @@ async def buka_senarai_harga(client, callback):
     produk_key = callback.data.replace("harga_", "", 1)
     await callback.message.edit_reply_markup(reply_markup=build_select_harga_keyboard(produk_key, page=0))
     await callback.answer("Pilih harga")
+
 
 @bot.on_callback_query(filters.regex(r"^harga_page_"))
 async def harga_pagination(client, callback):
@@ -554,6 +576,7 @@ async def harga_pagination(client, callback):
     await callback.message.edit_reply_markup(reply_markup=build_select_harga_keyboard(produk_key, page=page))
     await callback.answer()
 
+
 @bot.on_callback_query(filters.regex(r"^back_harga_menu$"))
 async def back_harga_menu(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -562,6 +585,7 @@ async def back_harga_menu(client, callback):
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
     await callback.message.edit_reply_markup(reply_markup=kb)
     await callback.answer()
+
 
 @bot.on_callback_query(filters.regex(r"^setharga_"))
 async def set_harga(client, callback):
@@ -588,8 +612,8 @@ async def set_harga(client, callback):
         state.get("prices", {}),
         state.get("dest"),
         state.get("ship_cost"),
-        locked=False,
-        receipts_count=0,
+        locked=bool(state.get("locked")),
+        receipts_count=len(state.get("receipts", [])),
     )
 
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
@@ -609,6 +633,7 @@ async def set_harga(client, callback):
     ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
+
 @bot.on_callback_query(filters.regex(r"^destinasi$"))
 async def buka_destinasi(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -619,6 +644,7 @@ async def buka_destinasi(client, callback):
         return
     await callback.message.edit_reply_markup(reply_markup=build_dest_keyboard())
     await callback.answer("Pilih destinasi")
+
 
 @bot.on_callback_query(filters.regex(r"^setdest_"))
 async def set_destinasi(client, callback):
@@ -645,8 +671,8 @@ async def set_destinasi(client, callback):
         state.get("prices", {}),
         state.get("dest"),
         state.get("ship_cost"),
-        locked=False,
-        receipts_count=0,
+        locked=bool(state.get("locked")),
+        receipts_count=len(state.get("receipts", [])),
     )
 
     try:
@@ -664,6 +690,7 @@ async def set_destinasi(client, callback):
     ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
+
 @bot.on_callback_query(filters.regex(r"^back_after_dest$"))
 async def back_after_dest(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -675,6 +702,7 @@ async def back_after_dest(client, callback):
         await callback.message.edit_reply_markup(reply_markup=build_after_dest_keyboard())
     await callback.answer()
 
+
 @bot.on_callback_query(filters.regex(r"^kos_penghantaran$"))
 async def buka_kos_penghantaran(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -685,6 +713,7 @@ async def buka_kos_penghantaran(client, callback):
         return
     await callback.message.edit_reply_markup(reply_markup=build_select_kos_keyboard(page=0))
     await callback.answer("Pilih kos penghantaran")
+
 
 @bot.on_callback_query(filters.regex(r"^kos_page_"))
 async def kos_pagination(client, callback):
@@ -698,6 +727,7 @@ async def kos_pagination(client, callback):
         return
     await callback.message.edit_reply_markup(reply_markup=build_select_kos_keyboard(page=page))
     await callback.answer()
+
 
 @bot.on_callback_query(filters.regex(r"^setkos_"))
 async def set_kos(client, callback):
@@ -722,8 +752,8 @@ async def set_kos(client, callback):
         state.get("prices", {}),
         state.get("dest"),
         state.get("ship_cost"),
-        locked=False,
-        receipts_count=0,
+        locked=bool(state.get("locked")),
+        receipts_count=len(state.get("receipts", [])),
     )
 
     try:
@@ -741,6 +771,7 @@ async def set_kos(client, callback):
     ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
+
 # ====== LAST SUBMIT (LOCK) ======
 @bot.on_callback_query(filters.regex(r"^last_submit$"))
 async def last_submit(client, callback):
@@ -751,6 +782,7 @@ async def last_submit(client, callback):
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
+
     if not state.get("items"):
         await callback.answer("Item kosong.", show_alert=True)
         return
@@ -775,7 +807,7 @@ async def last_submit(client, callback):
 
     await callback.answer("Last submit ✅")
 
-    # Lepas lock: TIADA button lagi (payment hanya muncul selepas resit pertama -> album)
+    # Lepas lock: TIADA button (muncul hanya selepas resit pertama -> album)
     caption_baru = build_caption(
         state["base_caption"],
         state["items"],
@@ -783,7 +815,7 @@ async def last_submit(client, callback):
         state.get("dest"),
         state.get("ship_cost"),
         locked=True,
-        receipts_count=0,  # 0 resit
+        receipts_count=0,
     )
 
     try:
@@ -806,20 +838,23 @@ async def last_submit(client, callback):
 
     ORDER_STATE[old_id] = state
 
-# ====== PAYMENT SETTLE (button melekat pada album_first_id) ======
+
+# ====== PAYMENT SETTLE (butang berada pada album_first_id) ======
 @bot.on_callback_query(filters.regex(r"^pay_settle$"))
 async def pay_settle(client, callback):
-    key_id = callback.message.id  # sekarang ini = album_first_id
+    key_id = callback.message.id  # album_first_id
     state = ORDER_STATE.get(key_id)
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
+
     if not state.get("locked"):
         await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
         return
 
     tz = pytz.timezone("Asia/Kuala_Lumpur")
-    display = datetime.now(tz).strftime("%d/%m/%Y %I:%M%p").lower()
+    now = datetime.now(tz)
+    display = now.strftime("%d/%m/%Y %I:%M%p").lower()
 
     state["paid"] = True
     state["paid_at"] = display
@@ -827,23 +862,26 @@ async def pay_settle(client, callback):
 
     await callback.answer("Payment settled ✅")
 
-    # kamu tak mahu ayat tambahan, jadi kita hanya tukar button jadi SETTLED
+    # tukar label butang sahaja
     try:
         await callback.message.edit_reply_markup(reply_markup=build_payment_keyboard(True))
     except Exception:
         pass
 
+
 @bot.on_callback_query(filters.regex(r"^noop$"))
 async def noop(client, callback):
     await callback.answer("Dah settle ✅", show_alert=False)
+
 
 # ================= PHOTO HANDLER =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
     """
     A) gambar order baru -> bot jadikan order UI
-    B) gambar resit (SWIPE REPLY) -> bot padam resit staff, padam bundle lama,
-       hantar semula album: order + resit (last 9) + button PAYMENT SETTLE pada album_first_id
+    B) gambar resit (SWIPE REPLY pada anchor / mana-mana gambar album) ->
+       bot padam resit staff, padam bundle lama, kemudian hantar semula album:
+       order + semua resit (last 9) + butang PAYMENT di bawah caption (tanpa mesej tambahan).
     """
     chat_id = message.chat.id
 
@@ -854,14 +892,14 @@ async def handle_photo(client, message):
         key_id = None
         state = None
 
-        # replied kepada anchor (order selepas lock, belum album)
+        # reply kepada anchor (single order locked)
         if replied_id in ORDER_STATE:
             state = ORDER_STATE.get(replied_id)
             key_id = replied_id
 
-        # replied kepada mana2 gambar dalam album
+        # reply kepada mana-mana gambar album
         elif replied_id in REPLY_MAP:
-            key_id = REPLY_MAP[replied_id]          # album_first_id
+            key_id = REPLY_MAP[replied_id]
             state = ORDER_STATE.get(key_id)
 
         if state and state.get("locked"):
@@ -871,18 +909,18 @@ async def handle_photo(client, message):
             except Exception:
                 pass
 
-            # tambah resit
+            # tambah resit file_id
             state.setdefault("receipts", [])
             state["receipts"].append(message.photo.file_id)
 
-            # padam bundle lama (anchor / album lama)
+            # padam bundle lama (anchor/album)
             await delete_bundle(client, state)
 
-            # rebuild album + lekat button pada album_first_id
+            # rebuild album (order + resit...) => butang muncul pada gambar pertama album
             new_key = await send_or_rebuild_album(client, state)
 
-            # buang state lama dan simpan di key baru
-            if key_id in ORDER_STATE:
+            # pindah key ORDER_STATE
+            if key_id is not None:
                 ORDER_STATE.pop(key_id, None)
             ORDER_STATE[new_key] = state
             return
@@ -935,6 +973,6 @@ async def handle_photo(client, message):
         "album_first_id": None,
     }
 
+
 if __name__ == "__main__":
     bot.run()
-
