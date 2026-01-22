@@ -1,4 +1,4 @@
 pyrogram
 tgcrypto
-google-cloud-vision==3.7.4
-google-auth==2.34.0
+google-cloud-vision
+google-auth
