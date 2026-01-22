@@ -7,10 +7,10 @@ from google.cloud import vision
 TARGET_ACC = "8606018423"
 TARGET_BANK = "CIMB BANK"
 
-# ================== GOOGLE CREDS ==================
-# Railway env vars:
-# API_ID, API_HASH, BOT_TOKEN
-# GOOGLE_APPLICATION_CREDENTIALS_JSON  (paste FULL JSON)
+# ============ Google creds from env ============
+# Railway Variables:
+#   API_ID, API_HASH, BOT_TOKEN
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON  (paste FULL JSON content)
 creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
 if not creds_json:
     raise RuntimeError("Missing env var: GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -20,32 +20,31 @@ tmp.write(creds_json.encode("utf-8"))
 tmp.close()
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
 
-# ================== TELEGRAM ==================
+# ================== Telegram ==================
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Missing API_ID / API_HASH / BOT_TOKEN")
 
-app = Client(
-    "ocr_receipt_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+app = Client("ocr_receipt_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ================== VISION ==================
+# ================== Vision ==================
 vision_client = vision.ImageAnnotatorClient()
 
 # ================== HELPERS ==================
 def normalize_ocr_text(s: str) -> str:
-    """Ringankan kesilapan OCR biasa (SELAMAT utk tarikh & amount)."""
+    """
+    Betulkan salah OCR biasa + kemaskan whitespace.
+    (Tidak tukar 'l' -> '1' supaya perkataan bulan BM tidak rosak: Julai, Disember)
+    """
     if not s:
         return ""
     trans = str.maketrans({
-        "O": "0", "o": "0",
-        "I": "1", "|": reminder_ocr_error := "1",
-        "S": "5", "s": "5",
+        "O": "0", "o": "0",   # O->0
+        "I": "1", "|": "1",   # I/| -> 1
+        "S": "5", "s": "5",   # S->5
     })
     s = s.translate(trans)
     s = re.sub(r"[ \t]+", " ", s)
@@ -55,146 +54,253 @@ def digits_only(s: str) -> str:
     return re.sub(r"\D+", "", s or "")
 
 def account_found(text: str) -> bool:
+    """
+    Akan jumpa walaupun format:
+    - 8 6 0 6 0 1 8 4 2 3
+    - 8606 0184 23
+    - 86-06-01-84-23
+    """
     t = normalize_ocr_text(text)
     return TARGET_ACC in digits_only(t)
 
 def format_dt(dt: datetime) -> str:
-    d = dt.strftime("%d/%m/%Y")
+    # output: DD/MM/YYYY | 12:30am
+    ddmmyyyy = dt.strftime("%d/%m/%Y")
     h, m = dt.hour, dt.minute
     ap = "am" if h < 12 else "pm"
-    h12 = h % 12 or 12
-    return f"{d} | {h12}:{m:02d}{ap}"
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    return f"{ddmmyyyy} | {h12}:{m:02d}{ap}"
 
-# ================== DATETIME ==================
+# ================== DATETIME PARSER ==================
 def parse_datetime(text: str):
     t = normalize_ocr_text(text)
 
-    p_time = re.compile(r"\b(\d{1,2})[:\.](\d{2})(?:[:\.]\d{2})?\s*(am|pm)?\b", re.I)
+    # time: 14:17 / 2:17 PM / 02.17pm / 02:17:59
+    p_time = re.compile(r"\b(\d{1,2})[:\.](\d{2})(?:[:\.](\d{2}))?\s*(am|pm)?\b", re.I)
 
-    mon = {
-        "jan":1,"january":1,"januari":1,
-        "feb":2,"february":2,"februari":2,
-        "mar":3,"march":3,"mac":3,
-        "apr":4,"april":4,
-        "may":5,"mei":5,
-        "jun":6,"june":6,
-        "jul":7,"july":7,"julai":7,
-        "aug":8,"august":8,"ogos":8,
-        "sep":9,"sept":9,"september":9,
-        "oct":10,"october":10,"oktober":10,
-        "nov":11,"november":11,
-        "dec":12,"december":12,"disember":12
+    # month map (EN + BM)
+    mon_map = {
+        # EN
+        "jan": 1, "january": 1,
+        "feb": 2, "february": 2,
+        "mar": 3, "march": 3,
+        "apr": 4, "april": 4,
+        "may": 5,
+        "jun": 6, "june": 6,
+        "jul": 7, "july": 7,
+        "aug": 8, "august": 8,
+        "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10,
+        "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+
+        # BM
+        "januari": 1,
+        "februari": 2,
+        "mac": 3,
+        "april": 4,
+        "mei": 5,
+        "jun": 6,
+        "julai": 7,
+        "ogos": 8,
+        "september": 9, "sep": 9, "sept": 9,
+        "oktober": 10, "oct": 10,
+        "november": 11, "nov": 11,
+        "disember": 12, "dec": 12,
     }
 
-    dates = []
+    def month_to_int(m: str):
+        if not m:
+            return None
+        m2 = m.strip().lower()
+        m2 = re.sub(r"\.+$", "", m2)
+        m2 = re.sub(r"[^a-z]", "", m2)
+        if not m2:
+            return None
+        if m2 in mon_map:
+            return mon_map[m2]
+        if len(m2) >= 3 and m2[:3] in mon_map:
+            return mon_map[m2[:3]]
+        return None
 
-    # D/M/Y
-    for m in re.finditer(r"\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b", t):
+    dates = []  # (pos, (d, m, y))
+    times = []  # (pos, (hh, mm, ampm))
+
+    # A) numeric D/M/Y: 22/01/2026, 2-1-26
+    p_dmy = re.compile(r"\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b")
+    for m in p_dmy.finditer(t):
         dates.append((m.start(), (m.group(1), m.group(2), m.group(3))))
 
-    # Y/M/D
-    for m in re.finditer(r"\b(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})\b", t):
+    # B) numeric Y/M/D: 2026/01/22
+    p_ymd = re.compile(r"\b(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})\b")
+    for m in p_ymd.finditer(t):
         dates.append((m.start(), (m.group(3), m.group(2), m.group(1))))
 
-    # D MON Y
-    for m in re.finditer(r"\b(\d{1,2})\s*([A-Za-z]+)\s*(\d{4})\b", t):
-        mm = mon.get(m.group(2).lower()[:3])
-        if mm:
-            dates.append((m.start(), (m.group(1), str(mm), m.group(3))))
+    # C) D MON Y: 22 Jan 2026 / 22/Jan/2026 / 22 Januari 2026 / 22hb Januari 2026
+    p_d_mon_y = re.compile(
+        r"\b(\d{1,2})(?:st|nd|rd|th|hb)?\s*(?:[\/\-\.\s])\s*([A-Za-z]+)\s*(?:[\/\-\.\s])?\s*(\d{2,4})\b",
+        re.I
+    )
+    for m in p_d_mon_y.finditer(t):
+        d, mon, y = m.group(1), m.group(2), m.group(3)
+        mo = month_to_int(mon)
+        if mo:
+            dates.append((m.start(), (d, str(mo), y)))
+
+    # D) MON D, Y: Jan 22, 2026 / January 22 2026 / Januari 22, 2026
+    p_mon_d_y = re.compile(
+        r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th|hb)?\s*,?\s+(\d{2,4})\b",
+        re.I
+    )
+    for m in p_mon_d_y.finditer(t):
+        mon, d, y = m.group(1), m.group(2), m.group(3)
+        mo = month_to_int(mon)
+        if mo:
+            dates.append((m.start(), (d, str(mo), y)))
+
+    # times
+    for m in p_time.finditer(t):
+        times.append((m.start(), (m.group(1), m.group(2), m.group(4))))
 
     if not dates:
         return None
 
-    times = []
-    for m in p_time.finditer(t):
-        times.append((m.start(), (m.group(1), m.group(2), m.group(3))))
+    # pair nearest date-time
+    best_date = dates[0]
+    best_time = times[0] if times else None
 
-    _, (dd, mm, yy) = dates[0]
-    y = int(yy) + (2000 if int(yy) < 100 else 0)
-    mo, d = int(mm), int(dd)
-
-    hh = minute = 0
     if times:
-        _, (h, mi, ap) = times[0]
-        hh, minute = int(h), int(mi)
+        best = None
+        for dpos, dval in dates:
+            for tpos, tval in times:
+                dist = abs(dpos - tpos)
+                if best is None or dist < best[0]:
+                    best = (dist, (dpos, dval), (tpos, tval))
+        _, best_date, best_time = best
+
+    _, (dd, mm, yyyy) = best_date
+    y = int(yyyy)
+    if y < 100:
+        y += 2000
+    mo = int(mm)
+    d = int(dd)
+
+    if best_time:
+        _, (hh, minute, ap) = best_time
+        hh, minute = int(hh), int(minute)
         if ap:
             ap = ap.lower()
-            if ap == "pm" and hh != 12: hh += 12
-            if ap == "am" and hh == 12: hh = 0
+            if ap == "pm" and hh != 12:
+                hh += 12
+            if ap == "am" and hh == 12:
+                hh = 0
+    else:
+        hh, minute = 0, 0
 
-    return datetime(y, mo, d, hh, minute)
+    try:
+        return datetime(y, mo, d, hh, minute)
+    except:
+        return None
 
-# ================== AMOUNT (WITH SEN) ==================
+# ================== AMOUNT PARSER (WITH SEN) ==================
 def parse_amount(text: str):
     """
-    Support:
-    RM119.70
-    RM 5,900.00
-    MYR119.7
-    Amount 119.70
+    Ambil amount dengan sen.
+    Prioriti: RM/MYR dahulu. Kalau tak jumpa, fallback kepada nombor dekat keyword.
     """
     t = normalize_ocr_text(text).lower()
-    keywords = ["amount","total","jumlah","amaun","payment","paid","successful","transfer"]
+    keywords = ["amount", "total", "jumlah", "amaun", "grand total", "payment", "paid", "pay", "transfer", "successful"]
 
-    p = re.compile(
-        r"\b(?:rm|myr)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+\.[0-9]{1,2})\b",
-        re.I
-    )
+    def score_match(val: float, start: int) -> float:
+        window = t[max(0, start - 60): start + 60]
+        near_kw = any(k in window for k in keywords)
+        return (100 if near_kw else 0) + min(val, 999999) / 1000.0
 
     candidates = []
-    for m in p.finditer(t):
-        num = m.group(1).replace(",", "")
+
+    # PASS 1: RM/MYR formats
+    p_rm = re.compile(
+        r"\b(?:rm|myr)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b",
+        re.I
+    )
+    for m in p_rm.finditer(t):
+        num_str = m.group(1).replace(",", "")
         try:
-            val = float(num)
+            val = float(num_str)
         except:
             continue
-        window = t[max(0, m.start()-40): m.start()+40]
-        score = (80 if any(k in window for k in keywords) else 0) + val
-        candidates.append((score, val))
+        candidates.append((score_match(val, m.start()) + 1000, val))  # tambah bonus utk RM/MYR
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    # PASS 2 (fallback): nombor biasa dekat keyword
+    p_num = re.compile(r"\b([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b")
+    for m in p_num.finditer(t):
+        num_str = m.group(1).replace(",", "")
+        try:
+            val = float(num_str)
+        except:
+            continue
+        candidates.append((score_match(val, m.start()), val))
 
     if not candidates:
         return None
 
-    candidates.sort(reverse=True)
+    candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
 def format_amount_rm(val: float) -> str:
-    """KEKALKAN SEN – TIADA ROUNDING"""
+    # ✅ kekalkan sen: RM119.70
     return f"RM{val:.2f}"
 
 # ================== BOT HANDLER ==================
 @app.on_message(filters.photo)
-async def ocr_handler(_, message):
+async def ocr_photo(_, message):
     photo_path = None
     try:
         photo_path = await message.download()
-        with open(photo_path, "rb") as f:
+        with io.open(photo_path, "rb") as f:
             content = f.read()
 
         image = vision.Image(content=content)
         resp = vision_client.text_detection(image=image)
 
-        text = resp.text_annotations[0].description if resp.text_annotations else ""
-        if not text.strip():
-            await message.reply_text("❌ OCR tak jumpa teks.")
+        if resp.error and resp.error.message:
+            await message.reply_text(f"❌ OCR Error: {resp.error.message}")
             return
 
+        text = (resp.text_annotations[0].description.strip()
+                if resp.text_annotations else "")
+
+        if not text:
+            await message.reply_text("❌ OCR tak jumpa teks (cuba gambar lebih jelas).")
+            return
+
+        # 1) Account
         line1 = f"{TARGET_ACC} {TARGET_BANK}" if account_found(text) else "No akaun tidak sah"
 
+        # 2) Date + time
         dt = parse_datetime(text)
         line2 = format_dt(dt) if dt else "Tarikh tidak dijumpai"
 
+        # 3) Amount
         amt = parse_amount(text)
         line3 = format_amount_rm(amt) if amt is not None else "Total tidak dijumpai"
 
         await message.reply_text(f"{line1}\n{line2}\n{line3}")
 
     except Exception as e:
-        await message.reply_text(f"❌ Error: {e}")
+        await message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
 
     finally:
         if photo_path:
-            try: os.remove(photo_path)
-            except: pass
+            try:
+                os.remove(photo_path)
+            except:
+                pass
 
 app.run()
