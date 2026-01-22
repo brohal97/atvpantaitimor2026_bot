@@ -3,8 +3,8 @@
 # + OCR skrip (Google Vision)
 # + Lepas tekan PAYMENT SETTLE:
 #   - Ayat "SLIDE KIRI TAMBAH RESIT" hilang
-#   - Diganti dengan hasil OCR (terus dalam caption gambar order dalam album)
-# + Butang "BUTANG SEMAK BAYARAN" akan re-run OCR dan update caption album (bukan hantar mesej OCR baru)
+#   - Diganti dengan hasil OCR UNTUK SEMUA RESIT (maks 9 dalam album, tapi OCR boleh simpan lebih)
+# + Butang "BUTANG SEMAK BAYARAN" akan re-run OCR untuk SEMUA RESIT dan update caption album
 # =========================
 
 import os, io, re, tempfile
@@ -99,7 +99,12 @@ KOS_STEP = 10
 KOS_LIST = list(range(KOS_START, KOS_END + 1, KOS_STEP))
 KOS_PER_PAGE = 15  # 3 baris x 5 butang
 
-MAX_RECEIPTS_IN_ALBUM = 9  # Telegram album max 10 media: 1 order + 9 resit
+# Album Telegram max 10 media: 1 order + 9 resit
+MAX_RECEIPTS_IN_ALBUM = 9
+
+# ✅ OCR yang dipaparkan dalam caption boleh jadi banyak (10, 20, 50...)
+# tapi Telegram ada limit caption 1024 chars. Kita limit untuk stabil.
+MAX_OCR_RESULTS_IN_CAPTION = 10
 
 # ================= TEXT STYLE =================
 BOLD_MAP = str.maketrans(
@@ -130,6 +135,33 @@ def calc_products_total(items_dict: dict, prices_dict: dict) -> int:
             pass
     return total
 
+def build_ocr_block(state: dict) -> str:
+    """
+    Gabungkan semua OCR result (ikut turutan resit).
+    - Ambil state["ocr_results"] (list[str]) kalau ada
+    - Limit paparan untuk stabil (caption limit 1024)
+    """
+    results = state.get("ocr_results") or []
+    if not results:
+        return ""
+
+    # limit paparan
+    show = results[-MAX_OCR_RESULTS_IN_CAPTION:]
+    blocks = []
+    for i, txt in enumerate(show, start=max(1, len(results) - len(show) + 1)):
+        t = (txt or "").strip()
+        if not t:
+            continue
+        blocks.append(t)
+
+    out = "\n\n".join(blocks)
+
+    # kalau lebih dari limit, beritahu ringkas
+    if len(results) > len(show):
+        out += f"\n\n(+{len(results) - len(show)} resit lagi tidak dipaparkan sebab limit caption)"
+
+    return out.strip()
+
 def build_caption(
     base_caption: str,
     items_dict: dict,
@@ -139,12 +171,12 @@ def build_caption(
     locked: bool = False,
     receipts_count: int = 0,
     paid: bool = False,
-    ocr_text: str | None = None,
+    state: dict | None = None,
 ) -> str:
     """
-    ✅ BEHAVIOR BARU:
+    ✅ BEHAVIOR:
     - LOCK + belum paid -> tunjuk arahan "SLIDE KIRI ..."
-    - LOCK + sudah paid -> buang arahan slide, ganti OCR result dalam caption
+    - LOCK + sudah paid -> buang arahan slide, ganti OCR result untuk SEMUA resit dalam caption
     """
     prices_dict = prices_dict or {}
     lines = [base_caption]
@@ -179,17 +211,23 @@ def build_caption(
 
     if locked:
         lines.append("")
-        if paid and ocr_text:
-            # ✅ OCR masuk dalam caption
-            lines.append(ocr_text.strip())
+        if paid and state:
+            ocr_block = build_ocr_block(state)
+            if ocr_block:
+                lines.append(ocr_block)
+            else:
+                lines.append("❌ OCR belum ada (tekan BUTANG SEMAK BAYARAN).")
         else:
-            # sebelum paid masih perlu guide slide
             if receipts_count <= 0:
                 lines.append("⬅️" + bold("SLIDE KIRI UPLOAD RESIT"))
             else:
                 lines.append("⬅️" + bold("SLIDE KIRI TAMBAH RESIT"))
 
-    return "\n".join(lines)
+    # ✅ safety: caption limit Telegram ~1024
+    cap = "\n".join(lines)
+    if len(cap) > 1024:
+        cap = cap[:1000] + "\n...(caption terlalu panjang)"
+    return cap
 
 def build_payment_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("PAYMENT SETTLE", callback_data="pay_settle")]])
@@ -385,7 +423,6 @@ def parse_amount(text: str):
 def format_amount_rm(val: float) -> str:
     return f"RM{val:.2f}"
 
-# Status ikut resit (guna teks asal)
 POSITIVE_KW = [
     "transaction successful", "payment successful", "transfer successful",
     "successful", "success", "completed", "complete",
@@ -429,9 +466,6 @@ def detect_status_original(text: str) -> str:
     return "Status tidak pasti ❓"
 
 async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
-    """
-    Download file_id -> Google Vision -> parse OCR skrip -> hasil string.
-    """
     tmp_path = None
     try:
         tmp_path = await client.download_media(file_id)
@@ -470,20 +504,27 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
             except Exception:
                 pass
 
+async def run_ocr_for_all_receipts(client: Client, state: dict) -> list[str]:
+    """
+    ✅ OCR untuk SEMUA resit dalam state["receipts"]
+    Simpan result ikut turutan resit.
+    """
+    receipts = state.get("receipts") or []
+    results = []
+    for fid in receipts:
+        try:
+            results.append(await run_ocr_on_receipt_file_id(client, fid))
+        except Exception as e:
+            results.append(f"❌ OCR Error: {type(e).__name__}: {e}")
+    return results
+
 # ================= ALBUM SENDER =================
 async def send_or_rebuild_album(client: Client, state: dict) -> int:
-    """
-    Hantar / rebuild album:
-    - order + semua resit (last 9)
-    - caption pada gambar order (album first) termasuk OCR jika sudah paid
-    - selepas album dihantar: create CONTROL message (bukan reply)
-    Return: control_msg_id baru (jadi key ORDER_STATE)
-    """
     chat_id = state["chat_id"]
 
-    receipts = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
-    state["receipts"] = receipts
-
+    # album hanya simpan last 9 resit (Telegram limit)
+    receipts_album = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
+    state["receipts_album"] = receipts_album  # simpan untuk reference
     caption = build_caption(
         state["base_caption"],
         state.get("items", {}),
@@ -491,13 +532,13 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
         state.get("dest"),
         state.get("ship_cost"),
         locked=True,
-        receipts_count=len(receipts),
+        receipts_count=len(receipts_album),
         paid=bool(state.get("paid")),
-        ocr_text=state.get("ocr_text"),
+        state=state,
     )
 
     media = [InputMediaPhoto(media=state["photo_id"], caption=caption)]
-    for r in receipts:
+    for r in receipts_album:
         media.append(InputMediaPhoto(media=r))
 
     album_msgs = await client.send_media_group(chat_id=chat_id, media=media)
@@ -547,7 +588,6 @@ def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
-    # ✅ callback_data standard: qty_<produk>_<n>
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
@@ -701,7 +741,7 @@ async def simpan_qty_repost(client, callback):
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
-        ocr_text=state.get("ocr_text"),
+        state=state,
     )
 
     try:
@@ -741,7 +781,7 @@ async def submit_order(client, callback):
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
-        ocr_text=state.get("ocr_text"),
+        state=state,
     )
 
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
@@ -822,7 +862,7 @@ async def set_harga(client, callback):
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
-        ocr_text=state.get("ocr_text"),
+        state=state,
     )
 
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
@@ -881,7 +921,7 @@ async def set_destinasi(client, callback):
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
-        ocr_text=state.get("ocr_text"),
+        state=state,
     )
 
     try:
@@ -960,7 +1000,7 @@ async def set_kos(client, callback):
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
-        ocr_text=state.get("ocr_text"),
+        state=state,
     )
 
     try:
@@ -1007,9 +1047,10 @@ async def last_submit(client, callback):
     state.setdefault("paid", False)
     state.setdefault("paid_at", None)
     state.setdefault("paid_by", None)
-    state.setdefault("ocr_text", None)
 
-    # album data reset (akan wujud bila resit masuk)
+    # ✅ OCR: simpan semua result dalam list
+    state.setdefault("ocr_results", [])
+
     state["album_msg_ids"] = None
     state["album_first_id"] = None
     state["control_msg_id"] = None
@@ -1026,7 +1067,7 @@ async def last_submit(client, callback):
         locked=True,
         receipts_count=len(state.get("receipts", [])),
         paid=False,
-        ocr_text=None,
+        state=state,
     )
 
     try:
@@ -1047,7 +1088,7 @@ async def last_submit(client, callback):
 
     ORDER_STATE[old_id] = state
 
-# ====== PAYMENT SETTLE ======
+# ====== PAYMENT SETTLE (OCR semua resit) ======
 @bot.on_callback_query(filters.regex(r"^pay_settle$"))
 async def pay_settle(client, callback):
     control_id = callback.message.id
@@ -1064,25 +1105,21 @@ async def pay_settle(client, callback):
         await callback.answer("Tiada resit. Sila upload resit dulu.", show_alert=True)
         return
 
-    await callback.answer("Proses OCR & settle...")
+    await callback.answer("Proses OCR semua resit & settle...")
 
     tz = pytz.timezone("Asia/Kuala_Lumpur")
     now = datetime.now(tz)
-    display = now.strftime("%d/%m/%Y %I:%M%p").lower()
-
     state["paid"] = True
-    state["paid_at"] = display
+    state["paid_at"] = now.strftime("%d/%m/%Y %I:%M%p").lower()
     state["paid_by"] = callback.from_user.id if callback.from_user else None
 
-    # OCR resit terakhir
-    last_receipt_id = receipts[-1]
-    state["ocr_text"] = await run_ocr_on_receipt_file_id(client, last_receipt_id)
+    # ✅ OCR semua resit
+    state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
 
     # padam bundle lama (album/control/anchor)
     await delete_bundle(client, state)
 
-    # rebuild album:
-    # ✅ caption akan buang "SLIDE..." dan ganti OCR
+    # rebuild album: caption akan papar semua OCR (ikut limit)
     new_control_id = await send_or_rebuild_album(client, state)
 
     # rebind key state (bersih semua key lama)
@@ -1091,7 +1128,7 @@ async def pay_settle(client, callback):
             ORDER_STATE.pop(k, None)
     ORDER_STATE[new_control_id] = state
 
-# ====== BUTANG SEMAK BAYARAN (rerun OCR & update caption album) ======
+# ====== BUTANG SEMAK BAYARAN (OCR semua resit + update caption) ======
 @bot.on_callback_query(filters.regex(r"^semak_bayaran$"))
 async def semak_bayaran(client, callback):
     control_id = callback.message.id
@@ -1105,10 +1142,10 @@ async def semak_bayaran(client, callback):
         await callback.answer("Tiada resit untuk disemak.", show_alert=True)
         return
 
-    await callback.answer("Semak OCR...")
+    await callback.answer("Semak OCR semua resit...")
 
-    last_receipt_id = receipts[-1]
-    state["ocr_text"] = await run_ocr_on_receipt_file_id(client, last_receipt_id)
+    # ✅ OCR semua resit
+    state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
 
     # update caption album pertama (gambar order)
     if state.get("album_first_id"):
@@ -1119,9 +1156,9 @@ async def semak_bayaran(client, callback):
             state.get("dest"),
             state.get("ship_cost"),
             locked=True,
-            receipts_count=len(receipts),
+            receipts_count=len(state.get("receipts_album", []) or []),
             paid=True,
-            ocr_text=state.get("ocr_text"),
+            state=state,
         )
         try:
             await client.edit_message_caption(
@@ -1144,26 +1181,16 @@ async def handle_photo(client, message):
         control_id = None
         state = None
 
-        # reply kepada control message (butang bawah)
         if replied_id in ORDER_STATE:
             state = ORDER_STATE.get(replied_id)
             control_id = replied_id
-
-        # reply kepada mana-mana gambar dalam album
         elif replied_id in REPLY_MAP:
             control_id = REPLY_MAP[replied_id]
             state = ORDER_STATE.get(control_id)
 
         if state and state.get("locked"):
-            # ✅ kalau dah paid, tak terima resit baru (lebih stabil)
-            if state.get("paid"):
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-                return
-
-            # padam gambar resit staff (kemas)
+            # lepas paid: masih boleh tambah resit (awak nak banyak result)
+            # tapi caption limit, jadi mungkin tak muat semua — bot akan limit & bagitahu.
             try:
                 await message.delete()
             except Exception:
@@ -1172,13 +1199,18 @@ async def handle_photo(client, message):
             state.setdefault("receipts", [])
             state["receipts"].append(message.photo.file_id)
 
-            # padam bundle lama
-            await delete_bundle(client, state)
+            # bila tambah resit selepas paid, reset paid->False supaya staff tekan settle semula kalau mahu
+            # (kalau awak tak mahu reset, buang 3 baris ini)
+            if state.get("paid"):
+                state["paid"] = False
+                state["paid_at"] = None
+                state["paid_by"] = None
 
-            # rebuild album + control
+            state.setdefault("ocr_results", [])
+
+            await delete_bundle(client, state)
             new_control_id = await send_or_rebuild_album(client, state)
 
-            # rebind key state
             for k in list(ORDER_STATE.keys()):
                 if ORDER_STATE.get(k) is state:
                     ORDER_STATE.pop(k, None)
@@ -1223,19 +1255,19 @@ async def handle_photo(client, message):
         "dest": None,
         "ship_cost": None,
         "receipts": [],
+        "receipts_album": [],
         "paid": False,
         "paid_at": None,
         "paid_by": None,
         "locked": False,
 
-        # album bundle
         "anchor_msg_id": sent.id,
         "album_msg_ids": None,
         "album_first_id": None,
         "control_msg_id": None,
 
-        # OCR
-        "ocr_text": None,
+        # ✅ OCR list
+        "ocr_results": [],
     }
 
 if __name__ == "__main__":
