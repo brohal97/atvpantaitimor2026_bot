@@ -32,12 +32,15 @@ bot = Client(
 #   "prices": {produk_key: unit_price_int},
 #   "dest": str | None,
 #   "ship_cost": int | None,
-#   "receipt_photo_id": str | None,
+#   "receipts": [str, ...],          # multi resit
+#   "paid": bool,
+#   "paid_at": str | None,
+#   "paid_by": int | None,
 #   "locked": bool
 # }
 ORDER_STATE = {}
 
-# bila staff tekan "UPLOAD GAMBAR RESIT"
+# bila staff tekan "ADD RESIT" (fallback manual)
 # key = (chat_id, user_id) -> value = order_msg_id
 WAITING_RECEIPT = {}
 
@@ -110,7 +113,11 @@ def build_caption(
     items_dict: dict,
     prices_dict: dict | None = None,
     dest: str | None = None,
-    ship_cost: int | None = None
+    ship_cost: int | None = None,
+    locked: bool = False,
+    paid: bool = False,
+    receipts_count: int = 0,
+    paid_at: str | None = None,
 ) -> str:
     """
     Khamis | 22/1/2026 | 12:13am
@@ -158,6 +165,18 @@ def build_caption(
         lines.append("")
         lines.append(f"TOTAL KESELURUHAN : RM{grand_total}")
 
+    # status
+    if locked:
+        lines.append("")
+        lines.append("🧾 JARI SLIDE KIRI (REPLY) PADA MESEJ INI UNTUK UPLOAD RESIT")
+        if receipts_count:
+            lines.append(f"📎 RESIT: {receipts_count} keping")
+        if paid:
+            if paid_at:
+                lines.append(f"✅ PAYMENT SETTLED ({paid_at})")
+            else:
+                lines.append("✅ PAYMENT SETTLED")
+
     return "\n".join(lines)
 
 
@@ -170,18 +189,30 @@ def clone_state_for_new_msg(state: dict) -> dict:
         "prices": dict(state.get("prices", {})),
         "dest": state.get("dest"),
         "ship_cost": state.get("ship_cost"),
-        "receipt_photo_id": state.get("receipt_photo_id"),
+        "receipts": list(state.get("receipts", [])),
+        "paid": bool(state.get("paid", False)),
+        "paid_at": state.get("paid_at"),
+        "paid_by": state.get("paid_by"),
         "locked": bool(state.get("locked", False)),
     }
 
 
 async def repost_message(client: Client, old_msg, state: dict, reply_markup: InlineKeyboardMarkup | None):
+    # paid_at display pendek
+    paid_at_display = None
+    if state.get("paid_at"):
+        paid_at_display = state["paid_at"]
+
     caption_baru = build_caption(
         state["base_caption"],
         state["items"],
         state.get("prices", {}),
         state.get("dest"),
         state.get("ship_cost"),
+        locked=bool(state.get("locked")),
+        paid=bool(state.get("paid")),
+        receipts_count=len(state.get("receipts", [])),
+        paid_at=paid_at_display,
     )
 
     try:
@@ -198,7 +229,7 @@ async def repost_message(client: Client, old_msg, state: dict, reply_markup: Inl
     return new_msg
 
 
-async def deny_if_locked(state: dict, callback, allow_upload_only: bool = False) -> bool:
+async def deny_if_locked(state: dict, callback, allow_when_locked: bool = False) -> bool:
     """
     Return True jika boleh teruskan.
     Return False jika order locked dan perlu stop.
@@ -207,14 +238,40 @@ async def deny_if_locked(state: dict, callback, allow_upload_only: bool = False)
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return False
 
-    if state.get("locked"):
-        # kalau lock, hanya allow upload_resit
-        if allow_upload_only and callback.data == "upload_resit":
-            return True
+    if state.get("locked") and not allow_when_locked:
         await callback.answer("Order ini sudah LAST SUBMIT (LOCK).", show_alert=True)
         return False
 
     return True
+
+
+async def refresh_order_caption_and_kb(client: Client, msg, state: dict, kb: InlineKeyboardMarkup):
+    """
+    Update caption + keyboard pada message order sedia ada (tanpa repost).
+    Kalau gagal (contoh message lama / caption same / permission), fallback repost.
+    """
+    paid_at_display = state.get("paid_at")
+    caption_baru = build_caption(
+        state["base_caption"],
+        state.get("items", {}),
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=bool(state.get("locked")),
+        paid=bool(state.get("paid")),
+        receipts_count=len(state.get("receipts", [])),
+        paid_at=paid_at_display,
+    )
+
+    try:
+        await msg.edit_caption(caption=caption_baru, reply_markup=kb)
+        return msg
+    except Exception:
+        # fallback: repost (delete+send) untuk pastikan caption update
+        new_msg = await repost_message(client, msg, state, kb)
+        ORDER_STATE[new_msg.id] = clone_state_for_new_msg(state)
+        ORDER_STATE.pop(msg.id, None)
+        return new_msg
 
 
 # ================= KEYBOARDS =================
@@ -357,10 +414,13 @@ def build_after_cost_keyboard() -> InlineKeyboardMarkup:
 
 def build_final_keyboard() -> InlineKeyboardMarkup:
     """
-    Selepas LAST SUBMIT: tinggal 1 butang sahaja.
+    Selepas LAST SUBMIT:
+    - tiada butang upload (upload guna swipe reply)
+    - ada 2 butang: PAYMENT SETTLE + ADD RESIT (manual fallback)
     """
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧾 UPLOAD GAMBAR RESIT", callback_data="upload_resit")]
+        [InlineKeyboardButton("✅ PAYMENT SETTLE", callback_data="pay_settle")],
+        [InlineKeyboardButton("➕ ADD RESIT", callback_data="add_resit")],
     ])
 
 
@@ -370,7 +430,6 @@ async def senarai_produk(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
-
     await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
     await callback.answer()
 
@@ -380,7 +439,6 @@ async def back_produk(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
-
     await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
     await callback.answer()
 
@@ -390,7 +448,6 @@ async def pilih_kuantiti(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
-
     produk_key = callback.data.replace("produk_", "", 1)
     await callback.message.edit_reply_markup(reply_markup=build_qty_keyboard(produk_key))
     await callback.answer("Pilih kuantiti")
@@ -641,25 +698,60 @@ async def last_submit(client, callback):
         return
 
     state["locked"] = True
+    # init extra fields
+    state.setdefault("receipts", [])
+    state.setdefault("paid", False)
+    state.setdefault("paid_at", None)
+    state.setdefault("paid_by", None)
+
     await callback.answer("Last submit ✅")
 
-    # Repost final: tinggal 1 butang UPLOAD RESIT
+    # Repost final: 2 butang (payment settle + add resit)
     new_msg = await repost_message(client, msg, state, build_final_keyboard())
     ORDER_STATE[new_msg.id] = clone_state_for_new_msg(state)
     ORDER_STATE.pop(old_msg_id, None)
 
 
-# ====== UPLOAD GAMBAR RESIT (dibolehkan walaupun locked) ======
-@bot.on_callback_query(filters.regex(r"^upload_resit$"))
-async def upload_resit(client, callback):
+# ====== PAYMENT SETTLE (dibolehkan walaupun locked) ======
+@bot.on_callback_query(filters.regex(r"^pay_settle$"))
+async def pay_settle(client, callback):
     state = ORDER_STATE.get(callback.message.id)
-    if not await deny_if_locked(state, callback, allow_upload_only=True):
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
 
-    # set pending receipt untuk user yg tekan
-    WAITING_RECEIPT[(callback.message.chat.id, callback.from_user.id)] = callback.message.id
+    if not state.get("locked"):
+        await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
+        return
 
-    await callback.answer("Sila reply gambar resit", show_alert=False)
+    tz = pytz.timezone("Asia/Kuala_Lumpur")
+    now = datetime.now(tz)
+    display = now.strftime("%d/%m/%Y %I:%M%p").lower()
+
+    state["paid"] = True
+    state["paid_at"] = display
+    state["paid_by"] = callback.from_user.id if callback.from_user else None
+
+    await callback.answer("Payment settled ✅")
+
+    # update caption + keyboard
+    await refresh_order_caption_and_kb(client, callback.message, state, build_final_keyboard())
+
+
+# ====== ADD RESIT (manual fallback, keluarkan ForceReply) ======
+@bot.on_callback_query(filters.regex(r"^add_resit$"))
+async def add_resit(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    if not state.get("locked"):
+        await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
+        return
+
+    WAITING_RECEIPT[(callback.message.chat.id, callback.from_user.id)] = callback.message.id
+    await callback.answer()
 
     await client.send_message(
         chat_id=callback.message.chat.id,
@@ -672,25 +764,103 @@ async def upload_resit(client, callback):
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
     """
-    2 kes:
+    3 kes:
     A) gambar order baru -> bot jadikan order UI
-    B) gambar resit (reply) -> kalau user sedang WAITING_RECEIPT, simpan resit
+    B) gambar resit (SWIPE REPLY pada order locked) -> bot senyap, padam resit staff, repost resit + detail
+    C) gambar resit (manual: selepas tekan ADD RESIT / ForceReply) -> simpan, padam, repost
     """
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else 0
 
-    # ====== KES B: RESIT ======
+    # ====== KES B: RESIT (SWIPE REPLY pada order locked) ======
+    if message.reply_to_message:
+        replied_id = message.reply_to_message.id
+        state = ORDER_STATE.get(replied_id)
+
+        if state and state.get("locked"):
+            state.setdefault("receipts", [])
+            state["receipts"].append(message.photo.file_id)
+
+            # padam gambar resit staff (jika bot admin)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            # repost resit + detail order (senyap, tiada reply text)
+            caption_order = build_caption(
+                state["base_caption"],
+                state.get("items", {}),
+                state.get("prices", {}),
+                state.get("dest"),
+                state.get("ship_cost"),
+                locked=True,
+                paid=bool(state.get("paid")),
+                receipts_count=len(state.get("receipts", [])),
+                paid_at=state.get("paid_at"),
+            )
+
+            # hantar gabung resit + detail (guna photo resit)
+            await client.send_photo(
+                chat_id=state["chat_id"],
+                photo=message.photo.file_id,
+                caption="🧾 RESIT\n\n" + caption_order
+            )
+
+            # update caption order asal supaya counter resit naik
+            await refresh_order_caption_and_kb(client, message.reply_to_message, state, build_final_keyboard())
+            return
+
+    # ====== KES C: RESIT (manual selepas ADD RESIT / ForceReply) ======
     key = (chat_id, user_id)
     if key in WAITING_RECEIPT:
         order_msg_id = WAITING_RECEIPT.pop(key)
         state = ORDER_STATE.get(order_msg_id)
 
         if not state:
+            # diam je pun boleh, tapi bagi tau ringkas
             await message.reply_text("Order asal tidak dijumpai. Sila cuba semula.")
             return
 
-        state["receipt_photo_id"] = message.photo.file_id
-        await message.reply_text("Resit diterima ✅")
+        if not state.get("locked"):
+            # kalau belum locked, ignore
+            return
+
+        state.setdefault("receipts", [])
+        state["receipts"].append(message.photo.file_id)
+
+        # padam gambar resit staff (jika bot admin)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        caption_order = build_caption(
+            state["base_caption"],
+            state.get("items", {}),
+            state.get("prices", {}),
+            state.get("dest"),
+            state.get("ship_cost"),
+            locked=True,
+            paid=bool(state.get("paid")),
+            receipts_count=len(state.get("receipts", [])),
+            paid_at=state.get("paid_at"),
+        )
+
+        await client.send_photo(
+            chat_id=state["chat_id"],
+            photo=message.photo.file_id,
+            caption="🧾 RESIT\n\n" + caption_order
+        )
+
+        # update order message supaya counter resit naik
+        # NOTE: order_msg_id mungkin message lama yg sudah repost; jika tiada, tak apa
+        try:
+            order_msg = await client.get_messages(chat_id, order_msg_id)
+            await refresh_order_caption_and_kb(client, order_msg, state, build_final_keyboard())
+        except Exception:
+            pass
+
         return
 
     # ====== KES A: ORDER BARU ======
@@ -731,10 +901,14 @@ async def handle_photo(client, message):
         "prices": {},
         "dest": None,
         "ship_cost": None,
-        "receipt_photo_id": None,
+        "receipts": [],
+        "paid": False,
+        "paid_at": None,
+        "paid_by": None,
         "locked": False,
     }
 
 
 if __name__ == "__main__":
     bot.run()
+
