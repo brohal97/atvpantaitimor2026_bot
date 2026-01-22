@@ -3,14 +3,15 @@ from datetime import datetime
 from pyrogram import Client, filters
 from google.cloud import vision
 
-# ================== TARGET ==================
+# ================== SETTINGS ==================
 TARGET_ACC = "8606018423"
 TARGET_BANK = "CIMB BANK"
+MAX_REPLY_CHARS = 3500  # safety limit telegram
 
-# ============ Google creds from env ============
-# Railway Variables:
+# ================== GOOGLE CREDS (Railway Env) ==================
+# Required Railway Variables:
 #   API_ID, API_HASH, BOT_TOKEN
-#   GOOGLE_APPLICATION_CREDENTIALS_JSON  (paste FULL JSON content)
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON   (paste FULL JSON content)
 creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
 if not creds_json:
     raise RuntimeError("Missing env var: GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -20,31 +21,30 @@ tmp.write(creds_json.encode("utf-8"))
 tmp.close()
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
 
-# ================== Telegram ==================
+# ================== TELEGRAM ==================
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Missing API_ID / API_HASH / BOT_TOKEN")
 
 app = Client("ocr_receipt_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ================== Vision ==================
+# ================== VISION ==================
 vision_client = vision.ImageAnnotatorClient()
 
 # ================== HELPERS ==================
 def normalize_ocr_text(s: str) -> str:
     """
     Betulkan salah OCR biasa + kemaskan whitespace.
-    (Tidak tukar 'l' -> '1' supaya perkataan bulan BM tidak rosak: Julai, Disember)
+    Nota: sengaja TIDAK tukar 'l'->'1' supaya bulan BM (Julai/Disember) tak rosak.
     """
     if not s:
         return ""
     trans = str.maketrans({
-        "O": "0", "o": "0",   # O->0
-        "I": "1", "|": "1",   # I/| -> 1
-        "S": "5", "s": "5",   # S->5
+        "O": "0", "o": "0",   # O -> 0
+        "I": "1", "|": "1",   # I / | -> 1
+        "S": "5", "s": "5",   # S -> 5
     })
     s = s.translate(trans)
     s = re.sub(r"[ \t]+", " ", s)
@@ -68,16 +68,27 @@ def format_dt(dt: datetime) -> str:
     ddmmyyyy = dt.strftime("%d/%m/%Y")
     h, m = dt.hour, dt.minute
     ap = "am" if h < 12 else "pm"
-    h12 = h % 12
-    if h12 == 0:
-        h12 = 12
+    h12 = h % 12 or 12
     return f"{ddmmyyyy} | {h12}:{m:02d}{ap}"
 
 # ================== DATETIME PARSER ==================
 def parse_datetime(text: str):
+    """
+    Supported:
+    - 22/01/2026, 22-01-26, 22.1.2026
+    - 2026/01/22, 2026-1-22
+    - 22 Jan 2026, 22 January 2026
+    - 22/Jan/2026, 22-Jan-2026, 22.Jan.2026
+    - Jan 22, 2026
+    - 22 Januari 2026, 22hb Januari 2026
+    Time:
+    - 10:38, 22:51, 10.38
+    - 10:38 PM, 10:38PM, 10.38pm
+    - 10:38:48 (seconds ignored)
+    """
     t = normalize_ocr_text(text)
 
-    # time: 14:17 / 2:17 PM / 02.17pm / 02:17:59
+    # time patterns
     p_time = re.compile(r"\b(\d{1,2})[:\.](\d{2})(?:[:\.](\d{2}))?\s*(am|pm)?\b", re.I)
 
     # month map (EN + BM)
@@ -115,8 +126,8 @@ def parse_datetime(text: str):
         if not m:
             return None
         m2 = m.strip().lower()
-        m2 = re.sub(r"\.+$", "", m2)
-        m2 = re.sub(r"[^a-z]", "", m2)
+        m2 = re.sub(r"\.+$", "", m2)     # Jan. -> Jan
+        m2 = re.sub(r"[^a-z]", "", m2)   # buang comma/simbol
         if not m2:
             return None
         if m2 in mon_map:
@@ -128,17 +139,17 @@ def parse_datetime(text: str):
     dates = []  # (pos, (d, m, y))
     times = []  # (pos, (hh, mm, ampm))
 
-    # A) numeric D/M/Y: 22/01/2026, 2-1-26
+    # A) numeric D/M/Y
     p_dmy = re.compile(r"\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b")
     for m in p_dmy.finditer(t):
         dates.append((m.start(), (m.group(1), m.group(2), m.group(3))))
 
-    # B) numeric Y/M/D: 2026/01/22
+    # B) numeric Y/M/D
     p_ymd = re.compile(r"\b(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})\b")
     for m in p_ymd.finditer(t):
         dates.append((m.start(), (m.group(3), m.group(2), m.group(1))))
 
-    # C) D MON Y: 22 Jan 2026 / 22/Jan/2026 / 22 Januari 2026 / 22hb Januari 2026
+    # C) D MON Y (with separators)
     p_d_mon_y = re.compile(
         r"\b(\d{1,2})(?:st|nd|rd|th|hb)?\s*(?:[\/\-\.\s])\s*([A-Za-z]+)\s*(?:[\/\-\.\s])?\s*(\d{2,4})\b",
         re.I
@@ -149,7 +160,7 @@ def parse_datetime(text: str):
         if mo:
             dates.append((m.start(), (d, str(mo), y)))
 
-    # D) MON D, Y: Jan 22, 2026 / January 22 2026 / Januari 22, 2026
+    # D) MON D, Y
     p_mon_d_y = re.compile(
         r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th|hb)?\s*,?\s+(\d{2,4})\b",
         re.I
@@ -160,14 +171,13 @@ def parse_datetime(text: str):
         if mo:
             dates.append((m.start(), (d, str(mo), y)))
 
-    # times
     for m in p_time.finditer(t):
         times.append((m.start(), (m.group(1), m.group(2), m.group(4))))
 
     if not dates:
         return None
 
-    # pair nearest date-time
+    # choose nearest date-time
     best_date = dates[0]
     best_time = times[0] if times else None
 
@@ -231,7 +241,7 @@ def parse_amount(text: str):
             val = float(num_str)
         except:
             continue
-        candidates.append((score_match(val, m.start()) + 1000, val))  # tambah bonus utk RM/MYR
+        candidates.append((score_match(val, m.start()) + 1000, val))  # bonus utk RM/MYR
 
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -254,8 +264,10 @@ def parse_amount(text: str):
     return candidates[0][1]
 
 def format_amount_rm(val: float) -> str:
-    # ✅ kekalkan sen: RM119.70
     return f"RM{val:.2f}"
+
+def build_line(label_ok: str, label_bad: str, ok: bool) -> str:
+    return f"{label_ok} ✅" if ok else f"{label_bad} ❌"
 
 # ================== BOT HANDLER ==================
 @app.on_message(filters.photo)
@@ -280,18 +292,37 @@ async def ocr_photo(_, message):
             await message.reply_text("❌ OCR tak jumpa teks (cuba gambar lebih jelas).")
             return
 
-        # 1) Account
-        line1 = f"{TARGET_ACC} {TARGET_BANK}" if account_found(text) else "No akaun tidak sah"
+        # ACCOUNT
+        ok_acc = account_found(text)
+        line1 = build_line(
+            f"{TARGET_ACC} {TARGET_BANK}",
+            "No akaun tidak sah",
+            ok_acc
+        )
 
-        # 2) Date + time
+        # DATETIME
         dt = parse_datetime(text)
-        line2 = format_dt(dt) if dt else "Tarikh tidak dijumpai"
+        ok_dt = dt is not None
+        line2 = build_line(
+            format_dt(dt) if ok_dt else "",
+            "Tarikh tidak dijumpai",
+            ok_dt
+        )
 
-        # 3) Amount
+        # AMOUNT
         amt = parse_amount(text)
-        line3 = format_amount_rm(amt) if amt is not None else "Total tidak dijumpai"
+        ok_amt = amt is not None
+        line3 = build_line(
+            format_amount_rm(amt) if ok_amt else "",
+            "Total tidak dijumpai",
+            ok_amt
+        )
 
-        await message.reply_text(f"{line1}\n{line2}\n{line3}")
+        reply = f"{line1}\n{line2}\n{line3}"
+        if len(reply) > MAX_REPLY_CHARS:
+            reply = reply[:MAX_REPLY_CHARS] + "\n...\n(terlalu panjang)"
+
+        await message.reply_text(reply)
 
     except Exception as e:
         await message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
