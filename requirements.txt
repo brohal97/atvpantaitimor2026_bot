@@ -1,4 +1,5 @@
 pyrogram
 tgcrypto
+pytz
 google-cloud-vision
 google-auth
