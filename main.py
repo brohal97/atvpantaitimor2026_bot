@@ -313,4 +313,3 @@ async def ocr_photo(_, message):
                 pass
 
 app.run()
-
