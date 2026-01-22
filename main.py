@@ -7,7 +7,6 @@ from pyrogram.errors import MessageDeleteForbidden, ChatAdminRequired
 from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ForceReply,
     InputMediaPhoto,
 )
 
@@ -28,7 +27,10 @@ bot = Client(
 )
 
 # ================= TEMP STATE (RAM) =================
-# ORDER_STATE key = "CONTROL MESSAGE ID" (message yang ada buttons)
+# ORDER_STATE key:
+#   - sebelum album: key = order_msg_id (photo message)
+#   - selepas album: key = control_msg_id (message yang ada button PAYMENT SETTLE)
+#
 # state = {
 #   "chat_id": int,
 #   "photo_id": str,                # order photo file_id
@@ -37,27 +39,26 @@ bot = Client(
 #   "prices": {produk_key: unit_price_int},
 #   "dest": str | None,
 #   "ship_cost": int | None,
-#   "receipts": [file_id, ...],
+#
+#   "receipts": [file_id, ...],     # resit file_id
 #   "paid": bool,
 #   "paid_at": str | None,
 #   "paid_by": int | None,
 #   "locked": bool,
 #
-#   # bila dah jadi ALBUM (order+resit)
-#   "album_msg_ids": [int, int] | None,   # msg ids album (order+resit)
+#   "anchor_msg_id": int | None,    # mesej photo order (masa belum album) untuk reply swipe
+#
+#   "album_msg_ids": [int, ...] | None,   # msg ids album (order+resit...)
 #   "album_first_id": int | None,         # msg id pertama album (caption ada di sini)
-#   "control_msg_id": int | None,         # msg id control (buttons) => sama dgn key ORDER_STATE
+#   "control_msg_id": int | None,         # msg id control (button payment)
 # }
 ORDER_STATE = {}
 
-# Mapping untuk detect reply pada mana-mana message dalam album -> pergi ke control message id
+# Mapping reply untuk album image -> control_msg_id
 # key = album_message_id -> value = control_message_id
 REPLY_MAP = {}
 
-# Manual fallback (bila tekan ADD RESIT)
-# key = (chat_id, user_id) -> value = control_msg_id
-WAITING_RECEIPT = {}
-
+# ================= DATA =================
 PRODUK_LIST = {
     "125_FULL": "125 FULL SPEC",
     "125_BIG": "125 BIG BODY",
@@ -69,14 +70,12 @@ PRODUK_LIST = {
     "TROLI_PLASTIK": "TROLI PLASTIK",
 }
 
-# ================= HARGA PRODUK LIST =================
 HARGA_START = 2500
 HARGA_END = 3000
 HARGA_STEP = 10
 HARGA_LIST = list(range(HARGA_START, HARGA_END + 1, HARGA_STEP))
 HARGA_PER_PAGE = 15  # 3 baris x 5 butang
 
-# ================= DESTINASI LIST =================
 DEST_LIST = [
     "JOHOR",
     "KEDAH",
@@ -94,12 +93,15 @@ DEST_LIST = [
     "LORI KITA HANTAR",
 ]
 
-# ================= KOS PENGHANTARAN LIST =================
 KOS_START = 0
 KOS_END = 1500
 KOS_STEP = 10
 KOS_LIST = list(range(KOS_START, KOS_END + 1, KOS_STEP))
 KOS_PER_PAGE = 15  # 3 baris x 5 butang
+
+# Telegram album max 10 media:
+# 1 order + max 9 resit
+MAX_RECEIPTS_IN_ALBUM = 9
 
 
 # ================= UTIL =================
@@ -136,13 +138,11 @@ def build_caption(
     prices_dict = prices_dict or {}
     lines = [base_caption]
 
-    # list produk
     if items_dict:
         lines.append("")
         for k, q in items_dict.items():
             nama = PRODUK_LIST.get(k, k)
             unit_price = prices_dict.get(k)
-
             if unit_price is None:
                 harga_display = "-"
             else:
@@ -151,10 +151,8 @@ def build_caption(
                 except Exception:
                     total_line = unit_price
                 harga_display = f"RM{total_line}"
-
             lines.append(f"{nama} | {q} | {harga_display}")
 
-    # destinasi + kos
     if dest:
         lines.append("")
         if ship_cost is None:
@@ -162,19 +160,20 @@ def build_caption(
         else:
             lines.append(f"Destinasi : {dest} | RM{int(ship_cost)}")
 
-    # total keseluruhan
     if items_dict and is_all_prices_done(items_dict, prices_dict) and ship_cost is not None:
         prod_total = calc_products_total(items_dict, prices_dict)
         grand_total = prod_total + int(ship_cost)
         lines.append("")
         lines.append(f"TOTAL KESELURUHAN : RM{grand_total}")
 
-    # arahan + status
     if locked:
         lines.append("")
-        lines.append("🧾 JARI SLIDE KIRI (REPLY) PADA MESEJ INI UNTUK UPLOAD RESIT")
-        if receipts_count:
+        if receipts_count <= 0:
+            lines.append("🧾 JARI SLIDE KIRI (REPLY) PADA MESEJ INI UNTUK UPLOAD RESIT")
+        else:
+            lines.append("📎 SLIDE KE KIRI (REPLY) UNTUK TAMBAH RESIT")
             lines.append(f"📎 RESIT: {receipts_count} keping")
+
         if paid:
             if paid_at:
                 lines.append(f"✅ PAYMENT SETTLED ({paid_at})")
@@ -184,24 +183,11 @@ def build_caption(
     return "\n".join(lines)
 
 
-def clone_state_for_new_msg(state: dict) -> dict:
-    return {
-        "chat_id": state["chat_id"],
-        "photo_id": state["photo_id"],
-        "base_caption": state["base_caption"],
-        "items": dict(state.get("items", {})),
-        "prices": dict(state.get("prices", {})),
-        "dest": state.get("dest"),
-        "ship_cost": state.get("ship_cost"),
-        "receipts": list(state.get("receipts", [])),
-        "paid": bool(state.get("paid", False)),
-        "paid_at": state.get("paid_at"),
-        "paid_by": state.get("paid_by"),
-        "locked": bool(state.get("locked", False)),
-        "album_msg_ids": list(state.get("album_msg_ids") or []) if state.get("album_msg_ids") else None,
-        "album_first_id": state.get("album_first_id"),
-        "control_msg_id": state.get("control_msg_id"),
-    }
+def build_payment_keyboard(paid: bool) -> InlineKeyboardMarkup:
+    if paid:
+        # bila dah settle, tekan pun tak buat apa-apa (noop)
+        return InlineKeyboardMarkup([[InlineKeyboardButton("✅ PAYMENT SETTLED", callback_data="noop")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ PAYMENT SETTLE", callback_data="pay_settle")]])
 
 
 async def safe_delete(client: Client, chat_id: int, message_id: int):
@@ -211,101 +197,43 @@ async def safe_delete(client: Client, chat_id: int, message_id: int):
         pass
 
 
-async def delete_whole_order_bundle(client: Client, state: dict):
+async def delete_bundle(client: Client, state: dict):
     """
-    Padam:
-    - control message (buttons)
+    Padam SEMUA:
     - album (jika ada)
+    - control msg (jika ada)
+    - anchor photo msg (jika ada)
     """
     chat_id = state["chat_id"]
 
-    # padam album msgs dulu
-    album_ids = state.get("album_msg_ids") or []
-    for mid in album_ids:
+    # album messages
+    for mid in (state.get("album_msg_ids") or []):
         await safe_delete(client, chat_id, mid)
         REPLY_MAP.pop(mid, None)
 
-    # padam control msg
+    # control
     if state.get("control_msg_id"):
         await safe_delete(client, chat_id, state["control_msg_id"])
 
-
-async def repost_single_photo_message(client: Client, old_msg, state: dict, reply_markup: InlineKeyboardMarkup | None):
-    caption_baru = build_caption(
-        state["base_caption"],
-        state["items"],
-        state.get("prices", {}),
-        state.get("dest"),
-        state.get("ship_cost"),
-        locked=bool(state.get("locked")),
-        paid=bool(state.get("paid")),
-        receipts_count=len(state.get("receipts", [])),
-        paid_at=state.get("paid_at"),
-    )
-
-    try:
-        await old_msg.delete()
-    except Exception:
-        pass
-
-    new_msg = await client.send_photo(
-        chat_id=state["chat_id"],
-        photo=state["photo_id"],
-        caption=caption_baru,
-        reply_markup=reply_markup
-    )
-    return new_msg
+    # anchor (single photo)
+    if state.get("anchor_msg_id"):
+        await safe_delete(client, chat_id, state["anchor_msg_id"])
 
 
-async def refresh_single_caption_and_kb(client: Client, msg, state: dict, kb: InlineKeyboardMarkup):
+async def send_or_rebuild_album(client: Client, state: dict) -> int:
     """
-    Untuk message single-photo (bukan album).
-    """
-    caption_baru = build_caption(
-        state["base_caption"],
-        state.get("items", {}),
-        state.get("prices", {}),
-        state.get("dest"),
-        state.get("ship_cost"),
-        locked=bool(state.get("locked")),
-        paid=bool(state.get("paid")),
-        receipts_count=len(state.get("receipts", [])),
-        paid_at=state.get("paid_at"),
-    )
-
-    try:
-        await msg.edit_caption(caption=caption_baru, reply_markup=kb)
-        return msg
-    except Exception:
-        # fallback repost
-        new_msg = await repost_single_photo_message(client, msg, state, kb)
-        # update state key
-        ORDER_STATE[new_msg.id] = clone_state_for_new_msg(state)
-        ORDER_STATE[new_msg.id]["control_msg_id"] = new_msg.id
-        ORDER_STATE.pop(msg.id, None)
-        return new_msg
-
-
-def build_final_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ PAYMENT SETTLE", callback_data="pay_settle")],
-        [InlineKeyboardButton("➕ ADD RESIT", callback_data="add_resit")],
-    ])
-
-
-async def convert_to_album_bundle(client: Client, state: dict, receipt_photo_id: str) -> int:
-    """
-    Buat 2 gambar duduk bersama (album):
-    1) Gambar order (caption detail)
-    2) Gambar resit
-    + 1 message control (buttons) reply kepada album message pertama (nampak macam satu blok)
+    Hantar / rebuild album:
+    - Gambar order + semua resit (last 9)
+    - caption pada gambar order
+    - selepas album dihantar: baru create control message (button payment)
     Return: control_msg_id baru
     """
     chat_id = state["chat_id"]
 
-    # update receipts list
-    state.setdefault("receipts", [])
-    state["receipts"].append(receipt_photo_id)
+    receipts = list(state.get("receipts", []))
+    # simpan last 9 resit supaya muat album
+    receipts = receipts[-MAX_RECEIPTS_IN_ALBUM:]
+    state["receipts"] = receipts
 
     caption = build_caption(
         state["base_caption"],
@@ -319,39 +247,35 @@ async def convert_to_album_bundle(client: Client, state: dict, receipt_photo_id:
         paid_at=state.get("paid_at"),
     )
 
-    media = [
-        InputMediaPhoto(media=state["photo_id"], caption=caption),
-        InputMediaPhoto(media=receipt_photo_id),
-    ]
+    media = [InputMediaPhoto(media=state["photo_id"], caption=caption)]
+    for r in receipts:
+        media.append(InputMediaPhoto(media=r))
 
     album_msgs = await client.send_media_group(chat_id=chat_id, media=media)
     album_ids = [m.id for m in album_msgs]
     album_first_id = album_msgs[0].id
 
-    # Control message: letak text "invisible" supaya macam tak ada ayat (tapi buttons ada)
-    invisible = "\u2060"  # WORD JOINER
+    # Control message: invisible text supaya tak “keluar ayat”
+    invisible = "\u2060"
     control = await client.send_message(
         chat_id=chat_id,
         text=invisible,
         reply_to_message_id=album_first_id,
-        reply_markup=build_final_keyboard()
+        reply_markup=build_payment_keyboard(bool(state.get("paid")))
     )
 
-    # save mapping reply->control
     for mid in album_ids:
         REPLY_MAP[mid] = control.id
 
     state["album_msg_ids"] = album_ids
     state["album_first_id"] = album_first_id
     state["control_msg_id"] = control.id
+    state["anchor_msg_id"] = None  # dah bukan single
 
     return control.id
 
 
 async def update_album_caption_only(client: Client, state: dict):
-    """
-    Bila paid/resit count berubah, update caption pada album_first_id.
-    """
     if not state.get("album_first_id"):
         return
 
@@ -366,7 +290,6 @@ async def update_album_caption_only(client: Client, state: dict):
         receipts_count=len(state.get("receipts", [])),
         paid_at=state.get("paid_at"),
     )
-
     try:
         await client.edit_message_caption(
             chat_id=state["chat_id"],
@@ -560,11 +483,34 @@ async def simpan_qty_repost(client, callback):
     state["items"][produk_key] = qty
     await callback.answer("Dikemaskini")
 
-    new_msg = await repost_single_photo_message(client, msg, state, build_produk_keyboard(state["items"]))
-    # update key
-    state2 = clone_state_for_new_msg(state)
-    state2["control_msg_id"] = new_msg.id
-    ORDER_STATE[new_msg.id] = state2
+    caption_baru = build_caption(
+        state["base_caption"],
+        state["items"],
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=bool(state.get("locked")),
+        paid=bool(state.get("paid")),
+        receipts_count=len(state.get("receipts", [])),
+        paid_at=state.get("paid_at"),
+    )
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    new_msg = await client.send_photo(
+        chat_id=state["chat_id"],
+        photo=state["photo_id"],
+        caption=caption_baru,
+        reply_markup=build_produk_keyboard(state["items"]),
+    )
+
+    ORDER_STATE[new_msg.id] = {
+        **state,
+        "anchor_msg_id": new_msg.id if not state.get("locked") else state.get("anchor_msg_id"),
+    }
     ORDER_STATE.pop(old_id, None)
 
 
@@ -575,19 +521,39 @@ async def submit_order(client, callback):
     state = ORDER_STATE.get(old_id)
     if not await deny_if_locked(state, callback):
         return
-
     if not state["items"]:
         await callback.answer("Sila pilih sekurang-kurangnya 1 produk dulu.", show_alert=True)
         return
 
     await callback.answer("Submit...")
 
-    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
-    new_msg = await repost_single_photo_message(client, msg, state, kb)
+    caption_baru = build_caption(
+        state["base_caption"],
+        state["items"],
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=bool(state.get("locked")),
+        paid=bool(state.get("paid")),
+        receipts_count=len(state.get("receipts", [])),
+        paid_at=state.get("paid_at"),
+    )
 
-    state2 = clone_state_for_new_msg(state)
-    state2["control_msg_id"] = new_msg.id
-    ORDER_STATE[new_msg.id] = state2
+    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    new_msg = await client.send_photo(
+        chat_id=state["chat_id"],
+        photo=state["photo_id"],
+        caption=caption_baru,
+        reply_markup=kb
+    )
+
+    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
 
@@ -646,12 +612,33 @@ async def set_harga(client, callback):
     state["prices"][produk_key] = harga
     await callback.answer("Harga diset")
 
-    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
-    new_msg = await repost_single_photo_message(client, msg, state, kb)
+    caption_baru = build_caption(
+        state["base_caption"],
+        state["items"],
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=bool(state.get("locked")),
+        paid=bool(state.get("paid")),
+        receipts_count=len(state.get("receipts", [])),
+        paid_at=state.get("paid_at"),
+    )
 
-    state2 = clone_state_for_new_msg(state)
-    state2["control_msg_id"] = new_msg.id
-    ORDER_STATE[new_msg.id] = state2
+    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    new_msg = await client.send_photo(
+        chat_id=state["chat_id"],
+        photo=state["photo_id"],
+        caption=caption_baru,
+        reply_markup=kb
+    )
+
+    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
 
@@ -686,10 +673,31 @@ async def set_destinasi(client, callback):
     state["ship_cost"] = None
     await callback.answer(f"Destinasi: {dest}")
 
-    new_msg = await repost_single_photo_message(client, msg, state, build_after_dest_keyboard())
-    state2 = clone_state_for_new_msg(state)
-    state2["control_msg_id"] = new_msg.id
-    ORDER_STATE[new_msg.id] = state2
+    caption_baru = build_caption(
+        state["base_caption"],
+        state["items"],
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=bool(state.get("locked")),
+        paid=bool(state.get("paid")),
+        receipts_count=len(state.get("receipts", [])),
+        paid_at=state.get("paid_at"),
+    )
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    new_msg = await client.send_photo(
+        chat_id=state["chat_id"],
+        photo=state["photo_id"],
+        caption=caption_baru,
+        reply_markup=build_after_dest_keyboard()
+    )
+
+    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
 
@@ -748,10 +756,31 @@ async def set_kos(client, callback):
     state["ship_cost"] = kos
     await callback.answer(f"Kos diset: {kos}")
 
-    new_msg = await repost_single_photo_message(client, msg, state, build_after_cost_keyboard())
-    state2 = clone_state_for_new_msg(state)
-    state2["control_msg_id"] = new_msg.id
-    ORDER_STATE[new_msg.id] = state2
+    caption_baru = build_caption(
+        state["base_caption"],
+        state["items"],
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=bool(state.get("locked")),
+        paid=bool(state.get("paid")),
+        receipts_count=len(state.get("receipts", [])),
+        paid_at=state.get("paid_at"),
+    )
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    new_msg = await client.send_photo(
+        chat_id=state["chat_id"],
+        photo=state["photo_id"],
+        caption=caption_baru,
+        reply_markup=build_after_cost_keyboard()
+    )
+
+    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
 
@@ -786,19 +815,46 @@ async def last_submit(client, callback):
     state.setdefault("paid_by", None)
     state["album_msg_ids"] = None
     state["album_first_id"] = None
-    state["control_msg_id"] = old_id
+    state["control_msg_id"] = None  # belum ada button
+    state["anchor_msg_id"] = old_id
 
     await callback.answer("Last submit ✅")
 
-    # Kekal single-photo dulu (buttons ada). Bila resit masuk baru convert jadi album 2 gambar.
-    new_msg = await repost_single_photo_message(client, msg, state, build_final_keyboard())
-    state2 = clone_state_for_new_msg(state)
-    state2["control_msg_id"] = new_msg.id
-    ORDER_STATE[new_msg.id] = state2
-    ORDER_STATE.pop(old_id, None)
+    # Lepas lock: TIADA button (supaya tak muncul awal)
+    caption_baru = build_caption(
+        state["base_caption"],
+        state["items"],
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=True,
+        paid=bool(state.get("paid")),
+        receipts_count=len(state.get("receipts", [])),
+        paid_at=state.get("paid_at"),
+    )
+
+    try:
+        await msg.edit_caption(caption=caption_baru, reply_markup=None)
+    except Exception:
+        # fallback: repost tanpa keyboard
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        new_msg = await client.send_photo(
+            chat_id=state["chat_id"],
+            photo=state["photo_id"],
+            caption=caption_baru
+        )
+        ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
+        ORDER_STATE.pop(old_id, None)
+        return
+
+    # state kekal key = old_id (anchor msg)
+    ORDER_STATE[old_id] = state
 
 
-# ====== PAYMENT SETTLE ======
+# ====== PAYMENT SETTLE (hanya wujud selepas resit pertama -> control msg) ======
 @bot.on_callback_query(filters.regex(r"^pay_settle$"))
 async def pay_settle(client, callback):
     control_id = callback.message.id
@@ -806,6 +862,7 @@ async def pay_settle(client, callback):
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
+
     if not state.get("locked"):
         await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
         return
@@ -820,35 +877,17 @@ async def pay_settle(client, callback):
 
     await callback.answer("Payment settled ✅")
 
-    # Kalau dah album: edit caption album first
-    if state.get("album_first_id"):
-        await update_album_caption_only(client, state)
-        # buttons sudah ada pada control msg ini (tak perlu ubah)
-        return
-
-    # Kalau belum album: update caption + buttons pada single message
-    await refresh_single_caption_and_kb(client, callback.message, state, build_final_keyboard())
+    # update caption album + update button jadi settled
+    await update_album_caption_only(client, state)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=build_payment_keyboard(True))
+    except Exception:
+        pass
 
 
-# ====== ADD RESIT (manual fallback ForceReply) ======
-@bot.on_callback_query(filters.regex(r"^add_resit$"))
-async def add_resit(client, callback):
-    state = ORDER_STATE.get(callback.message.id)
-    if not state:
-        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
-        return
-    if not state.get("locked"):
-        await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
-        return
-
-    WAITING_RECEIPT[(callback.message.chat.id, callback.from_user.id)] = callback.message.id
-    await callback.answer()
-
-    await client.send_message(
-        chat_id=callback.message.chat.id,
-        text="Sila REPLY gambar resit di mesej ini ya.",
-        reply_markup=ForceReply(selective=True)
-    )
+@bot.on_callback_query(filters.regex(r"^noop$"))
+async def noop(client, callback):
+    await callback.answer("Dah settle ✅", show_alert=False)
 
 
 # ================= PHOTO HANDLER =================
@@ -856,55 +895,32 @@ async def add_resit(client, callback):
 async def handle_photo(client, message):
     """
     A) gambar order baru -> bot jadikan order UI
-    B) gambar resit (SWIPE REPLY pada ORDER/ALBUM) -> bot padam semua dan repost sebagai ALBUM 2 gambar + detail + buttons
-    C) gambar resit (manual selepas ADD RESIT / ForceReply) -> sama juga, convert jadi ALBUM 2 gambar
+    B) gambar resit (SWIPE REPLY pada anchor/album/control) -> bot padam resit staff, padam bundle lama,
+       kemudian hantar semula album: order + SEMUA resit (last 9) => baru muncul PAYMENT SETTLE.
     """
     chat_id = message.chat.id
-    user_id = message.from_user.id if message.from_user else 0
 
     # ---------- KES B: RESIT (SWIPE REPLY) ----------
     if message.reply_to_message:
         replied_id = message.reply_to_message.id
 
         # replied boleh jadi:
-        # - control message (single-photo locked, ada buttons)
-        # - album message (order/resit) => map ke control id
+        # - anchor (single order msg selepas lock, tiada button) => ORDER_STATE[anchor_id]
+        # - control msg (ada button) => ORDER_STATE[control_id]
+        # - album photo msg => REPLY_MAP[album_msg_id] => control_id
         control_id = None
+        state = None
+
         if replied_id in ORDER_STATE:
-            control_id = replied_id
+            # ini boleh jadi anchor_id (sebelum album) atau control_id (selepas album)
+            state = ORDER_STATE.get(replied_id)
+            if state and state.get("control_msg_id"):
+                control_id = state["control_msg_id"]
+            else:
+                control_id = replied_id  # anchor case
         elif replied_id in REPLY_MAP:
             control_id = REPLY_MAP[replied_id]
-
-        if control_id:
             state = ORDER_STATE.get(control_id)
-            if state and state.get("locked"):
-                # padam gambar resit staff (kalau boleh)
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-
-                # padam semua bundle lama:
-                # - kalau sebelum ni single-photo: padam control message sahaja
-                # - kalau dah album: padam album + control
-                await delete_whole_order_bundle(client, state)
-
-                # convert kepada album 2 gambar (order + resit)
-                new_control_id = await convert_to_album_bundle(client, state, message.photo.file_id)
-
-                # update ORDER_STATE key ke control baru
-                state2 = clone_state_for_new_msg(state)
-                state2["control_msg_id"] = new_control_id
-                ORDER_STATE[new_control_id] = state2
-                ORDER_STATE.pop(control_id, None)
-
-                return
-
-    # ---------- KES C: RESIT manual selepas ADD RESIT ----------
-    key = (chat_id, user_id)
-    if key in WAITING_RECEIPT:
-        control_id = WAITING_RECEIPT.pop(key)
-        state = ORDER_STATE.get(control_id)
 
         if state and state.get("locked"):
             # padam gambar resit staff (kalau boleh)
@@ -913,19 +929,27 @@ async def handle_photo(client, message):
             except Exception:
                 pass
 
-            # padam bundle lama
-            await delete_whole_order_bundle(client, state)
+            # tambah resit
+            state.setdefault("receipts", [])
+            state["receipts"].append(message.photo.file_id)
 
-            # convert kepada album
-            new_control_id = await convert_to_album_bundle(client, state, message.photo.file_id)
+            # padam bundle lama (anchor/album/control)
+            await delete_bundle(client, state)
 
-            # update ORDER_STATE key
-            state2 = clone_state_for_new_msg(state)
-            state2["control_msg_id"] = new_control_id
-            ORDER_STATE[new_control_id] = state2
-            ORDER_STATE.pop(control_id, None)
+            # rebuild album (order + semua resit) => keluar button payment
+            new_control_id = await send_or_rebuild_album(client, state)
 
-        return
+            # pindah key ORDER_STATE:
+            # - kalau sebelum ini key = anchor_id, buang anchor key
+            # - kalau sebelum ini key = control_id lama, buang control lama
+            # cara mudah: remove semua key yang mungkin
+            for k in list(ORDER_STATE.keys()):
+                if ORDER_STATE.get(k) is state:
+                    ORDER_STATE.pop(k, None)
+
+            # simpan state di key baru
+            ORDER_STATE[new_control_id] = state
+            return
 
     # ---------- KES A: ORDER BARU ----------
     photo_id = message.photo.file_id
@@ -957,7 +981,6 @@ async def handle_photo(client, message):
         reply_markup=keyboard_awal
     )
 
-    # Simpan state. Key = message id (control message id pada fasa ini)
     ORDER_STATE[sent.id] = {
         "chat_id": chat_id,
         "photo_id": photo_id,
@@ -971,9 +994,10 @@ async def handle_photo(client, message):
         "paid_at": None,
         "paid_by": None,
         "locked": False,
+        "anchor_msg_id": sent.id,
         "album_msg_ids": None,
         "album_first_id": None,
-        "control_msg_id": sent.id,
+        "control_msg_id": None,
     }
 
 
