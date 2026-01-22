@@ -5,6 +5,7 @@
 #   - Ayat "SLIDE KIRI TAMBAH RESIT" hilang
 #   - Diganti dengan hasil OCR UNTUK SEMUA RESIT (maks 9 dalam album, tapi OCR boleh simpan lebih)
 # + Butang "BUTANG SEMAK BAYARAN" akan re-run OCR untuk SEMUA RESIT dan update caption album
+# + ✅ PAYMENT SETTLE ADA PASSWORD KEYPAD (0-9 + BACK + OKEY)
 # =========================
 
 import os, io, re, tempfile
@@ -24,6 +25,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Missing API_ID / API_HASH / BOT_TOKEN in Railway Variables")
+
+# ================= PASSWORD SETTINGS =================
+# Set dekat Railway env: PAYMENT_PIN=1234
+PAYMENT_PIN = os.getenv("PAYMENT_PIN", "1234").strip()
+MAX_PIN_TRIES = 5  # berapa kali salah sebelum reset paksa
 
 # ================= OCR SETTINGS (OCR skrip) =================
 TARGET_ACC = "8606018423"
@@ -102,7 +108,7 @@ KOS_PER_PAGE = 15  # 3 baris x 5 butang
 # Album Telegram max 10 media: 1 order + 9 resit
 MAX_RECEIPTS_IN_ALBUM = 9
 
-# ✅ OCR yang dipaparkan dalam caption boleh jadi banyak (10, 20, 50...)
+# ✅ OCR yang dipaparkan dalam caption boleh jadi banyak
 # tapi Telegram ada limit caption 1024 chars. Kita limit untuk stabil.
 MAX_OCR_RESULTS_IN_CAPTION = 10
 
@@ -145,10 +151,9 @@ def build_ocr_block(state: dict) -> str:
     if not results:
         return ""
 
-    # limit paparan
     show = results[-MAX_OCR_RESULTS_IN_CAPTION:]
     blocks = []
-    for i, txt in enumerate(show, start=max(1, len(results) - len(show) + 1)):
+    for txt in show:
         t = (txt or "").strip()
         if not t:
             continue
@@ -156,7 +161,6 @@ def build_ocr_block(state: dict) -> str:
 
     out = "\n\n".join(blocks)
 
-    # kalau lebih dari limit, beritahu ringkas
     if len(results) > len(show):
         out += f"\n\n(+{len(results) - len(show)} resit lagi tidak dipaparkan sebab limit caption)"
 
@@ -223,18 +227,56 @@ def build_caption(
             else:
                 lines.append("⬅️" + bold("SLIDE KIRI TAMBAH RESIT"))
 
-    # ✅ safety: caption limit Telegram ~1024
     cap = "\n".join(lines)
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
     return cap
 
+# ================= KEYBOARDS =================
 def build_payment_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("PAYMENT SETTLE", callback_data="pay_settle")]])
 
 def build_semak_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("BUTANG SEMAK BAYARAN", callback_data="semak_bayaran")]])
 
+def build_pin_keyboard() -> InlineKeyboardMarkup:
+    """
+    Keypad nombor 0-9 + BACK + OKEY
+    """
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1", callback_data="pin_1"),
+            InlineKeyboardButton("2", callback_data="pin_2"),
+            InlineKeyboardButton("3", callback_data="pin_3"),
+        ],
+        [
+            InlineKeyboardButton("4", callback_data="pin_4"),
+            InlineKeyboardButton("5", callback_data="pin_5"),
+            InlineKeyboardButton("6", callback_data="pin_6"),
+        ],
+        [
+            InlineKeyboardButton("7", callback_data="pin_7"),
+            InlineKeyboardButton("8", callback_data="pin_8"),
+            InlineKeyboardButton("9", callback_data="pin_9"),
+        ],
+        [
+            InlineKeyboardButton("0", callback_data="pin_0"),
+        ],
+        [
+            InlineKeyboardButton("🔙 BACK", callback_data="pin_back"),
+            InlineKeyboardButton("✅ OKEY", callback_data="pin_ok"),
+        ],
+    ])
+
+def mask_pin(buf: str) -> str:
+    if not buf:
+        return "(kosong)"
+    return "•" * len(buf)
+
+def build_pin_prompt_text(buf: str) -> str:
+    return f"🔐 Sila masukkan PASSWORD untuk PAYMENT SETTLE\n\nPIN: {mask_pin(buf)}"
+
+# ================= SAFE DELETE =================
 async def safe_delete(client: Client, chat_id: int, message_id: int):
     try:
         await client.delete_messages(chat_id, message_id)
@@ -507,7 +549,6 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
 async def run_ocr_for_all_receipts(client: Client, state: dict) -> list[str]:
     """
     ✅ OCR untuk SEMUA resit dalam state["receipts"]
-    Simpan result ikut turutan resit.
     """
     receipts = state.get("receipts") or []
     results = []
@@ -522,9 +563,9 @@ async def run_ocr_for_all_receipts(client: Client, state: dict) -> list[str]:
 async def send_or_rebuild_album(client: Client, state: dict) -> int:
     chat_id = state["chat_id"]
 
-    # album hanya simpan last 9 resit (Telegram limit)
     receipts_album = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
-    state["receipts_album"] = receipts_album  # simpan untuk reference
+    state["receipts_album"] = receipts_album
+
     caption = build_caption(
         state["base_caption"],
         state.get("items", {}),
@@ -1047,9 +1088,13 @@ async def last_submit(client, callback):
     state.setdefault("paid", False)
     state.setdefault("paid_at", None)
     state.setdefault("paid_by", None)
-
-    # ✅ OCR: simpan semua result dalam list
     state.setdefault("ocr_results", [])
+
+    # ✅ PIN STATE
+    state["pin_mode"] = False
+    state["pin_active_user"] = None
+    state["pin_buffer"] = ""
+    state["pin_tries"] = 0
 
     state["album_msg_ids"] = None
     state["album_first_id"] = None
@@ -1088,18 +1133,11 @@ async def last_submit(client, callback):
 
     ORDER_STATE[old_id] = state
 
-# ====== PAYMENT SETTLE (OCR semua resit) ======
-@bot.on_callback_query(filters.regex(r"^pay_settle$"))
-async def pay_settle(client, callback):
-    control_id = callback.message.id
-    state = ORDER_STATE.get(control_id)
-    if not state:
-        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
-        return
-    if not state.get("locked"):
-        await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
-        return
-
+# ================= PAYMENT SETTLE (PASSWORD FLOW) =================
+async def do_payment_settle_after_pin(client: Client, callback, state: dict):
+    """
+    Proses settle sebenar: OCR semua resit + rebuild album
+    """
     receipts = state.get("receipts") or []
     if not receipts:
         await callback.answer("Tiada resit. Sila upload resit dulu.", show_alert=True)
@@ -1116,19 +1154,201 @@ async def pay_settle(client, callback):
     # ✅ OCR semua resit
     state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
 
+    # reset PIN mode
+    state["pin_mode"] = False
+    state["pin_active_user"] = None
+    state["pin_buffer"] = ""
+    state["pin_tries"] = 0
+
     # padam bundle lama (album/control/anchor)
     await delete_bundle(client, state)
 
-    # rebuild album: caption akan papar semua OCR (ikut limit)
+    # rebuild album
     new_control_id = await send_or_rebuild_album(client, state)
 
-    # rebind key state (bersih semua key lama)
+    # rebind key state
     for k in list(ORDER_STATE.keys()):
         if ORDER_STATE.get(k) is state:
             ORDER_STATE.pop(k, None)
     ORDER_STATE[new_control_id] = state
 
-# ====== BUTANG SEMAK BAYARAN (OCR semua resit + update caption) ======
+@bot.on_callback_query(filters.regex(r"^pay_settle$"))
+async def pay_settle_password_start(client, callback):
+    """
+    Bila tekan PAYMENT SETTLE -> keluar keypad PIN
+    """
+    control_id = callback.message.id
+    state = ORDER_STATE.get(control_id)
+
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+    if not state.get("locked"):
+        await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
+        return
+
+    # kalau dah paid, tak perlu settle
+    if state.get("paid"):
+        await callback.answer("Order ini sudah PAID ✅", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else None
+    if not user_id:
+        await callback.answer("User tidak sah.", show_alert=True)
+        return
+
+    # lock keypad utk 1 user sahaja
+    active = state.get("pin_active_user")
+    if active and active != user_id:
+        await callback.answer("Keypad sedang digunakan oleh user lain.", show_alert=True)
+        return
+
+    state["pin_mode"] = True
+    state["pin_active_user"] = user_id
+    state["pin_buffer"] = ""
+    state["pin_tries"] = 0
+
+    try:
+        await callback.message.edit_text(
+            build_pin_prompt_text(state["pin_buffer"]),
+            reply_markup=build_pin_keyboard()
+        )
+    except Exception:
+        pass
+
+    await callback.answer("Masukkan password")
+
+# ===== PIN INPUT DIGITS =====
+@bot.on_callback_query(filters.regex(r"^pin_[0-9]$"))
+async def pin_press_digit(client, callback):
+    control_id = callback.message.id
+    state = ORDER_STATE.get(control_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    if not state.get("pin_mode"):
+        await callback.answer("Sila tekan PAYMENT SETTLE dulu.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else None
+    if state.get("pin_active_user") != user_id:
+        await callback.answer("Ini bukan keypad anda.", show_alert=True)
+        return
+
+    digit = callback.data.split("_", 1)[1]
+
+    # limit panjang buffer
+    buf = state.get("pin_buffer", "")
+    if len(buf) >= max(4, len(PAYMENT_PIN)):
+        await callback.answer("PIN sudah cukup, tekan OKEY.", show_alert=True)
+        return
+
+    state["pin_buffer"] = buf + digit
+
+    try:
+        await callback.message.edit_text(
+            build_pin_prompt_text(state["pin_buffer"]),
+            reply_markup=build_pin_keyboard()
+        )
+    except Exception:
+        pass
+
+    await callback.answer()
+
+# ===== PIN BACK =====
+@bot.on_callback_query(filters.regex(r"^pin_back$"))
+async def pin_back(client, callback):
+    control_id = callback.message.id
+    state = ORDER_STATE.get(control_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else None
+    if state.get("pin_active_user") and state.get("pin_active_user") != user_id:
+        await callback.answer("Ini bukan keypad anda.", show_alert=True)
+        return
+
+    # reset pin mode
+    state["pin_mode"] = False
+    state["pin_active_user"] = None
+    state["pin_buffer"] = ""
+    state["pin_tries"] = 0
+
+    try:
+        await callback.message.edit_text(
+            "TEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI",
+            reply_markup=build_payment_keyboard()
+        )
+    except Exception:
+        pass
+
+    await callback.answer("Kembali")
+
+# ===== PIN OKEY =====
+@bot.on_callback_query(filters.regex(r"^pin_ok$"))
+async def pin_ok(client, callback):
+    control_id = callback.message.id
+    state = ORDER_STATE.get(control_id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    if not state.get("pin_mode"):
+        await callback.answer("Sila tekan PAYMENT SETTLE dulu.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else None
+    if state.get("pin_active_user") != user_id:
+        await callback.answer("Ini bukan keypad anda.", show_alert=True)
+        return
+
+    buf = state.get("pin_buffer", "")
+
+    if not buf:
+        await callback.answer("PIN kosong. Sila tekan nombor.", show_alert=True)
+        return
+
+    # semak
+    if buf == PAYMENT_PIN:
+        # betul
+        await do_payment_settle_after_pin(client, callback, state)
+        return
+
+    # salah
+    state["pin_tries"] = int(state.get("pin_tries", 0)) + 1
+    state["pin_buffer"] = ""
+
+    if state["pin_tries"] >= MAX_PIN_TRIES:
+        # reset & keluar
+        state["pin_mode"] = False
+        state["pin_active_user"] = None
+        state["pin_tries"] = 0
+        state["pin_buffer"] = ""
+
+        try:
+            await callback.message.edit_text(
+                "❌ Password salah terlalu banyak kali.\n\nTEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI",
+                reply_markup=build_payment_keyboard()
+            )
+        except Exception:
+            pass
+
+        await callback.answer("Salah banyak kali. Reset.", show_alert=True)
+        return
+
+    try:
+        await callback.message.edit_text(
+            f"❌ Password salah. Cuba lagi.\n\n{build_pin_prompt_text(state['pin_buffer'])}",
+            reply_markup=build_pin_keyboard()
+        )
+    except Exception:
+        pass
+
+    await callback.answer("Password salah", show_alert=True)
+
+# ================= BUTANG SEMAK BAYARAN (OCR semua resit + update caption) =================
 @bot.on_callback_query(filters.regex(r"^semak_bayaran$"))
 async def semak_bayaran(client, callback):
     control_id = callback.message.id
@@ -1144,10 +1364,8 @@ async def semak_bayaran(client, callback):
 
     await callback.answer("Semak OCR semua resit...")
 
-    # ✅ OCR semua resit
     state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
 
-    # update caption album pertama (gambar order)
     if state.get("album_first_id"):
         new_caption = build_caption(
             state["base_caption"],
@@ -1189,8 +1407,6 @@ async def handle_photo(client, message):
             state = ORDER_STATE.get(control_id)
 
         if state and state.get("locked"):
-            # lepas paid: masih boleh tambah resit (awak nak banyak result)
-            # tapi caption limit, jadi mungkin tak muat semua — bot akan limit & bagitahu.
             try:
                 await message.delete()
             except Exception:
@@ -1199,8 +1415,7 @@ async def handle_photo(client, message):
             state.setdefault("receipts", [])
             state["receipts"].append(message.photo.file_id)
 
-            # bila tambah resit selepas paid, reset paid->False supaya staff tekan settle semula kalau mahu
-            # (kalau awak tak mahu reset, buang 3 baris ini)
+            # bila tambah resit selepas paid, reset paid->False supaya staff settle semula
             if state.get("paid"):
                 state["paid"] = False
                 state["paid_at"] = None
@@ -1266,8 +1481,13 @@ async def handle_photo(client, message):
         "album_first_id": None,
         "control_msg_id": None,
 
-        # ✅ OCR list
         "ocr_results": [],
+
+        # PIN
+        "pin_mode": False,
+        "pin_active_user": None,
+        "pin_buffer": "",
+        "pin_tries": 0,
     }
 
 if __name__ == "__main__":
