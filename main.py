@@ -32,6 +32,7 @@ vision_client = vision.ImageAnnotatorClient()
 
 # ================== NORMALIZE ==================
 def normalize_ocr_text(s: str) -> str:
+    """Normalization minima & selamat untuk tarikh/amount/akaun."""
     if not s:
         return ""
     trans = str.maketrans({
@@ -44,24 +45,21 @@ def normalize_ocr_text(s: str) -> str:
     return s
 
 def normalize_for_status(s: str) -> str:
-    """
-    Normalization khas untuk STATUS sahaja (lebih agresif).
-    Tujuan: betulkan OCR yang baca 'Successful' jadi pelik.
-    """
+    """Normalization khas untuk status sahaja (lebih agresif)."""
     if not s:
         return ""
-    t = s.lower()
+    t = s
 
-    # OCR typo fixes yang sangat biasa untuk perkataan status
+    # Betulkan OCR typo biasa utk "successful"
     # (bukan tambah keyword baru; ini cuma betulkan ejaan OCR)
-    t = t.replace("5uccessful", "successful")
-    t = t.replace("successfu1", "successful")
-    t = t.replace("successfu|", "successful")
-    t = t.replace("successfull", "successful")
-    t = t.replace("succesful", "successful")
-    t = t.replace("suceessful", "successful")
-    t = t.replace("successfui", "successful")  # i/l/1 confusion
-    t = re.sub(r"\s+", " ", t)
+    t = t.replace("5uccessful", "Successful")
+    t = t.replace("successfu1", "Successful")
+    t = t.replace("successfu|", "Successful")
+    t = t.replace("successfull", "Successful")
+    t = t.replace("succesful", "Successful")
+    t = t.replace("suceessful", "Successful")
+    t = t.replace("successfui", "Successful")
+    t = re.sub(r"[ \t]+", " ", t)
     return t
 
 def digits_only(s: str) -> str:
@@ -257,17 +255,42 @@ NEGATIVE_KW = [
     "ibg", "interbank giro", "scheduled transfer", "future dated", "effective date", "pending settlement",
 ]
 
-def detect_payment_status(text: str):
-    # guna normalization khas untuk status
-    t = normalize_for_status(text)
+def _find_status_original(text: str, keyword: str):
+    """
+    Cari keyword dalam text original (case-insensitive) dan pulangkan substring asal.
+    """
+    m = re.search(re.escape(keyword), text, flags=re.I)
+    if not m:
+        return None
+    return text[m.start():m.end()]
 
-    has_pos = any(k in t for k in POSITIVE_KW)
-    has_neg = any(k in t for k in NEGATIVE_KW)
+def detect_payment_status_original(text: str):
+    """
+    Output ikut resit (bukan terjemah):
+      - contoh: "Successful ✅"
+      - contoh: "Pending ‼️"
+    Rules:
+      - Jika jumpa positive -> ✅
+      - Jika jumpa negative (dan tiada positive) -> ‼️
+      - Jika tak jumpa -> "Status tidak pasti ❓"
+    """
+    # guna versi status-normalized untuk detect
+    t_norm = normalize_for_status(text)
+    t_low = t_norm.lower()
 
-    if has_neg and not has_pos:
-        return ("Duit belum masuk", "‼️")
-    if has_pos:
-        return ("Duit sudah masuk", "✅")
+    # 1) scan POSITIVE dulu (kalau dua-dua ada, positive menang)
+    for kw in POSITIVE_KW:
+        if kw in t_low:
+            # ambil balik ejaan asal dari teks (try original text dulu)
+            orig = _find_status_original(text, kw) or kw
+            return (orig.strip(), "✅")
+
+    # 2) scan NEGATIVE
+    for kw in NEGATIVE_KW:
+        if kw in t_low:
+            orig = _find_status_original(text, kw) or kw
+            return (orig.strip(), "‼️")
+
     return ("Status tidak pasti", "❓")
 
 # ================== BOT HANDLER ==================
@@ -281,7 +304,6 @@ async def ocr_photo(_, message):
 
         image = vision.Image(content=content)
 
-        # ✅ lebih stabil untuk resit: document_text_detection
         resp = vision_client.document_text_detection(image=image)
 
         if resp.error and resp.error.message:
@@ -307,8 +329,8 @@ async def ocr_photo(_, message):
         ok_amt = amt is not None
         line3 = build_line(format_amount_rm(amt) if ok_amt else "", "Total tidak dijumpai", ok_amt, "✅", "❌")
 
-        # 4) STATUS
-        status_text, status_emoji = detect_payment_status(text)
+        # 4) STATUS (ikut resit)
+        status_text, status_emoji = detect_payment_status_original(text)
         line4 = f"{status_text} {status_emoji}"
 
         reply = f"{line1}\n{line2}\n{line3}\n{line4}"
