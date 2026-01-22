@@ -1,14 +1,19 @@
+# =========================
+# ATV PANTAI TIMOR BOT
+# + OCR skrip (Google Vision)
+# + Lepas tekan PAYMENT SETTLE:
+#   - Ayat "SLIDE KIRI TAMBAH RESIT" hilang
+#   - Diganti dengan hasil OCR (terus dalam caption gambar order dalam album)
+# + Butang "BUTANG SEMAK BAYARAN" akan re-run OCR dan update caption album (bukan hantar mesej OCR baru)
+# =========================
+
 import os, io, re, tempfile
 from datetime import datetime
 
 import pytz
 from pyrogram import Client, filters
 from pyrogram.errors import MessageDeleteForbidden, ChatAdminRequired
-from pyrogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    InputMediaPhoto,
-)
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 
 from google.cloud import vision  # ✅ OCR skrip
 
@@ -45,7 +50,9 @@ bot = Client(
 )
 
 # ================= TEMP STATE (RAM) =================
-# Tambah: "ocr_text", "ocr_msg_id", "last_ocr_receipt_file_id"
+# Key ORDER_STATE:
+# - Semasa belum LOCK: key = anchor msg id (gambar order)
+# - Selepas rebuild album: key = control msg id (mesej butang bawah)
 ORDER_STATE = {}
 
 # Mapping reply untuk album image -> control_msg_id
@@ -131,7 +138,14 @@ def build_caption(
     ship_cost: int | None = None,
     locked: bool = False,
     receipts_count: int = 0,
+    paid: bool = False,
+    ocr_text: str | None = None,
 ) -> str:
+    """
+    ✅ BEHAVIOR BARU:
+    - LOCK + belum paid -> tunjuk arahan "SLIDE KIRI ..."
+    - LOCK + sudah paid -> buang arahan slide, ganti OCR result dalam caption
+    """
     prices_dict = prices_dict or {}
     lines = [base_caption]
 
@@ -165,16 +179,19 @@ def build_caption(
 
     if locked:
         lines.append("")
-        if receipts_count <= 0:
-            lines.append("⬅️" + bold("SLIDE KIRI UPLOAD RESIT"))
+        if paid and ocr_text:
+            # ✅ OCR masuk dalam caption
+            lines.append(ocr_text.strip())
         else:
-            lines.append("⬅️" + bold("SLIDE KIRI TAMBAH RESIT"))
+            # sebelum paid masih perlu guide slide
+            if receipts_count <= 0:
+                lines.append("⬅️" + bold("SLIDE KIRI UPLOAD RESIT"))
+            else:
+                lines.append("⬅️" + bold("SLIDE KIRI TAMBAH RESIT"))
 
     return "\n".join(lines)
 
-def build_payment_keyboard(paid: bool) -> InlineKeyboardMarkup:
-    if paid:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("PAYMENT SETTLED", callback_data="noop")]])
+def build_payment_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("PAYMENT SETTLE", callback_data="pay_settle")]])
 
 def build_semak_keyboard() -> InlineKeyboardMarkup:
@@ -192,7 +209,6 @@ async def delete_bundle(client: Client, state: dict):
     - album (jika ada)
     - control msg (jika ada)
     - anchor msg (jika ada)
-    - ocr msg (jika ada)
     """
     chat_id = state["chat_id"]
 
@@ -205,10 +221,6 @@ async def delete_bundle(client: Client, state: dict):
 
     if state.get("anchor_msg_id"):
         await safe_delete(client, chat_id, state["anchor_msg_id"])
-
-    if state.get("ocr_msg_id"):
-        await safe_delete(client, chat_id, state["ocr_msg_id"])
-        state["ocr_msg_id"] = None
 
 # ================= OCR skrip (helpers) =================
 def normalize_ocr_text(s: str) -> str:
@@ -243,31 +255,18 @@ def parse_datetime(text: str):
     p_time = re.compile(r"\b(\d{1,2})[:\.](\d{2})(?:[:\.](\d{2}))?\s*(am|pm)?\b", re.I)
 
     mon_map = {
-        "jan": 1, "january": 1,
-        "feb": 2, "february": 2,
-        "mar": 3, "march": 3,
+        "jan": 1, "january": 1, "januari": 1,
+        "feb": 2, "february": 2, "februari": 2,
+        "mar": 3, "march": 3, "mac": 3,
         "apr": 4, "april": 4,
-        "may": 5,
+        "may": 5, "mei": 5,
         "jun": 6, "june": 6,
-        "jul": 7, "july": 7,
-        "aug": 8, "august": 8,
+        "jul": 7, "july": 7, "julai": 7,
+        "aug": 8, "august": 8, "ogos": 8,
         "sep": 9, "sept": 9, "september": 9,
-        "oct": 10, "october": 10,
+        "oct": 10, "october": 10, "oktober": 10,
         "nov": 11, "november": 11,
-        "dec": 12, "december": 12,
-
-        "januari": 1,
-        "februari": 2,
-        "mac": 3,
-        "april": 4,
-        "mei": 5,
-        "jun": 6,
-        "julai": 7,
-        "ogos": 8,
-        "september": 9, "sep": 9, "sept": 9,
-        "oktober": 10, "oct": 10,
-        "november": 11, "nov": 11,
-        "disember": 12, "dec": 12,
+        "dec": 12, "december": 12, "disember": 12,
     }
 
     def month_to_int(m: str):
@@ -353,7 +352,7 @@ def parse_datetime(text: str):
 
     try:
         return datetime(y, mo, d, hh, minute)
-    except:
+    except Exception:
         return None
 
 def parse_amount(text: str):
@@ -374,7 +373,7 @@ def parse_amount(text: str):
         num_str = m.group(1).replace(",", "")
         try:
             val = float(num_str)
-        except:
+        except Exception:
             continue
         candidates.append((score_match(val, m.start()) + 1000, val))
 
@@ -386,40 +385,31 @@ def parse_amount(text: str):
 def format_amount_rm(val: float) -> str:
     return f"RM{val:.2f}"
 
-# Status ikut resit (awak kata “guna ini sahaja”)
+# Status ikut resit (guna teks asal)
 POSITIVE_KW = [
-    "successful", "success", "completed", "complete",
     "transaction successful", "payment successful", "transfer successful",
-    "paid", "payment received", "received", "funds received",
-    "credited", "credit", "approved", "verified", "posted",
-    "settled", "processed",
-    "berjaya", "berjaya diproses", "transaksi berjaya", "pembayaran berjaya",
+    "successful", "success", "completed", "complete",
+    "paid", "payment received", "funds received", "received",
+    "credited", "approved", "verified", "posted", "settled", "processed",
+    "berjaya diproses", "transaksi berjaya", "pembayaran berjaya",
     "pemindahan berjaya", "diterima", "telah diterima", "sudah masuk",
     "dana diterima", "dikreditkan", "diluluskan", "selesai", "telah selesai",
-    "berjaya dihantar",
 ]
 
 NEGATIVE_KW = [
+    "pending settlement", "scheduled transfer", "future dated", "effective date",
     "pending", "processing", "in progress", "queued", "awaiting", "awaiting confirmation",
     "not received", "unpaid", "failed", "unsuccessful", "rejected", "declined",
     "cancelled", "canceled", "reversed", "refunded", "void", "timeout", "timed out",
-    "belum masuk", "belum diterima", "belum terima", "belum berjaya", "dalam proses",
+    "belum masuk", "belum diterima", "belum terima", "dalam proses",
     "sedang diproses", "menunggu pengesahan", "gagal", "tidak berjaya", "ditolak",
     "dibatalkan", "dipulangkan", "diproses semula",
-    "ibg", "interbank giro", "scheduled transfer", "future dated", "effective date", "pending settlement",
+    "ibg", "interbank giro",
 ]
 
-def detect_status_original(text: str):
-    """
-    Awak minta: status ikut apa yang tertulis pada resit.
-    Jadi kita cuba cari substring yang match dari list awak.
-    Kalau jumpa positive -> pulangkan keyword yang match + ✅
-    Kalau jumpa negative -> keyword yang match + ‼️
-    Kalau tak jumpa -> "Status tidak pasti ❓"
-    """
+def detect_status_original(text: str) -> str:
     t = normalize_ocr_text(text).lower()
 
-    # priority: kalau ada positive & negative serentak, ambil positive
     pos_hit = None
     for kw in sorted(POSITIVE_KW, key=len, reverse=True):
         if kw in t:
@@ -467,7 +457,6 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
         amt = parse_amount(text)
         line3 = f"{format_amount_rm(amt)} ✅" if amt is not None else "Total tidak dijumpai ❌"
 
-        # ✅ status ikut resit (bukan translate)
         line4 = detect_status_original(text)
 
         return "\n".join([line1, line2, line3, line4])
@@ -486,8 +475,8 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
     """
     Hantar / rebuild album:
     - order + semua resit (last 9)
-    - caption pada gambar order (album first)
-    - selepas album dihantar: create CONTROL message (Bukan reply) untuk elak kotak merah
+    - caption pada gambar order (album first) termasuk OCR jika sudah paid
+    - selepas album dihantar: create CONTROL message (bukan reply)
     Return: control_msg_id baru (jadi key ORDER_STATE)
     """
     chat_id = state["chat_id"]
@@ -503,6 +492,8 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
         state.get("ship_cost"),
         locked=True,
         receipts_count=len(receipts),
+        paid=bool(state.get("paid")),
+        ocr_text=state.get("ocr_text"),
     )
 
     media = [InputMediaPhoto(media=state["photo_id"], caption=caption)]
@@ -513,11 +504,17 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
     album_ids = [m.id for m in album_msgs]
     album_first_id = album_msgs[0].id
 
-    control_text = "TEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI"
+    if state.get("paid"):
+        control_text = "SEMAK OCR BAYARAN"
+        control_markup = build_semak_keyboard()
+    else:
+        control_text = "TEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI"
+        control_markup = build_payment_keyboard()
+
     control = await client.send_message(
         chat_id=chat_id,
         text=control_text,
-        reply_markup=build_payment_keyboard(bool(state.get("paid")))
+        reply_markup=control_markup
     )
 
     for mid in album_ids:
@@ -530,11 +527,11 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
 
     return control.id
 
-async def deny_if_locked(state: dict, callback, allow_when_locked: bool = False) -> bool:
+async def deny_if_locked(state: dict, callback) -> bool:
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return False
-    if state.get("locked") and not allow_when_locked:
+    if state.get("locked"):
         await callback.answer("Order ini sudah LAST SUBMIT (LOCK).", show_alert=True)
         return False
     return True
@@ -550,6 +547,7 @@ def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
+    # ✅ callback_data standard: qty_<produk>_<n>
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
@@ -702,6 +700,8 @@ async def simpan_qty_repost(client, callback):
         state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
+        paid=bool(state.get("paid")),
+        ocr_text=state.get("ocr_text"),
     )
 
     try:
@@ -716,10 +716,7 @@ async def simpan_qty_repost(client, callback):
         reply_markup=build_produk_keyboard(state["items"]),
     )
 
-    ORDER_STATE[new_msg.id] = {
-        **state,
-        "anchor_msg_id": new_msg.id if not state.get("locked") else state.get("anchor_msg_id"),
-    }
+    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
     ORDER_STATE.pop(old_id, None)
 
 @bot.on_callback_query(filters.regex(r"^submit$"))
@@ -743,6 +740,8 @@ async def submit_order(client, callback):
         state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
+        paid=bool(state.get("paid")),
+        ocr_text=state.get("ocr_text"),
     )
 
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
@@ -822,6 +821,8 @@ async def set_harga(client, callback):
         state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
+        paid=bool(state.get("paid")),
+        ocr_text=state.get("ocr_text"),
     )
 
     kb = build_harga_keyboard(state["items"], state.get("prices", {}))
@@ -879,6 +880,8 @@ async def set_destinasi(client, callback):
         state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
+        paid=bool(state.get("paid")),
+        ocr_text=state.get("ocr_text"),
     )
 
     try:
@@ -956,6 +959,8 @@ async def set_kos(client, callback):
         state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
+        paid=bool(state.get("paid")),
+        ocr_text=state.get("ocr_text"),
     )
 
     try:
@@ -1002,15 +1007,13 @@ async def last_submit(client, callback):
     state.setdefault("paid", False)
     state.setdefault("paid_at", None)
     state.setdefault("paid_by", None)
+    state.setdefault("ocr_text", None)
+
+    # album data reset (akan wujud bila resit masuk)
     state["album_msg_ids"] = None
     state["album_first_id"] = None
     state["control_msg_id"] = None
     state["anchor_msg_id"] = old_id
-
-    # OCR fields
-    state.setdefault("ocr_text", None)
-    state.setdefault("ocr_msg_id", None)
-    state.setdefault("last_ocr_receipt_file_id", None)
 
     await callback.answer("Last submit ✅")
 
@@ -1021,7 +1024,9 @@ async def last_submit(client, callback):
         state.get("dest"),
         state.get("ship_cost"),
         locked=True,
-        receipts_count=0,
+        receipts_count=len(state.get("receipts", [])),
+        paid=False,
+        ocr_text=None,
     )
 
     try:
@@ -1042,7 +1047,7 @@ async def last_submit(client, callback):
 
     ORDER_STATE[old_id] = state
 
-# ====== PAYMENT SETTLE (ubah: rebuild + OCR + butang semak) ======
+# ====== PAYMENT SETTLE ======
 @bot.on_callback_query(filters.regex(r"^pay_settle$"))
 async def pay_settle(client, callback):
     control_id = callback.message.id
@@ -1054,7 +1059,6 @@ async def pay_settle(client, callback):
         await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
         return
 
-    # mesti ada resit
     receipts = state.get("receipts") or []
     if not receipts:
         await callback.answer("Tiada resit. Sila upload resit dulu.", show_alert=True)
@@ -1072,41 +1076,22 @@ async def pay_settle(client, callback):
 
     # OCR resit terakhir
     last_receipt_id = receipts[-1]
-    state["last_ocr_receipt_file_id"] = last_receipt_id
-    ocr_text = await run_ocr_on_receipt_file_id(client, last_receipt_id)
-    state["ocr_text"] = ocr_text
+    state["ocr_text"] = await run_ocr_on_receipt_file_id(client, last_receipt_id)
 
-    # padam bundle lama (album/control/anchor/ocr)
+    # padam bundle lama (album/control/anchor)
     await delete_bundle(client, state)
 
-    # rebuild album (order+resit) + control message baru
+    # rebuild album:
+    # ✅ caption akan buang "SLIDE..." dan ganti OCR
     new_control_id = await send_or_rebuild_album(client, state)
 
-    # lepas settle, kita tukar control message jadi butang semak sahaja
-    try:
-        await client.edit_message_text(
-            chat_id=state["chat_id"],
-            message_id=new_control_id,
-            text="SEMAK OCR BAYARAN",
-            reply_markup=build_semak_keyboard()
-        )
-    except Exception:
-        pass
-
-    # hantar mesej OCR result
-    ocr_msg = await client.send_message(
-        chat_id=state["chat_id"],
-        text=ocr_text
-    )
-    state["ocr_msg_id"] = ocr_msg.id
-
-    # bersihkan key lama state dalam ORDER_STATE dan rebind ke key baru
+    # rebind key state (bersih semua key lama)
     for k in list(ORDER_STATE.keys()):
         if ORDER_STATE.get(k) is state:
             ORDER_STATE.pop(k, None)
     ORDER_STATE[new_control_id] = state
 
-# ====== BUTANG SEMAK BAYARAN (rerun OCR & update mesej OCR) ======
+# ====== BUTANG SEMAK BAYARAN (rerun OCR & update caption album) ======
 @bot.on_callback_query(filters.regex(r"^semak_bayaran$"))
 async def semak_bayaran(client, callback):
     control_id = callback.message.id
@@ -1123,28 +1108,29 @@ async def semak_bayaran(client, callback):
     await callback.answer("Semak OCR...")
 
     last_receipt_id = receipts[-1]
-    state["last_ocr_receipt_file_id"] = last_receipt_id
-    ocr_text = await run_ocr_on_receipt_file_id(client, last_receipt_id)
-    state["ocr_text"] = ocr_text
+    state["ocr_text"] = await run_ocr_on_receipt_file_id(client, last_receipt_id)
 
-    # update jika ocr msg masih ada, kalau tak, send baru
-    if state.get("ocr_msg_id"):
+    # update caption album pertama (gambar order)
+    if state.get("album_first_id"):
+        new_caption = build_caption(
+            state["base_caption"],
+            state.get("items", {}),
+            state.get("prices", {}),
+            state.get("dest"),
+            state.get("ship_cost"),
+            locked=True,
+            receipts_count=len(receipts),
+            paid=True,
+            ocr_text=state.get("ocr_text"),
+        )
         try:
-            await client.edit_message_text(
+            await client.edit_message_caption(
                 chat_id=state["chat_id"],
-                message_id=state["ocr_msg_id"],
-                text=ocr_text
+                message_id=state["album_first_id"],
+                caption=new_caption
             )
-            return
         except Exception:
-            state["ocr_msg_id"] = None
-
-    ocr_msg = await client.send_message(chat_id=state["chat_id"], text=ocr_text)
-    state["ocr_msg_id"] = ocr_msg.id
-
-@bot.on_callback_query(filters.regex(r"^noop$"))
-async def noop(client, callback):
-    await callback.answer("Dah settle ✅", show_alert=False)
+            pass
 
 # ================= PHOTO HANDLER =================
 @bot.on_message(filters.photo & ~filters.bot)
@@ -1158,19 +1144,26 @@ async def handle_photo(client, message):
         control_id = None
         state = None
 
+        # reply kepada control message (butang bawah)
         if replied_id in ORDER_STATE:
             state = ORDER_STATE.get(replied_id)
-            if state and state.get("control_msg_id"):
-                control_id = state["control_msg_id"]
-            else:
-                control_id = replied_id
+            control_id = replied_id
 
+        # reply kepada mana-mana gambar dalam album
         elif replied_id in REPLY_MAP:
             control_id = REPLY_MAP[replied_id]
             state = ORDER_STATE.get(control_id)
 
         if state and state.get("locked"):
-            # padam gambar resit staff
+            # ✅ kalau dah paid, tak terima resit baru (lebih stabil)
+            if state.get("paid"):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                return
+
+            # padam gambar resit staff (kemas)
             try:
                 await message.delete()
             except Exception:
@@ -1185,11 +1178,10 @@ async def handle_photo(client, message):
             # rebuild album + control
             new_control_id = await send_or_rebuild_album(client, state)
 
-            # buang semua key lama
+            # rebind key state
             for k in list(ORDER_STATE.keys()):
                 if ORDER_STATE.get(k) is state:
                     ORDER_STATE.pop(k, None)
-
             ORDER_STATE[new_control_id] = state
             return
 
@@ -1235,15 +1227,15 @@ async def handle_photo(client, message):
         "paid_at": None,
         "paid_by": None,
         "locked": False,
+
+        # album bundle
         "anchor_msg_id": sent.id,
         "album_msg_ids": None,
         "album_first_id": None,
         "control_msg_id": None,
 
-        # OCR fields
+        # OCR
         "ocr_text": None,
-        "ocr_msg_id": None,
-        "last_ocr_receipt_file_id": None,
     }
 
 if __name__ == "__main__":
