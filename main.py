@@ -6,12 +6,12 @@ from google.cloud import vision
 # ================== SETTINGS ==================
 TARGET_ACC = "8606018423"
 TARGET_BANK = "CIMB BANK"
-MAX_REPLY_CHARS = 3500  # safety limit telegram
+MAX_REPLY_CHARS = 3500
 
 # ================== GOOGLE CREDS (Railway Env) ==================
-# Required Railway Variables:
+# Railway Variables:
 #   API_ID, API_HASH, BOT_TOKEN
-#   GOOGLE_APPLICATION_CREDENTIALS_JSON   (paste FULL JSON content)
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON  (paste FULL JSON content)
 creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
 if not creds_json:
     raise RuntimeError("Missing env var: GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -36,15 +36,15 @@ vision_client = vision.ImageAnnotatorClient()
 # ================== HELPERS ==================
 def normalize_ocr_text(s: str) -> str:
     """
-    Betulkan salah OCR biasa + kemaskan whitespace.
-    Nota: sengaja TIDAK tukar 'l'->'1' supaya bulan BM (Julai/Disember) tak rosak.
+    Kemaskan OCR (minima, selamat).
+    Nota: sengaja TIDAK tukar 'l'->'1' supaya Julai/Disember tak rosak.
     """
     if not s:
         return ""
     trans = str.maketrans({
-        "O": "0", "o": "0",   # O -> 0
-        "I": "1", "|": "1",   # I / | -> 1
-        "S": "5", "s": "5",   # S -> 5
+        "O": "0", "o": "0",
+        "I": "1", "|": "1",
+        "S": "5", "s": "5",
     })
     s = s.translate(trans)
     s = re.sub(r"[ \t]+", " ", s)
@@ -54,41 +54,24 @@ def digits_only(s: str) -> str:
     return re.sub(r"\D+", "", s or "")
 
 def account_found(text: str) -> bool:
-    """
-    Akan jumpa walaupun format:
-    - 8 6 0 6 0 1 8 4 2 3
-    - 8606 0184 23
-    - 86-06-01-84-23
-    """
     t = normalize_ocr_text(text)
     return TARGET_ACC in digits_only(t)
 
 def format_dt(dt: datetime) -> str:
-    # output: DD/MM/YYYY | 12:30am
     ddmmyyyy = dt.strftime("%d/%m/%Y")
     h, m = dt.hour, dt.minute
     ap = "am" if h < 12 else "pm"
     h12 = h % 12 or 12
     return f"{ddmmyyyy} | {h12}:{m:02d}{ap}"
 
+def build_line(ok_text: str, bad_text: str, ok: bool, ok_emoji="✅", bad_emoji="❌") -> str:
+    return f"{ok_text} {ok_emoji}" if ok else f"{bad_text} {bad_emoji}"
+
 # ================== DATETIME PARSER ==================
 def parse_datetime(text: str):
-    """
-    Supported:
-    - 22/01/2026, 22-01-26, 22.1.2026
-    - 2026/01/22, 2026-1-22
-    - 22 Jan 2026, 22 January 2026
-    - 22/Jan/2026, 22-Jan-2026, 22.Jan.2026
-    - Jan 22, 2026
-    - 22 Januari 2026, 22hb Januari 2026
-    Time:
-    - 10:38, 22:51, 10.38
-    - 10:38 PM, 10:38PM, 10.38pm
-    - 10:38:48 (seconds ignored)
-    """
     t = normalize_ocr_text(text)
 
-    # time patterns
+    # time: 14:17 / 2:17 PM / 02.17pm / 02:17:59
     p_time = re.compile(r"\b(\d{1,2})[:\.](\d{2})(?:[:\.](\d{2}))?\s*(am|pm)?\b", re.I)
 
     # month map (EN + BM)
@@ -126,8 +109,8 @@ def parse_datetime(text: str):
         if not m:
             return None
         m2 = m.strip().lower()
-        m2 = re.sub(r"\.+$", "", m2)     # Jan. -> Jan
-        m2 = re.sub(r"[^a-z]", "", m2)   # buang comma/simbol
+        m2 = re.sub(r"\.+$", "", m2)
+        m2 = re.sub(r"[^a-z]", "", m2)
         if not m2:
             return None
         if m2 in mon_map:
@@ -139,17 +122,17 @@ def parse_datetime(text: str):
     dates = []  # (pos, (d, m, y))
     times = []  # (pos, (hh, mm, ampm))
 
-    # A) numeric D/M/Y
+    # A) numeric D/M/Y: 22/01/2026, 2-1-26
     p_dmy = re.compile(r"\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b")
     for m in p_dmy.finditer(t):
         dates.append((m.start(), (m.group(1), m.group(2), m.group(3))))
 
-    # B) numeric Y/M/D
+    # B) numeric Y/M/D: 2026/01/22
     p_ymd = re.compile(r"\b(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})\b")
     for m in p_ymd.finditer(t):
         dates.append((m.start(), (m.group(3), m.group(2), m.group(1))))
 
-    # C) D MON Y (with separators)
+    # C) D MON Y: 22 Jan 2026 / 22/Jan/2026 / 22 Januari 2026 / 22hb Januari 2026
     p_d_mon_y = re.compile(
         r"\b(\d{1,2})(?:st|nd|rd|th|hb)?\s*(?:[\/\-\.\s])\s*([A-Za-z]+)\s*(?:[\/\-\.\s])?\s*(\d{2,4})\b",
         re.I
@@ -160,7 +143,7 @@ def parse_datetime(text: str):
         if mo:
             dates.append((m.start(), (d, str(mo), y)))
 
-    # D) MON D, Y
+    # D) MON D, Y: Jan 22, 2026 / January 22 2026 / Januari 22, 2026
     p_mon_d_y = re.compile(
         r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th|hb)?\s*,?\s+(\d{2,4})\b",
         re.I
@@ -177,7 +160,7 @@ def parse_datetime(text: str):
     if not dates:
         return None
 
-    # choose nearest date-time
+    # Pair nearest date-time
     best_date = dates[0]
     best_time = times[0] if times else None
 
@@ -214,11 +197,11 @@ def parse_datetime(text: str):
     except:
         return None
 
-# ================== AMOUNT PARSER (WITH SEN) ==================
+# ================== AMOUNT (WITH SEN) ==================
 def parse_amount(text: str):
     """
     Ambil amount dengan sen.
-    Prioriti: RM/MYR dahulu. Kalau tak jumpa, fallback kepada nombor dekat keyword.
+    Prioriti RM/MYR dahulu.
     """
     t = normalize_ocr_text(text).lower()
     keywords = ["amount", "total", "jumlah", "amaun", "grand total", "payment", "paid", "pay", "transfer", "successful"]
@@ -230,7 +213,6 @@ def parse_amount(text: str):
 
     candidates = []
 
-    # PASS 1: RM/MYR formats
     p_rm = re.compile(
         r"\b(?:rm|myr)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b",
         re.I
@@ -241,33 +223,66 @@ def parse_amount(text: str):
             val = float(num_str)
         except:
             continue
-        candidates.append((score_match(val, m.start()) + 1000, val))  # bonus utk RM/MYR
+        candidates.append((score_match(val, m.start()) + 1000, val))
 
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
 
-    # PASS 2 (fallback): nombor biasa dekat keyword
-    p_num = re.compile(r"\b([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b")
-    for m in p_num.finditer(t):
-        num_str = m.group(1).replace(",", "")
-        try:
-            val = float(num_str)
-        except:
-            continue
-        candidates.append((score_match(val, m.start()), val))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+    return None
 
 def format_amount_rm(val: float) -> str:
     return f"RM{val:.2f}"
 
-def build_line(label_ok: str, label_bad: str, ok: bool) -> str:
-    return f"{label_ok} ✅" if ok else f"{label_bad} ❌"
+# ================== STATUS (YOUR LIST ONLY) ==================
+POSITIVE_KW = [
+    # English ✅
+    "successful", "success", "completed", "complete",
+    "transaction successful", "payment successful", "transfer successful",
+    "paid", "payment received", "received", "funds received",
+    "credited", "credit", "approved", "verified", "posted",
+    "settled", "processed",
+
+    # BM ✅
+    "berjaya", "berjaya diproses", "transaksi berjaya", "pembayaran berjaya",
+    "pemindahan berjaya", "diterima", "telah diterima", "sudah masuk",
+    "dana diterima", "dikreditkan", "diluluskan", "selesai", "telah selesai",
+    "berjaya dihantar",
+]
+
+NEGATIVE_KW = [
+    # English ‼️
+    "pending", "processing", "in progress", "queued", "awaiting", "awaiting confirmation",
+    "not received", "unpaid", "failed", "unsuccessful", "rejected", "declined",
+    "cancelled", "canceled", "reversed", "refunded", "void", "timeout", "timed out",
+
+    # BM ‼️
+    "belum masuk", "belum diterima", "belum terima", "belum berjaya", "dalam proses",
+    "sedang diproses", "menunggu pengesahan", "gagal", "tidak berjaya", "ditolak",
+    "dibatalkan", "dipulangkan", "diproses semula",
+
+    # Istilah bank ‼️
+    "ibg", "interbank giro", "scheduled transfer", "future dated", "effective date", "pending settlement",
+]
+
+def detect_payment_status(text: str):
+    """
+    Output: (label, emoji)
+      - jika jumpa NEGATIVE -> "Duit belum masuk" ‼️
+      - jika jumpa POSITIVE -> "Duit sudah masuk" ✅
+      - jika tak jumpa -> "Status tidak pasti" ❓
+    Nota: kalau ada NEGATIVE + POSITIVE serentak, pilih POSITIVE (✅).
+    """
+    t = normalize_ocr_text(text).lower()
+
+    has_pos = any(k in t for k in POSITIVE_KW)
+    has_neg = any(k in t for k in NEGATIVE_KW)
+
+    if has_neg and not has_pos:
+        return ("Duit belum masuk", "‼️")
+    if has_pos:
+        return ("Duit sudah masuk", "✅")
+    return ("Status tidak pasti", "❓")
 
 # ================== BOT HANDLER ==================
 @app.on_message(filters.photo)
@@ -292,33 +307,43 @@ async def ocr_photo(_, message):
             await message.reply_text("❌ OCR tak jumpa teks (cuba gambar lebih jelas).")
             return
 
-        # ACCOUNT
+        # 1) ACCOUNT
         ok_acc = account_found(text)
         line1 = build_line(
             f"{TARGET_ACC} {TARGET_BANK}",
             "No akaun tidak sah",
-            ok_acc
+            ok_acc,
+            ok_emoji="✅",
+            bad_emoji="❌"
         )
 
-        # DATETIME
+        # 2) DATETIME
         dt = parse_datetime(text)
         ok_dt = dt is not None
         line2 = build_line(
             format_dt(dt) if ok_dt else "",
             "Tarikh tidak dijumpai",
-            ok_dt
+            ok_dt,
+            ok_emoji="✅",
+            bad_emoji="❌"
         )
 
-        # AMOUNT
+        # 3) AMOUNT
         amt = parse_amount(text)
         ok_amt = amt is not None
         line3 = build_line(
             format_amount_rm(amt) if ok_amt else "",
             "Total tidak dijumpai",
-            ok_amt
+            ok_amt,
+            ok_emoji="✅",
+            bad_emoji="❌"
         )
 
-        reply = f"{line1}\n{line2}\n{line3}"
+        # 4) STATUS
+        status_text, status_emoji = detect_payment_status(text)
+        line4 = f"{status_text} {status_emoji}"
+
+        reply = f"{line1}\n{line2}\n{line3}\n{line4}"
         if len(reply) > MAX_REPLY_CHARS:
             reply = reply[:MAX_REPLY_CHARS] + "\n...\n(terlalu panjang)"
 
@@ -335,3 +360,4 @@ async def ocr_photo(_, message):
                 pass
 
 app.run()
+
