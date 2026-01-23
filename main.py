@@ -216,7 +216,7 @@ def build_caption(
     if items_dict and is_all_prices_done(items_dict, prices_dict) and ship_cost is not None:
         prod_total = calc_products_total(items_dict, prices_dict)
         grand_total = prod_total + int(ship_cost)
-        lines.append(f"TOTAL KESELURUHAN : RM{grand_total}")
+        lines.append(f"Total keseluruhan : RM{grand_total}")
 
     if locked:
         if paid and state:
