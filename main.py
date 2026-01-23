@@ -273,11 +273,31 @@ async def delete_bundle(client: Client, state: dict):
         await safe_delete(client, chat_id, state["anchor_msg_id"])
 
 # ================= OCR skrip (helpers) =================
-def normalize_ocr_text(s: str) -> str:
+def normalize_for_text(s: str) -> str:
+    """
+    Normalizer untuk keyword/status/tarikh.
+    JANGAN tukar S->5 (ini punca 'successful' gagal detect).
+    """
     if not s:
         return ""
-    trans = str.maketrans({"O": "0", "o": "0", "I": "1", "|": "1", "S": "5", "s": "5"})
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    return s
+
+def normalize_for_digits(s: str) -> str:
+    """
+    Normalizer untuk nombor akaun/amount.
+    Boleh betulkan OCR common: O->0, I/l/|->1.
+    """
+    if not s:
+        return ""
+    trans = str.maketrans({
+        "O": "0", "o": "0",
+        "I": "1", "i": "1",
+        "l": "1", "|": "1",
+    })
     s = s.translate(trans)
+    s = s.replace("\u00a0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     return s
 
@@ -285,7 +305,7 @@ def digits_only(s: str) -> str:
     return re.sub(r"\D+", "", s or "")
 
 def account_found(text: str) -> bool:
-    t = normalize_ocr_text(text)
+    t = normalize_for_digits(text)
     return TARGET_ACC in digits_only(t)
 
 def format_dt(dt: datetime) -> str:
@@ -296,8 +316,19 @@ def format_dt(dt: datetime) -> str:
     return f"{ddmmyyyy} | {h12}:{m:02d}{ap}"
 
 def parse_datetime(text: str):
-    t = normalize_ocr_text(text)
-    p_time = re.compile(r"\b(\d{1,2})[:\.](\d{2})(?:[:\.](\d{2}))?\s*(am|pm)?\b", re.I)
+    """
+    Upgrade:
+    - boleh baca: '05:36 PM', '05:36PM', '05:36 P M', '05:36 P.M.'
+    - date: 20 Jan 2026, 20/01/2026, 2026-01-20, dll
+    """
+    t = normalize_for_text(text)
+
+    # Time: accept am/pm variants including P M, P.M., etc
+    p_time = re.compile(
+        r"\b(\d{1,2})[:\.](\d{2})(?:[:\.](\d{2}))?\s*"
+        r"(a\.?\s*m\.?|p\.?\s*m\.?)?\b",
+        re.I
+    )
 
     mon_map = {
         "jan": 1, "january": 1, "januari": 1,
@@ -328,14 +359,17 @@ def parse_datetime(text: str):
 
     dates, times = [], []
 
+    # dd/mm/yyyy or dd-mm-yy
     p_dmy = re.compile(r"\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b")
     for m in p_dmy.finditer(t):
         dates.append((m.start(), (m.group(1), m.group(2), m.group(3))))
 
+    # yyyy/mm/dd
     p_ymd = re.compile(r"\b(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})\b")
     for m in p_ymd.finditer(t):
         dates.append((m.start(), (m.group(3), m.group(2), m.group(1))))
 
+    # dd Mon yyyy
     p_d_mon_y = re.compile(r"\b(\d{1,2})\s*([A-Za-z]+)\s*(\d{2,4})\b", re.I)
     for m in p_d_mon_y.finditer(t):
         d, mon, y = m.group(1), m.group(2), m.group(3)
@@ -344,11 +378,14 @@ def parse_datetime(text: str):
             dates.append((m.start(), (d, str(mo), y)))
 
     for m in p_time.finditer(t):
-        times.append((m.start(), (m.group(1), m.group(2), m.group(4))))
+        ap_raw = m.group(4) or ""
+        ap_letters = re.sub(r"[^a-z]", "", ap_raw.lower())  # "p m" -> "pm", "p.m." -> "pm"
+        times.append((m.start(), (m.group(1), m.group(2), ap_letters)))
 
     if not dates:
         return None
 
+    # pick closest date-time pair
     best_date = dates[0]
     best_time = times[0] if times else None
 
@@ -372,10 +409,9 @@ def parse_datetime(text: str):
         _, (hh, minute, ap) = best_time
         hh, minute = int(hh), int(minute)
         if ap:
-            ap = ap.lower()
-            if ap == "pm" and hh != 12:
+            if ap.startswith("p") and hh != 12:
                 hh += 12
-            if ap == "am" and hh == 12:
+            if ap.startswith("a") and hh == 12:
                 hh = 0
     else:
         hh, minute = 0, 0
@@ -386,16 +422,19 @@ def parse_datetime(text: str):
         return None
 
 def parse_amount(text: str):
-    t = normalize_ocr_text(text).lower()
+    t = normalize_for_digits(text).lower()
     keywords = ["amount", "total", "jumlah", "amaun", "grand total", "payment", "paid", "pay", "transfer", "successful"]
 
     def score_match(val: float, start: int) -> float:
-        window = t[max(0, start - 60): start + 60]
+        window = t[max(0, start - 80): start + 80]
         near_kw = any(k in window for k in keywords)
         return (100 if near_kw else 0) + min(val, 999999) / 1000.0
 
     candidates = []
-    p_rm = re.compile(r"\b(?:rm|myr)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b", re.I)
+    p_rm = re.compile(
+        r"\b(?:rm|myr)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b",
+        re.I
+    )
     for m in p_rm.finditer(t):
         num_str = m.group(1).replace(",", "")
         try:
@@ -410,7 +449,7 @@ def parse_amount(text: str):
     return candidates[0][1]
 
 def format_amount_rm(val: float) -> str:
-    return f"RM{val:.2f}"
+    return f"RM{val:,.2f}"
 
 POSITIVE_KW = [
     "transaction successful", "payment successful", "transfer successful",
@@ -433,13 +472,23 @@ NEGATIVE_KW = [
 ]
 
 def detect_status_original(text: str) -> str:
-    t = normalize_ocr_text(text).lower()
-    pos_hit = next((kw for kw in sorted(POSITIVE_KW, key=len, reverse=True) if kw in t), None)
+    # guna normalizer TEXT (tak tukar S->5)
+    t = normalize_for_text(text).lower()
+
+    # negative first (kalau ada)
     neg_hit = next((kw for kw in sorted(NEGATIVE_KW, key=len, reverse=True) if kw in t), None)
-    if pos_hit:
-        return f"{pos_hit} ✅"
     if neg_hit:
         return f"{neg_hit} ‼️"
+
+    pos_hit = next((kw for kw in sorted(POSITIVE_KW, key=len, reverse=True) if kw in t), None)
+    if pos_hit:
+        return f"{pos_hit} ✅"
+
+    # fallback yang lebih “longgar” untuk OCR (success/succesful/successfu1 dll)
+    loose = t.replace("1", "l")
+    if "success" in loose or "berjaya" in loose or "selesai" in loose:
+        return "successful ✅"
+
     return "Status tidak pasti ❓"
 
 async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
@@ -1325,9 +1374,9 @@ async def sp_back(client, callback):
 @bot.on_callback_query(filters.regex(r"^sp_ok$"))
 async def sp_ok_move(client, callback):
     """
-    ✅ FIX + DEBUG:
-    - test access channel dulu (get_chat)
-    - jika gagal post/delete -> tulis sebab dalam group
+    ✅ FIX:
+    - OCR tarikh & status jadi betul
+    - Lepas pindah channel: TAK tinggal apa-apa mesej dalam group
     """
     state = ORDER_STATE.get(callback.message.id)
     if not state or not state.get("sp_mode"):
@@ -1366,11 +1415,10 @@ async def sp_ok_move(client, callback):
         await callback.answer("Password salah", show_alert=True)
         return
 
-    # ✅ betul
     await callback.answer("Proses pindah ke channel...")
 
     try:
-        # 0) test channel access (INI SELALU JADI PUNCA)
+        # 0) test channel access
         try:
             await client.get_chat(OFFICIAL_CHANNEL_ID)
         except Exception as e:
@@ -1405,6 +1453,7 @@ async def sp_ok_move(client, callback):
         try:
             await delete_bundle(client, state)
         except Exception as e:
+            # hanya debug jika delete gagal
             await client.send_message(
                 chat_id=state["chat_id"],
                 text=f"⚠️ DEBUG: Hantar channel berjaya, tapi gagal delete dalam group.\nPastikan bot admin group + Delete messages ON.\n{type(e).__name__}: {e}"
@@ -1415,14 +1464,10 @@ async def sp_ok_move(client, callback):
             if ORDER_STATE.get(k) is state:
                 ORDER_STATE.pop(k, None)
 
-        # 5) mesej ringkas dalam group
-        try:
-            await client.send_message(chat_id=state["chat_id"], text="✅ Order ini sudah dipindahkan ke channel rasmi.")
-        except Exception:
-            pass
+        # ✅ 5) TIADA mesej ditinggalkan dalam group (diminta user)
+        return
 
     except Exception as e:
-        # Catch ALL - supaya tak "senyap"
         try:
             tb = traceback.format_exc()
             await client.send_message(
