@@ -111,11 +111,11 @@ HARGA_PER_PAGE = 15
 
 DEST_LIST = [
     "JOHOR", "KEDAH", "KELANTAN", "MELAKA", "NEGERI SEMBILAN", "PAHANG", "PERAK", "PERLIS",
-    "PULAU PINANG", "SELANGOR", "TERENGGANU", "LANGKAWI", "PICKUP", "KITA HANTAR",
+    "PULAU PINANG", "SELANGOR", "TERENGGANU", "LANGKAWI", "PICKUP SENDIRI", "LORI KITA HANTAR",
 ]
 
 KOS_START = 0
-KOS_END = 2000
+KOS_END = 1500
 KOS_STEP = 10
 KOS_LIST = list(range(KOS_START, KOS_END + 1, KOS_STEP))
 KOS_PER_PAGE = 15
@@ -187,12 +187,22 @@ def build_caption(
     paid: bool = False,
     state: dict | None = None,
 ) -> str:
+    """
+    ✅ PERMINTAAN USER:
+    1) Baris detail/item -> BOLD (nama, qty, RM...)
+    2) Destinasi : {DEST | RM...} bahagian dalam kurungan/bahagian kanan tu BOLD
+    3) TOTAL KESELURUHAN : {RMxxxx} bahagian RMxxxx BOLD
+    4) Selepas detail, mesti ada 1 perenggan kosong sebelum "SLIDE KIRI ..."
+    """
     prices_dict = prices_dict or {}
 
-    # ✅ Base caption (detail) BOLD
+    # ✅ Base caption dah bold (kekal)
     lines = [bold(base_caption)]
 
-    # ✅ TIADA PERENGGAN/JARAK untuk detail
+    # Flag untuk tahu ada detail yang dipaparkan (item/dest/total)
+    has_detail = False
+
+    # ✅ Item lines jadi bold (Satu baris penuh)
     if items_dict:
         for k, q in items_dict.items():
             nama = PRODUK_LIST.get(k, k)
@@ -205,26 +215,41 @@ def build_caption(
                     harga_display = f"RM{total_line}"
                 except Exception:
                     harga_display = f"RM{unit_price}"
-            lines.append(f"{nama} | {q} | {harga_display}")
 
+            # ✅ FULL LINE BOLD
+            lines.append(bold(f"{nama} | {q} | {harga_display}"))
+            has_detail = True
+
+    # ✅ Destinasi: bahagian value BOLD
     if dest:
         if ship_cost is None:
-            lines.append(f"Destinasi : {dest}")
+            lines.append(f"Destinasi : {bold(dest)}")
         else:
-            lines.append(f"Destinasi : {dest} | RM{int(ship_cost)}")
+            lines.append(f"Destinasi : {bold(f'{dest} | RM{int(ship_cost)}')}")
+        has_detail = True
 
+    # ✅ Total: value RMxxxx BOLD
     if items_dict and is_all_prices_done(items_dict, prices_dict) and ship_cost is not None:
         prod_total = calc_products_total(items_dict, prices_dict)
         grand_total = prod_total + int(ship_cost)
-        lines.append(f"Total keseluruhan : RM{grand_total}")
+        lines.append(f"TOTAL KESELURUHAN : {bold(f'RM{grand_total}')}")
+        has_detail = True
 
+    # ✅ Locked behavior
     if locked:
         if paid and state:
-            # ✅ HANYA 1 PERENGGAN untuk bezakan detail & OCR
+            # ✅ 1 perenggan untuk bezakan detail & OCR
             lines.append("")
             ocr_block = build_ocr_block(state)
             lines.append(ocr_block if ocr_block else "❌ OCR belum ada (tekan BUTANG SEMAK BAYARAN).")
         else:
+            # ✅ WAJIB 1 PERENGGAN selepas detail sebelum SLIDE...
+            # (Jika tiada detail pun, ikut permintaan: letak juga 1 perenggan untuk kemas)
+            if has_detail:
+                lines.append("")
+            else:
+                lines.append("")
+
             if receipts_count <= 0:
                 lines.append("⬅️" + bold("SLIDE KIRI UPLOAD RESIT"))
             else:
@@ -548,7 +573,7 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
 
         # 2) No akaun/bank
         ok_acc = account_found(text)
-        line2 = bold(f"{TARGET_ACC} {TARGET_BANK}") + " ✅" if ok_acc else "Akaun tidak sah ❌"
+        line2 = bold(f"{TARGET_ACC} {TARGET_BANK}") + " ✅" if ok_acc else "No akaun tidak sah ❌"
 
         # 3) Status
         line3 = detect_status_original(text)
@@ -1663,3 +1688,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
