@@ -7,7 +7,7 @@
 #   - BACK -> kembali ke halaman BUTANG SEMAK BAYARAN
 # =========================
 
-import os, io, re, tempfile
+import os, io, re, tempfile, traceback
 from datetime import datetime
 
 import pytz
@@ -52,11 +52,6 @@ def parse_allowed_ids(raw: str) -> set[int]:
     return out
 
 SEMAK_ALLOWED_IDS = parse_allowed_ids(SEMAK_ALLOWED_IDS_RAW)
-if not SEMAK_ALLOWED_IDS:
-    # Biar jalan, tapi lebih selamat paksa set.
-    # Kalau awak nak wajib, uncomment baris bawah:
-    # raise RuntimeError("SEMAK_ALLOWED_IDS kosong. Letak contoh: 1111,2222")
-    pass
 
 # ================= OCR SETTINGS (OCR skrip) =================
 TARGET_ACC = "8606018423"
@@ -228,10 +223,6 @@ def build_semak_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("BUTANG SEMAK BAYARAN", callback_data="semak_bayaran")]])
 
 def build_pin_keyboard(prefix: str) -> InlineKeyboardMarkup:
-    """
-    prefix: "pin"  (untuk payment)
-            "sp"   (untuk semak)
-    """
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("1", callback_data=f"{prefix}_1"),
@@ -248,9 +239,7 @@ def build_pin_keyboard(prefix: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("8", callback_data=f"{prefix}_8"),
             InlineKeyboardButton("9", callback_data=f"{prefix}_9"),
         ],
-        [
-            InlineKeyboardButton("0", callback_data=f"{prefix}_0"),
-        ],
+        [InlineKeyboardButton("0", callback_data=f"{prefix}_0")],
         [
             InlineKeyboardButton("🔙 BACK", callback_data=f"{prefix}_back"),
             InlineKeyboardButton("✅ OKEY", callback_data=f"{prefix}_ok"),
@@ -526,7 +515,6 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
 
     album_msgs = await client.send_media_group(chat_id=chat_id, media=media)
     album_ids = [m.id for m in album_msgs]
-    album_first_id = album_msgs[0].id
 
     if state.get("paid"):
         control_text = "SEMAK OCR BAYARAN"
@@ -541,7 +529,6 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
         REPLY_MAP[mid] = control.id
 
     state["album_msg_ids"] = album_ids
-    state["album_first_id"] = album_first_id
     state["control_msg_id"] = control.id
     state["anchor_msg_id"] = None
 
@@ -558,9 +545,6 @@ async def deny_if_locked(state: dict, callback) -> bool:
 
 # ================= TRANSFER TO CHANNEL =================
 async def copy_album_to_channel(client: Client, state: dict) -> None:
-    """
-    Hantar semula (copy) order + resit ke channel rasmi.
-    """
     receipts_album = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
     state["receipts_album"] = receipts_album
 
@@ -1047,7 +1031,6 @@ async def last_submit(client, callback):
     state["sp_tries"] = 0
 
     state["album_msg_ids"] = None
-    state["album_first_id"] = None
     state["control_msg_id"] = None
     state["anchor_msg_id"] = old_id
 
@@ -1244,7 +1227,6 @@ def is_semak_allowed(user_id: int | None) -> bool:
     if not user_id:
         return False
     if not SEMAK_ALLOWED_IDS:
-        # kalau list kosong, anggap semua boleh (tapi saya syor isi SEMAK_ALLOWED_IDS)
         return True
     return user_id in SEMAK_ALLOWED_IDS
 
@@ -1256,9 +1238,6 @@ async def back_to_semak_page(callback, state: dict):
 
 @bot.on_callback_query(filters.regex(r"^semak_bayaran$"))
 async def semak_bayaran_start_pin(client, callback):
-    """
-    Bila tekan BUTANG SEMAK BAYARAN -> keluar keypad SEMAK_PIN (hanya untuk user yang dibenarkan)
-    """
     control_id = callback.message.id
     state = ORDER_STATE.get(control_id)
 
@@ -1275,7 +1254,6 @@ async def semak_bayaran_start_pin(client, callback):
         await callback.answer("Tiada resit untuk disemak.", show_alert=True)
         return
 
-    # lock keypad utk 1 user sahaja
     active = state.get("sp_active_user")
     if active and active != user_id:
         await callback.answer("Keypad sedang digunakan oleh user lain.", show_alert=True)
@@ -1346,6 +1324,11 @@ async def sp_back(client, callback):
 
 @bot.on_callback_query(filters.regex(r"^sp_ok$"))
 async def sp_ok_move(client, callback):
+    """
+    ✅ FIX + DEBUG:
+    - test access channel dulu (get_chat)
+    - jika gagal post/delete -> tulis sebab dalam group
+    """
     state = ORDER_STATE.get(callback.message.id)
     if not state or not state.get("sp_mode"):
         await callback.answer("Sila tekan BUTANG SEMAK BAYARAN dulu.", show_alert=True)
@@ -1356,7 +1339,7 @@ async def sp_ok_move(client, callback):
         await callback.answer("Ini bukan keypad anda.", show_alert=True)
         return
 
-    buf = state.get("sp_buffer", "")
+    buf = (state.get("sp_buffer", "") or "").strip()
     if not buf:
         await callback.answer("PIN kosong. Sila tekan nombor.", show_alert=True)
         return
@@ -1383,40 +1366,72 @@ async def sp_ok_move(client, callback):
         await callback.answer("Password salah", show_alert=True)
         return
 
-    # ✅ BETUL: OCR + COPY ke channel + delete bundle
+    # ✅ betul
     await callback.answer("Proses pindah ke channel...")
 
-    # Pastikan ada OCR terbaru (auto run sebelum pindah)
-    state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
-
-    # reset semak pin
-    state["sp_mode"] = False
-    state["sp_active_user"] = None
-    state["sp_buffer"] = ""
-    state["sp_tries"] = 0
-
-    # 1) copy ke channel
     try:
-        await copy_album_to_channel(client, state)
+        # 0) test channel access (INI SELALU JADI PUNCA)
+        try:
+            await client.get_chat(OFFICIAL_CHANNEL_ID)
+        except Exception as e:
+            await client.send_message(
+                chat_id=state["chat_id"],
+                text=f"❌ DEBUG: Bot tak dapat akses channel OFFICIAL_CHANNEL_ID={OFFICIAL_CHANNEL_ID}\n{type(e).__name__}: {e}"
+            )
+            await back_to_semak_page(callback, state)
+            return
+
+        # 1) OCR semua resit
+        state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
+
+        # reset semak pin
+        state["sp_mode"] = False
+        state["sp_active_user"] = None
+        state["sp_buffer"] = ""
+        state["sp_tries"] = 0
+
+        # 2) copy album ke channel
+        try:
+            await copy_album_to_channel(client, state)
+        except Exception as e:
+            await client.send_message(
+                chat_id=state["chat_id"],
+                text=f"❌ DEBUG: Gagal hantar ke channel OFFICIAL_CHANNEL_ID={OFFICIAL_CHANNEL_ID}\n{type(e).__name__}: {e}"
+            )
+            await back_to_semak_page(callback, state)
+            return
+
+        # 3) delete bundle dalam group
+        try:
+            await delete_bundle(client, state)
+        except Exception as e:
+            await client.send_message(
+                chat_id=state["chat_id"],
+                text=f"⚠️ DEBUG: Hantar channel berjaya, tapi gagal delete dalam group.\nPastikan bot admin group + Delete messages ON.\n{type(e).__name__}: {e}"
+            )
+
+        # 4) buang state dari memori
+        for k in list(ORDER_STATE.keys()):
+            if ORDER_STATE.get(k) is state:
+                ORDER_STATE.pop(k, None)
+
+        # 5) mesej ringkas dalam group
+        try:
+            await client.send_message(chat_id=state["chat_id"], text="✅ Order ini sudah dipindahkan ke channel rasmi.")
+        except Exception:
+            pass
+
     except Exception as e:
-        # kalau gagal post ke channel (bot tak admin / channel id salah)
-        await callback.answer(f"❌ Gagal hantar ke channel: {type(e).__name__}", show_alert=True)
+        # Catch ALL - supaya tak "senyap"
+        try:
+            tb = traceback.format_exc()
+            await client.send_message(
+                chat_id=state["chat_id"],
+                text=f"❌ DEBUG CRASH sp_ok_move\n{type(e).__name__}: {e}\n\n{tb[-1500:]}"
+            )
+        except Exception:
+            pass
         await back_to_semak_page(callback, state)
-        return
-
-    # 2) delete bundle dalam group
-    await delete_bundle(client, state)
-
-    # 3) buang state dari memori (supaya tak clash)
-    for k in list(ORDER_STATE.keys()):
-        if ORDER_STATE.get(k) is state:
-            ORDER_STATE.pop(k, None)
-
-    # 4) mesej ringkas dalam group
-    try:
-        await client.send_message(chat_id=state["chat_id"], text="✅ Order ini sudah dipindahkan ke channel rasmi.")
-    except Exception:
-        pass
 
 # ================= PHOTO HANDLER =================
 @bot.on_message(filters.photo & ~filters.bot)
@@ -1502,7 +1517,6 @@ async def handle_photo(client, message):
 
         "anchor_msg_id": sent.id,
         "album_msg_ids": None,
-        "album_first_id": None,
         "control_msg_id": None,
 
         "ocr_results": [],
@@ -1522,4 +1536,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
