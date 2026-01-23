@@ -9,6 +9,7 @@
 
 import os, io, re, tempfile, traceback
 from datetime import datetime
+from typing import Dict, List, Optional, Set, Any
 
 import pytz
 from pyrogram import Client, filters
@@ -41,8 +42,8 @@ SEMAK_PIN = os.getenv("SEMAK_PIN", "4321").strip()
 SEMAK_ALLOWED_IDS_RAW = os.getenv("SEMAK_ALLOWED_IDS", "1150078068").strip()
 
 
-def parse_allowed_ids(raw: str) -> set[int]:
-    out = set()
+def parse_allowed_ids(raw: str) -> Set[int]:
+    out: Set[int] = set()
     if not raw:
         return out
     for part in raw.split(","):
@@ -87,8 +88,8 @@ bot = Client(
 
 
 # ================= TEMP STATE (RAM) =================
-ORDER_STATE = {}   # key = anchor msg id (sebelum lock) / control msg id (selepas rebuild)
-REPLY_MAP = {}     # album message id -> control msg id
+ORDER_STATE: Dict[int, Dict[str, Any]] = {}   # key = anchor msg id (sebelum lock) / control msg id (selepas rebuild)
+REPLY_MAP: Dict[int, int] = {}               # album message id -> control msg id
 
 
 # ================= DATA =================
@@ -138,13 +139,13 @@ def bold(text: str) -> str:
 
 
 # ================= UTIL (ORDER) =================
-def is_all_prices_done(items_dict: dict, prices_dict: dict) -> bool:
+def is_all_prices_done(items_dict: Dict[str, int], prices_dict: Dict[str, int]) -> bool:
     if not items_dict:
         return False
     return all(k in prices_dict for k in items_dict.keys())
 
 
-def calc_products_total(items_dict: dict, prices_dict: dict) -> int:
+def calc_products_total(items_dict: Dict[str, int], prices_dict: Dict[str, int]) -> int:
     total = 0
     for k, qty in items_dict.items():
         unit = prices_dict.get(k)
@@ -157,20 +158,18 @@ def calc_products_total(items_dict: dict, prices_dict: dict) -> int:
     return total
 
 
-def build_ocr_block(state: dict) -> str:
+def build_ocr_block(state: Dict[str, Any]) -> str:
     results = state.get("ocr_results") or []
     if not results:
         return ""
     show = results[-MAX_OCR_RESULTS_IN_CAPTION:]
-    blocks = []
+    blocks: List[str] = []
     for txt in show:
         t = (txt or "").strip()
         if t:
             blocks.append(t)
 
-    # ✅ Kekalkan jarak antara resit (senang baca)
     out = "\n\n".join(blocks)
-
     if len(results) > len(show):
         out += f"\n\n(+{len(results)-len(show)} resit lagi tidak dipaparkan sebab limit caption)"
     return out.strip()
@@ -178,31 +177,20 @@ def build_ocr_block(state: dict) -> str:
 
 def build_caption(
     base_caption: str,
-    items_dict: dict,
-    prices_dict: dict | None = None,
-    dest: str | None = None,
-    ship_cost: int | None = None,
+    items_dict: Dict[str, int],
+    prices_dict: Optional[Dict[str, int]] = None,
+    dest: Optional[str] = None,
+    ship_cost: Optional[int] = None,
     locked: bool = False,
     receipts_count: int = 0,
     paid: bool = False,
-    state: dict | None = None,
+    state: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """
-    ✅ PERMINTAAN USER:
-    1) Baris detail/item -> BOLD (nama, qty, RM...)
-    2) Destinasi : {DEST | RM...} bahagian dalam kurungan/bahagian kanan tu BOLD
-    3) TOTAL KESELURUHAN : {RMxxxx} bahagian RMxxxx BOLD
-    4) Selepas detail, mesti ada 1 perenggan kosong sebelum "SLIDE KIRI ..."
-    """
     prices_dict = prices_dict or {}
 
-    # ✅ Base caption dah bold (kekal)
     lines = [bold(base_caption)]
-
-    # Flag untuk tahu ada detail yang dipaparkan (item/dest/total)
     has_detail = False
 
-    # ✅ Item lines jadi bold (Satu baris penuh)
     if items_dict:
         for k, q in items_dict.items():
             nama = PRODUK_LIST.get(k, k)
@@ -216,11 +204,9 @@ def build_caption(
                 except Exception:
                     harga_display = f"RM{unit_price}"
 
-            # ✅ FULL LINE BOLD
             lines.append(bold(f"{nama} | {q} | {harga_display}"))
             has_detail = True
 
-    # ✅ Destinasi: bahagian value BOLD
     if dest:
         if ship_cost is None:
             lines.append(f"Destinasi : {bold(dest)}")
@@ -228,28 +214,19 @@ def build_caption(
             lines.append(f"Destinasi : {bold(f'{dest} | RM{int(ship_cost)}')}")
         has_detail = True
 
-    # ✅ Total: value RMxxxx BOLD
     if items_dict and is_all_prices_done(items_dict, prices_dict) and ship_cost is not None:
         prod_total = calc_products_total(items_dict, prices_dict)
         grand_total = prod_total + int(ship_cost)
         lines.append(f"TOTAL KESELURUHAN : {bold(f'RM{grand_total}')}")
         has_detail = True
 
-    # ✅ Locked behavior
     if locked:
         if paid and state:
-            # ✅ 1 perenggan untuk bezakan detail & OCR
             lines.append("")
             ocr_block = build_ocr_block(state)
             lines.append(ocr_block if ocr_block else "❌ OCR belum ada (tekan BUTANG SEMAK BAYARAN).")
         else:
-            # ✅ WAJIB 1 PERENGGAN selepas detail sebelum SLIDE...
-            # (Jika tiada detail pun, ikut permintaan: letak juga 1 perenggan untuk kemas)
-            if has_detail:
-                lines.append("")
-            else:
-                lines.append("")
-
+            lines.append("")  # 1 perenggan kosong sebelum arahan slide
             if receipts_count <= 0:
                 lines.append("⬅️" + bold("SLIDE KIRI UPLOAD RESIT"))
             else:
@@ -311,7 +288,7 @@ async def safe_delete(client: Client, chat_id: int, message_id: int):
         pass
 
 
-async def delete_bundle(client: Client, state: dict):
+async def delete_bundle(client: Client, state: Dict[str, Any]):
     chat_id = state["chat_id"]
 
     for mid in (state.get("album_msg_ids") or []):
@@ -327,10 +304,6 @@ async def delete_bundle(client: Client, state: dict):
 
 # ================= OCR skrip (helpers) =================
 def normalize_for_text(s: str) -> str:
-    """
-    Normalizer untuk keyword/status/tarikh.
-    JANGAN tukar S->5 (ini punca 'successful' gagal detect).
-    """
     if not s:
         return ""
     s = s.replace("\u00a0", " ")
@@ -339,10 +312,6 @@ def normalize_for_text(s: str) -> str:
 
 
 def normalize_for_digits(s: str) -> str:
-    """
-    Normalizer untuk nombor akaun/amount.
-    Boleh betulkan OCR common: O->0, I/l/|->1.
-    """
     if not s:
         return ""
     trans = str.maketrans({
@@ -366,7 +335,6 @@ def account_found(text: str) -> bool:
 
 
 def format_dt(dt: datetime) -> str:
-    # ✅ Tarikh & waktu BOLD
     ddmmyyyy = dt.strftime("%d/%m/%Y")
     h, m = dt.hour, dt.minute
     ap = "am" if h < 12 else "pm"
@@ -374,12 +342,7 @@ def format_dt(dt: datetime) -> str:
     return bold(f"{ddmmyyyy} | {h12}:{m:02d}{ap}")
 
 
-def parse_datetime(text: str):
-    """
-    Upgrade:
-    - boleh baca: '05:36 PM', '05:36PM', '05:36 P M', '05:36 P.M.'
-    - date: 20 Jan 2026, 20/01/2026, 2026-01-20, dll
-    """
+def parse_datetime(text: str) -> Optional[datetime]:
     t = normalize_for_text(text)
 
     p_time = re.compile(
@@ -403,7 +366,7 @@ def parse_datetime(text: str):
         "dec": 12, "december": 12, "disember": 12,
     }
 
-    def month_to_int(m: str):
+    def month_to_int(m: str) -> Optional[int]:
         if not m:
             return None
         m2 = re.sub(r"[^a-z]", "", m.strip().lower())
@@ -476,8 +439,9 @@ def parse_datetime(text: str):
         return None
 
 
-def parse_amount(text: str):
+def parse_amount(text: str) -> Optional[float]:
     t = normalize_for_digits(text).lower()
+
     keywords = ["amount", "total", "jumlah", "amaun", "grand total", "payment", "paid", "pay", "transfer", "successful"]
 
     def score_match(val: float, start: int) -> float:
@@ -485,7 +449,7 @@ def parse_amount(text: str):
         near_kw = any(k in window for k in keywords)
         return (100 if near_kw else 0) + min(val, 999999) / 1000.0
 
-    candidates = []
+    candidates: List[tuple] = []
     p_rm = re.compile(
         r"\b(?:rm|myr)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b",
         re.I
@@ -501,7 +465,7 @@ def parse_amount(text: str):
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+    return float(candidates[0][1])
 
 
 def format_amount_rm(val: float) -> str:
@@ -530,26 +494,53 @@ NEGATIVE_KW = [
 ]
 
 
-def detect_status_original(text: str) -> str:
-    t = normalize_for_text(text).lower()
+# ================= OCR OUTPUT FORMAT (✅ sebelah kiri) =================
+def with_icon_left(line: str, ok: bool) -> str:
+    """
+    ✅/❌ sentiasa di sebelah kiri (tanpa jarak).
+    """
+    icon = "✅" if ok else "❌"
+    return f"{icon}{(line or '').strip()}"
+
+
+def detect_status_clean(full_text: str) -> (str, bool):
+    """
+    Output macam contoh awak:
+    ✅successful
+    ❌pending
+    dll.
+    """
+    t = normalize_for_text(full_text).lower()
 
     neg_hit = next((kw for kw in sorted(NEGATIVE_KW, key=len, reverse=True) if kw in t), None)
     if neg_hit:
-        return f"{neg_hit} ‼️"
+        # ringkaskan label
+        if "pending" in neg_hit:
+            return ("pending", False)
+        if "failed" in neg_hit or "unsuccessful" in neg_hit or "rejected" in neg_hit or "declined" in neg_hit:
+            return ("failed", False)
+        return (neg_hit, False)
 
     pos_hit = next((kw for kw in sorted(POSITIVE_KW, key=len, reverse=True) if kw in t), None)
     if pos_hit:
-        return f"{pos_hit} ✅"
+        return ("successful", True)
 
-    loose = t.replace("1", "l")
-    if "success" in loose or "berjaya" in loose or "selesai" in loose:
-        return "successful ✅"
+    # fallback longgar
+    if "success" in t or "berjaya" in t or "selesai" in t:
+        return ("successful", True)
 
-    return "Status tidak pasti ❓"
+    return ("status tidak pasti", False)
 
 
 # ================= OCR skrip (core) =================
 async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
+    """
+    FORMAT OCR (ikut permintaan user):
+    ✅{tarikh|masa bold}
+    ✅{akaun+bank bold}
+    ✅successful
+    ✅{amount bold}
+    """
     tmp_path = None
     try:
         tmp_path = await client.download_media(file_id)
@@ -560,32 +551,33 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
         resp = vision_client.document_text_detection(image=image)
 
         if resp.error and resp.error.message:
-            return f"❌ OCR Error: {resp.error.message}"
+            return with_icon_left(f"OCR Error: {resp.error.message}", False)
 
         text = resp.full_text_annotation.text.strip() if resp.full_text_annotation and resp.full_text_annotation.text else ""
         if not text:
-            return "❌ OCR tak jumpa teks (cuba gambar lebih jelas)."
+            return with_icon_left("OCR tak jumpa teks (cuba gambar lebih jelas).", False)
 
-        # ✅ Susunan ikut permintaan:
-        # 1) Tarikh & waktu (BOLD)
+        # 1) Tarikh & waktu
         dt = parse_datetime(text)
-        line1 = f"{format_dt(dt)} ✅" if dt else "Tarikh tidak dijumpai ❌"
+        line1 = with_icon_left(format_dt(dt), True) if dt else with_icon_left("Tarikh tidak dijumpai", False)
 
         # 2) No akaun/bank
         ok_acc = account_found(text)
-        line2 = bold(f"{TARGET_ACC} {TARGET_BANK}") + " ✅" if ok_acc else "No akaun tidak sah ❌"
+        line2 = with_icon_left(bold(f"{TARGET_ACC} {TARGET_BANK}"), True) if ok_acc else with_icon_left("No akaun tidak sah", False)
 
         # 3) Status
-        line3 = detect_status_original(text)
+        st_label, st_ok = detect_status_clean(text)
+        line3 = with_icon_left(st_label, st_ok)
 
-        # 4) Total/Amount (BOLD)
+        # 4) Total/Amount
         amt = parse_amount(text)
-        line4 = (bold(format_amount_rm(amt)) + " ✅") if amt is not None else "Total tidak dijumpai ❌"
+        line4 = with_icon_left(bold(format_amount_rm(amt)), True) if amt is not None else with_icon_left("Total tidak dijumpai", False)
 
         return "\n".join([line1, line2, line3, line4])
 
     except Exception as e:
-        return f"❌ Error OCR: {type(e).__name__}: {e}"
+        return with_icon_left(f"Error OCR: {type(e).__name__}: {e}", False)
+
     finally:
         if tmp_path:
             try:
@@ -594,19 +586,19 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
                 pass
 
 
-async def run_ocr_for_all_receipts(client: Client, state: dict) -> list[str]:
+async def run_ocr_for_all_receipts(client: Client, state: Dict[str, Any]) -> List[str]:
     receipts = state.get("receipts") or []
-    results = []
+    results: List[str] = []
     for fid in receipts:
         try:
             results.append(await run_ocr_on_receipt_file_id(client, fid))
         except Exception as e:
-            results.append(f"❌ OCR Error: {type(e).__name__}: {e}")
+            results.append(with_icon_left(f"OCR Error: {type(e).__name__}: {e}", False))
     return results
 
 
 # ================= ALBUM SENDER =================
-async def send_or_rebuild_album(client: Client, state: dict) -> int:
+async def send_or_rebuild_album(client: Client, state: Dict[str, Any]) -> int:
     chat_id = state["chat_id"]
 
     receipts_album = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
@@ -650,7 +642,7 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
     return control.id
 
 
-async def deny_if_locked(state: dict, callback) -> bool:
+async def deny_if_locked(state: Optional[Dict[str, Any]], callback) -> bool:
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return False
@@ -661,7 +653,7 @@ async def deny_if_locked(state: dict, callback) -> bool:
 
 
 # ================= TRANSFER TO CHANNEL =================
-async def copy_album_to_channel(client: Client, state: dict) -> None:
+async def copy_album_to_channel(client: Client, state: Dict[str, Any]) -> None:
     receipts_album = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
     state["receipts_album"] = receipts_album
 
@@ -685,7 +677,7 @@ async def copy_album_to_channel(client: Client, state: dict) -> None:
 
 
 # ================= KEYBOARDS (SEBELUM LOCK) =================
-def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
+def build_produk_keyboard(items_dict: Dict[str, int]) -> InlineKeyboardMarkup:
     rows = []
     for key, name in PRODUK_LIST.items():
         if key not in items_dict:
@@ -706,7 +698,7 @@ def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
     ])
 
 
-def build_harga_keyboard(items_dict: dict, prices_dict: dict | None = None) -> InlineKeyboardMarkup:
+def build_harga_keyboard(items_dict: Dict[str, int], prices_dict: Optional[Dict[str, int]] = None) -> InlineKeyboardMarkup:
     prices_dict = prices_dict or {}
     rows = []
     for k in items_dict.keys():
@@ -1202,7 +1194,7 @@ async def last_submit(client, callback):
 
 
 # ================= PAYMENT SETTLE (PASSWORD FLOW) =================
-async def do_payment_settle_after_pin(client: Client, callback, state: dict):
+async def do_payment_settle_after_pin(client: Client, callback, state: Dict[str, Any]):
     receipts = state.get("receipts") or []
     if not receipts:
         await callback.answer("Tiada resit. Sila upload resit dulu.", show_alert=True)
@@ -1373,7 +1365,7 @@ async def pin_ok(client, callback):
 
 
 # ================= SEMAK BAYARAN (AUTH + PIN + MOVE CHANNEL) =================
-def is_semak_allowed(user_id: int | None) -> bool:
+def is_semak_allowed(user_id: Optional[int]) -> bool:
     if not user_id:
         return False
     if not SEMAK_ALLOWED_IDS:
@@ -1381,7 +1373,7 @@ def is_semak_allowed(user_id: int | None) -> bool:
     return user_id in SEMAK_ALLOWED_IDS
 
 
-async def back_to_semak_page(callback, state: dict):
+async def back_to_semak_page(callback, state: Dict[str, Any]):
     try:
         await callback.message.edit_text("SEMAK OCR BAYARAN", reply_markup=build_semak_keyboard())
     except Exception:
@@ -1480,9 +1472,8 @@ async def sp_back(client, callback):
 @bot.on_callback_query(filters.regex(r"^sp_ok$"))
 async def sp_ok_move(client, callback):
     """
-    ✅ FIX:
-    - OCR tarikh & status jadi betul
-    - Lepas pindah channel: TAK tinggal apa-apa mesej dalam group
+    ✅ Lepas pindah channel: TAK tinggal apa-apa mesej dalam group
+    ✅ OCR output: ✅ di kiri (ikut format yang awak nak)
     """
     state = ORDER_STATE.get(callback.message.id)
     if not state or not state.get("sp_mode"):
@@ -1612,7 +1603,6 @@ async def handle_photo(client, message):
             state.setdefault("receipts", [])
             state["receipts"].append(message.photo.file_id)
 
-            # bila tambah resit selepas paid, reset paid->False supaya staff settle semula
             if state.get("paid"):
                 state["paid"] = False
                 state["paid_at"] = None
