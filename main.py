@@ -5,11 +5,19 @@
 # + SEMAK BAYARAN: hanya user tertentu + keypad password
 #   - betul -> OCR semua resit -> COPY ke channel rasmi -> delete dalam group
 #   - BACK -> kembali ke halaman BUTANG SEMAK BAYARAN
+#
+# ✅ UPDATE (STABIL):
+# 1) Halaman pilih kuantiti ADA butang "⬅️ BACK" (balik ke senarai produk)
+# 2) Boleh "EDIT/UNDO" kuantiti:
+#    - Senarai produk sentiasa papar semua produk
+#    - Jika produk sudah dipilih, button akan tunjuk (qty X)
+#    - Tekan produk itu semula untuk tukar qty
+# 3) Dalam halaman kuantiti ada "🗑 HAPUS ITEM" untuk buang produk yang tersalah pilih
 # =========================
 
 import os, io, re, tempfile, traceback
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 
 import pytz
 from pyrogram import Client, filters
@@ -189,7 +197,6 @@ def build_caption(
     prices_dict = prices_dict or {}
 
     lines = [bold(base_caption)]
-    has_detail = False
 
     if items_dict:
         for k, q in items_dict.items():
@@ -205,20 +212,17 @@ def build_caption(
                     harga_display = f"RM{unit_price}"
 
             lines.append(bold(f"{nama} | {q} | {harga_display}"))
-            has_detail = True
 
     if dest:
         if ship_cost is None:
             lines.append(f"Destinasi : {bold(dest)}")
         else:
             lines.append(f"Destinasi : {bold(f'{dest} | RM{int(ship_cost)}')}")
-        has_detail = True
 
     if items_dict and is_all_prices_done(items_dict, prices_dict) and ship_cost is not None:
         prod_total = calc_products_total(items_dict, prices_dict)
         grand_total = prod_total + int(ship_cost)
         lines.append(f"TOTAL KESELURUHAN : {bold(f'RM{grand_total}')}")
-        has_detail = True
 
     if locked:
         if paid and state:
@@ -226,7 +230,7 @@ def build_caption(
             ocr_block = build_ocr_block(state)
             lines.append(ocr_block if ocr_block else "❌ OCR belum ada (tekan BUTANG SEMAK BAYARAN).")
         else:
-            lines.append("")  # 1 perenggan kosong sebelum arahan slide
+            lines.append("")
             if receipts_count <= 0:
                 lines.append("⬅️" + bold("SLIDE KIRI UPLOAD RESIT"))
             else:
@@ -496,25 +500,15 @@ NEGATIVE_KW = [
 
 # ================= OCR OUTPUT FORMAT (✅ sebelah kiri) =================
 def with_icon_left(line: str, ok: bool) -> str:
-    """
-    ✅/❌ sentiasa di sebelah kiri (tanpa jarak).
-    """
     icon = "✅" if ok else "❌"
     return f"{icon}{(line or '').strip()}"
 
 
-def detect_status_clean(full_text: str) -> (str, bool):
-    """
-    Output macam contoh awak:
-    ✅successful
-    ❌pending
-    dll.
-    """
+def detect_status_clean(full_text: str) -> Tuple[str, bool]:
     t = normalize_for_text(full_text).lower()
 
     neg_hit = next((kw for kw in sorted(NEGATIVE_KW, key=len, reverse=True) if kw in t), None)
     if neg_hit:
-        # ringkaskan label
         if "pending" in neg_hit:
             return ("pending", False)
         if "failed" in neg_hit or "unsuccessful" in neg_hit or "rejected" in neg_hit or "declined" in neg_hit:
@@ -525,7 +519,6 @@ def detect_status_clean(full_text: str) -> (str, bool):
     if pos_hit:
         return ("successful", True)
 
-    # fallback longgar
     if "success" in t or "berjaya" in t or "selesai" in t:
         return ("successful", True)
 
@@ -534,13 +527,6 @@ def detect_status_clean(full_text: str) -> (str, bool):
 
 # ================= OCR skrip (core) =================
 async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
-    """
-    FORMAT OCR (ikut permintaan user):
-    ✅{tarikh|masa bold}
-    ✅{akaun+bank bold}
-    ✅successful
-    ✅{amount bold}
-    """
     tmp_path = None
     try:
         tmp_path = await client.download_media(file_id)
@@ -557,19 +543,15 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
         if not text:
             return with_icon_left("OCR tak jumpa teks (cuba gambar lebih jelas).", False)
 
-        # 1) Tarikh & waktu
         dt = parse_datetime(text)
         line1 = with_icon_left(format_dt(dt), True) if dt else with_icon_left("Tarikh tidak dijumpai", False)
 
-        # 2) No akaun/bank
         ok_acc = account_found(text)
         line2 = with_icon_left(bold(f"{TARGET_ACC} {TARGET_BANK}"), True) if ok_acc else with_icon_left("No akaun tidak sah", False)
 
-        # 3) Status
         st_label, st_ok = detect_status_clean(text)
         line3 = with_icon_left(st_label, st_ok)
 
-        # 4) Total/Amount
         amt = parse_amount(text)
         line4 = with_icon_left(bold(format_amount_rm(amt)), True) if amt is not None else with_icon_left("Total tidak dijumpai", False)
 
@@ -678,24 +660,49 @@ async def copy_album_to_channel(client: Client, state: Dict[str, Any]) -> None:
 
 # ================= KEYBOARDS (SEBELUM LOCK) =================
 def build_produk_keyboard(items_dict: Dict[str, int]) -> InlineKeyboardMarkup:
+    """
+    ✅ STABIL:
+    - Sentiasa papar semua produk
+    - Jika sudah dipilih, tunjuk (qty X)
+    - Tekan produk yang sama untuk EDIT qty
+    """
     rows = []
     for key, name in PRODUK_LIST.items():
-        if key not in items_dict:
+        if key in items_dict:
+            rows.append([InlineKeyboardButton(f"{name} (qty {items_dict[key]})", callback_data=f"produk_{key}")])
+        else:
             rows.append([InlineKeyboardButton(name, callback_data=f"produk_{key}")])
+
     if items_dict:
         rows.append([InlineKeyboardButton("✅ SUBMIT", callback_data="submit")])
+
     return InlineKeyboardMarkup(rows)
 
 
-def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
-         InlineKeyboardButton("2", callback_data=f"qty_{produk_key}_2"),
-         InlineKeyboardButton("3", callback_data=f"qty_{produk_key}_3")],
-        [InlineKeyboardButton("4", callback_data=f"qty_{produk_key}_4"),
-         InlineKeyboardButton("5", callback_data=f"qty_{produk_key}_5")],
-        [InlineKeyboardButton("⬅️ KEMBALI", callback_data="back_produk")]
-    ])
+def build_qty_keyboard(produk_key: str, items_dict: Dict[str, int]) -> InlineKeyboardMarkup:
+    """
+    ✅ ADA BACK + HAPUS ITEM
+    - BACK: balik senarai produk (tanpa ubah qty)
+    - HAPUS ITEM: buang produk yang tersalah pilih
+    """
+    rows = [
+        [
+            InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
+            InlineKeyboardButton("2", callback_data=f"qty_{produk_key}_2"),
+            InlineKeyboardButton("3", callback_data=f"qty_{produk_key}_3"),
+        ],
+        [
+            InlineKeyboardButton("4", callback_data=f"qty_{produk_key}_4"),
+            InlineKeyboardButton("5", callback_data=f"qty_{produk_key}_5"),
+        ],
+    ]
+
+    # hanya tunjuk "HAPUS ITEM" jika item sudah ada dalam cart
+    if produk_key in (items_dict or {}):
+        rows.append([InlineKeyboardButton("🗑 HAPUS ITEM", callback_data=f"remove_{produk_key}")])
+
+    rows.append([InlineKeyboardButton("⬅️ BACK", callback_data="back_produk")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_harga_keyboard(items_dict: Dict[str, int], prices_dict: Optional[Dict[str, int]] = None) -> InlineKeyboardMarkup:
@@ -815,8 +822,52 @@ async def pilih_kuantiti(client, callback):
     if not await deny_if_locked(state, callback):
         return
     produk_key = callback.data.replace("produk_", "", 1)
-    await callback.message.edit_reply_markup(reply_markup=build_qty_keyboard(produk_key))
+    await callback.message.edit_reply_markup(reply_markup=build_qty_keyboard(produk_key, state["items"]))
     await callback.answer("Pilih kuantiti")
+
+
+@bot.on_callback_query(filters.regex(r"^remove_"))
+async def remove_item(client, callback):
+    """
+    🗑 Buang item yang tersalah pilih (UNDO)
+    """
+    msg = callback.message
+    old_id = msg.id
+    state = ORDER_STATE.get(old_id)
+    if not await deny_if_locked(state, callback):
+        return
+
+    produk_key = callback.data.replace("remove_", "", 1)
+    if produk_key in state.get("items", {}):
+        state["items"].pop(produk_key, None)
+        # kalau dah set harga sebelum ini, buang juga
+        state.get("prices", {}).pop(produk_key, None)
+
+    await callback.answer("Item dibuang")
+
+    caption_baru = build_caption(
+        state["base_caption"], state["items"], state.get("prices", {}),
+        state.get("dest"), state.get("ship_cost"),
+        locked=bool(state.get("locked")),
+        receipts_count=len(state.get("receipts", [])),
+        paid=bool(state.get("paid")),
+        state=state,
+    )
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    new_msg = await client.send_photo(
+        chat_id=state["chat_id"],
+        photo=state["photo_id"],
+        caption=caption_baru,
+        reply_markup=build_produk_keyboard(state["items"]),
+    )
+
+    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
+    ORDER_STATE.pop(old_id, None)
 
 
 @bot.on_callback_query(filters.regex(r"^qty_"))
@@ -835,8 +886,9 @@ async def simpan_qty_repost(client, callback):
         await callback.answer("Format kuantiti tidak sah.", show_alert=True)
         return
 
+    # ✅ overwrite qty lama (edit/undo)
     state["items"][produk_key] = qty
-    await callback.answer("Dikemaskini")
+    await callback.answer("Kuantiti dikemaskini")
 
     caption_baru = build_caption(
         state["base_caption"], state["items"], state.get("prices", {}),
@@ -1471,10 +1523,6 @@ async def sp_back(client, callback):
 
 @bot.on_callback_query(filters.regex(r"^sp_ok$"))
 async def sp_ok_move(client, callback):
-    """
-    ✅ Lepas pindah channel: TAK tinggal apa-apa mesej dalam group
-    ✅ OCR output: ✅ di kiri (ikut format yang awak nak)
-    """
     state = ORDER_STATE.get(callback.message.id)
     if not state or not state.get("sp_mode"):
         await callback.answer("Sila tekan BUTANG SEMAK BAYARAN dulu.", show_alert=True)
@@ -1515,7 +1563,6 @@ async def sp_ok_move(client, callback):
     await callback.answer("Proses pindah ke channel...")
 
     try:
-        # 0) test channel access
         try:
             await client.get_chat(OFFICIAL_CHANNEL_ID)
         except Exception as e:
@@ -1526,16 +1573,13 @@ async def sp_ok_move(client, callback):
             await back_to_semak_page(callback, state)
             return
 
-        # 1) OCR semua resit
         state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
 
-        # reset semak pin
         state["sp_mode"] = False
         state["sp_active_user"] = None
         state["sp_buffer"] = ""
         state["sp_tries"] = 0
 
-        # 2) copy album ke channel
         try:
             await copy_album_to_channel(client, state)
         except Exception as e:
@@ -1546,7 +1590,6 @@ async def sp_ok_move(client, callback):
             await back_to_semak_page(callback, state)
             return
 
-        # 3) delete bundle dalam group
         try:
             await delete_bundle(client, state)
         except Exception as e:
@@ -1555,12 +1598,10 @@ async def sp_ok_move(client, callback):
                 text=f"⚠️ DEBUG: Hantar channel berjaya, tapi gagal delete dalam group.\nPastikan bot admin group + Delete messages ON.\n{type(e).__name__}: {e}"
             )
 
-        # 4) buang state dari memori
         for k in list(ORDER_STATE.keys()):
             if ORDER_STATE.get(k) is state:
                 ORDER_STATE.pop(k, None)
 
-        # ✅ 5) TIADA mesej ditinggalkan dalam group
         return
 
     except Exception as e:
@@ -1678,4 +1719,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
