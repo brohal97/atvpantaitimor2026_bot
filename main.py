@@ -111,11 +111,11 @@ HARGA_PER_PAGE = 15
 
 DEST_LIST = [
     "JOHOR", "KEDAH", "KELANTAN", "MELAKA", "NEGERI SEMBILAN", "PAHANG", "PERAK", "PERLIS",
-    "PULAU PINANG", "SELANGOR", "TERENGGANU", "LANGKAWI", "PICKUP SENDIRI", "LORI KITA HANTAR",
+    "PULAU PINANG", "SELANGOR", "TERENGGANU", "LANGKAWI", "PICKUP", "KITA HANTAR",
 ]
 
 KOS_START = 0
-KOS_END = 1500
+KOS_END = 2000
 KOS_STEP = 10
 KOS_LIST = list(range(KOS_START, KOS_END + 1, KOS_STEP))
 KOS_PER_PAGE = 15
@@ -548,7 +548,7 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
 
         # 2) No akaun/bank
         ok_acc = account_found(text)
-        line2 = bold(f"{TARGET_ACC} {TARGET_BANK}") + " ✅" if ok_acc else "No akaun tidak sah ❌"
+        line2 = bold(f"{TARGET_ACC} {TARGET_BANK}") + " ✅" if ok_acc else "Akaun tidak sah ❌"
 
         # 3) Status
         line3 = detect_status_original(text)
