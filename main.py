@@ -677,13 +677,24 @@ async def copy_album_to_channel(client: Client, state: Dict[str, Any]) -> None:
 
 
 # ================= KEYBOARDS (SEBELUM LOCK) =================
+# ✅ keyboard awal (NAMA PRODUK)
+def build_awal_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]])
+
+
+# ✅ SENARAI PRODUK + tambah BACK (kembali ke keyboard awal)
 def build_produk_keyboard(items_dict: Dict[str, int]) -> InlineKeyboardMarkup:
     rows = []
     for key, name in PRODUK_LIST.items():
         if key not in items_dict:
             rows.append([InlineKeyboardButton(name, callback_data=f"produk_{key}")])
+
     if items_dict:
         rows.append([InlineKeyboardButton("✅ SUBMIT", callback_data="submit")])
+
+    # ✅ BUTANG BACK (kembali ke halaman sebelum tekan NAMA PRODUK)
+    rows.append([InlineKeyboardButton("⬅️ BACK", callback_data="back_awal")])
+
     return InlineKeyboardMarkup(rows)
 
 
@@ -798,6 +809,16 @@ async def senarai_produk(client, callback):
         return
     await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
     await callback.answer()
+
+
+# ✅ BACK dari senarai produk -> kembali ke paparan asal (butang NAMA PRODUK sahaja)
+@bot.on_callback_query(filters.regex(r"^back_awal$"))
+async def back_awal(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
+    if not await deny_if_locked(state, callback):
+        return
+    await callback.message.edit_reply_markup(reply_markup=build_awal_keyboard())
+    await callback.answer("Kembali")
 
 
 @bot.on_callback_query(filters.regex(r"^back_produk$"))
@@ -1630,7 +1651,7 @@ async def handle_photo(client, message):
     jam = now.strftime("%I:%M%p").lower()
     base_caption = f"{hari} | {tarikh} | {jam}"
 
-    keyboard_awal = InlineKeyboardMarkup([[InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]])
+    keyboard_awal = build_awal_keyboard()
 
     try:
         await message.delete()
@@ -1639,7 +1660,12 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
-    sent = await client.send_photo(chat_id=chat_id, photo=photo_id, caption=bold(base_caption), reply_markup=keyboard_awal)
+    sent = await client.send_photo(
+        chat_id=chat_id,
+        photo=photo_id,
+        caption=bold(base_caption),
+        reply_markup=keyboard_awal
+    )
 
     ORDER_STATE[sent.id] = {
         "chat_id": chat_id,
