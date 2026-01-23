@@ -1,11 +1,10 @@
 # =========================
 # ATV PANTAI TIMOR BOT
 # + OCR skrip (Google Vision)
-# + Lepas tekan PAYMENT SETTLE:
-#   - Ayat "SLIDE KIRI TAMBAH RESIT" hilang
-#   - Diganti dengan hasil OCR UNTUK SEMUA RESIT (maks 9 dalam album, tapi OCR boleh simpan lebih)
-# + Butang "BUTANG SEMAK BAYARAN" akan re-run OCR untuk SEMUA RESIT dan update caption album
-# + ✅ PAYMENT SETTLE ADA PASSWORD KEYPAD (0-9 + BACK + OKEY)
+# + PAYMENT SETTLE ada password keypad
+# + SEMAK BAYARAN: hanya user tertentu + keypad password
+#   - betul -> OCR semua resit -> COPY ke channel rasmi -> delete dalam group
+#   - BACK -> kembali ke halaman BUTANG SEMAK BAYARAN
 # =========================
 
 import os, io, re, tempfile
@@ -27,9 +26,37 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Missing API_ID / API_HASH / BOT_TOKEN in Railway Variables")
 
 # ================= PASSWORD SETTINGS =================
-# Set dekat Railway env: PAYMENT_PIN=1234
 PAYMENT_PIN = os.getenv("PAYMENT_PIN", "1234").strip()
-MAX_PIN_TRIES = 5  # berapa kali salah sebelum reset paksa
+MAX_PIN_TRIES = 5
+
+# ================= SEMAK BAYARAN (ROLE + PIN + CHANNEL) =================
+OFFICIAL_CHANNEL_ID = int(os.getenv("OFFICIAL_CHANNEL_ID", "-1003573894188"))  # contoh: -1001234567890
+if not OFFICIAL_CHANNEL_ID:
+    raise RuntimeError("Missing env var: OFFICIAL_CHANNEL_ID (channel rasmi)")
+
+SEMAK_PIN = os.getenv("SEMAK_PIN", "4321").strip()
+SEMAK_ALLOWED_IDS_RAW = os.getenv("SEMAK_ALLOWED_IDS", "1150078068").strip()
+
+def parse_allowed_ids(raw: str) -> set[int]:
+    out = set()
+    if not raw:
+        return out
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+            pass
+    return out
+
+SEMAK_ALLOWED_IDS = parse_allowed_ids(SEMAK_ALLOWED_IDS_RAW)
+if not SEMAK_ALLOWED_IDS:
+    # Biar jalan, tapi lebih selamat paksa set.
+    # Kalau awak nak wajib, uncomment baris bawah:
+    # raise RuntimeError("SEMAK_ALLOWED_IDS kosong. Letak contoh: 1111,2222")
+    pass
 
 # ================= OCR SETTINGS (OCR skrip) =================
 TARGET_ACC = "8606018423"
@@ -56,13 +83,8 @@ bot = Client(
 )
 
 # ================= TEMP STATE (RAM) =================
-# Key ORDER_STATE:
-# - Semasa belum LOCK: key = anchor msg id (gambar order)
-# - Selepas rebuild album: key = control msg id (mesej butang bawah)
-ORDER_STATE = {}
-
-# Mapping reply untuk album image -> control_msg_id
-REPLY_MAP = {}
+ORDER_STATE = {}   # key = anchor msg id (sebelum lock) / control msg id (selepas rebuild)
+REPLY_MAP = {}     # album message id -> control msg id
 
 # ================= DATA =================
 PRODUK_LIST = {
@@ -80,36 +102,20 @@ HARGA_START = 2500
 HARGA_END = 3000
 HARGA_STEP = 10
 HARGA_LIST = list(range(HARGA_START, HARGA_END + 1, HARGA_STEP))
-HARGA_PER_PAGE = 15  # 3 baris x 5 butang
+HARGA_PER_PAGE = 15
 
 DEST_LIST = [
-    "JOHOR",
-    "KEDAH",
-    "KELANTAN",
-    "MELAKA",
-    "NEGERI SEMBILAN",
-    "PAHANG",
-    "PERAK",
-    "PERLIS",
-    "PULAU PINANG",
-    "SELANGOR",
-    "TERENGGANU",
-    "LANGKAWI",
-    "PICKUP SENDIRI",
-    "LORI KITA HANTAR",
+    "JOHOR", "KEDAH", "KELANTAN", "MELAKA", "NEGERI SEMBILAN", "PAHANG", "PERAK", "PERLIS",
+    "PULAU PINANG", "SELANGOR", "TERENGGANU", "LANGKAWI", "PICKUP SENDIRI", "LORI KITA HANTAR",
 ]
 
 KOS_START = 0
 KOS_END = 1500
 KOS_STEP = 10
 KOS_LIST = list(range(KOS_START, KOS_END + 1, KOS_STEP))
-KOS_PER_PAGE = 15  # 3 baris x 5 butang
+KOS_PER_PAGE = 15
 
-# Album Telegram max 10 media: 1 order + 9 resit
 MAX_RECEIPTS_IN_ALBUM = 9
-
-# ✅ OCR yang dipaparkan dalam caption boleh jadi banyak
-# tapi Telegram ada limit caption 1024 chars. Kita limit untuk stabil.
 MAX_OCR_RESULTS_IN_CAPTION = 10
 
 # ================= TEXT STYLE =================
@@ -142,28 +148,18 @@ def calc_products_total(items_dict: dict, prices_dict: dict) -> int:
     return total
 
 def build_ocr_block(state: dict) -> str:
-    """
-    Gabungkan semua OCR result (ikut turutan resit).
-    - Ambil state["ocr_results"] (list[str]) kalau ada
-    - Limit paparan untuk stabil (caption limit 1024)
-    """
     results = state.get("ocr_results") or []
     if not results:
         return ""
-
     show = results[-MAX_OCR_RESULTS_IN_CAPTION:]
     blocks = []
     for txt in show:
         t = (txt or "").strip()
-        if not t:
-            continue
-        blocks.append(t)
-
+        if t:
+            blocks.append(t)
     out = "\n\n".join(blocks)
-
     if len(results) > len(show):
-        out += f"\n\n(+{len(results) - len(show)} resit lagi tidak dipaparkan sebab limit caption)"
-
+        out += f"\n\n(+{len(results)-len(show)} resit lagi tidak dipaparkan sebab limit caption)"
     return out.strip()
 
 def build_caption(
@@ -177,11 +173,6 @@ def build_caption(
     paid: bool = False,
     state: dict | None = None,
 ) -> str:
-    """
-    ✅ BEHAVIOR:
-    - LOCK + belum paid -> tunjuk arahan "SLIDE KIRI ..."
-    - LOCK + sudah paid -> buang arahan slide, ganti OCR result untuk SEMUA resit dalam caption
-    """
     prices_dict = prices_dict or {}
     lines = [base_caption]
 
@@ -217,10 +208,7 @@ def build_caption(
         lines.append("")
         if paid and state:
             ocr_block = build_ocr_block(state)
-            if ocr_block:
-                lines.append(ocr_block)
-            else:
-                lines.append("❌ OCR belum ada (tekan BUTANG SEMAK BAYARAN).")
+            lines.append(ocr_block if ocr_block else "❌ OCR belum ada (tekan BUTANG SEMAK BAYARAN).")
         else:
             if receipts_count <= 0:
                 lines.append("⬅️" + bold("SLIDE KIRI UPLOAD RESIT"))
@@ -239,42 +227,41 @@ def build_payment_keyboard() -> InlineKeyboardMarkup:
 def build_semak_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("BUTANG SEMAK BAYARAN", callback_data="semak_bayaran")]])
 
-def build_pin_keyboard() -> InlineKeyboardMarkup:
+def build_pin_keyboard(prefix: str) -> InlineKeyboardMarkup:
     """
-    Keypad nombor 0-9 + BACK + OKEY
+    prefix: "pin"  (untuk payment)
+            "sp"   (untuk semak)
     """
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("1", callback_data="pin_1"),
-            InlineKeyboardButton("2", callback_data="pin_2"),
-            InlineKeyboardButton("3", callback_data="pin_3"),
+            InlineKeyboardButton("1", callback_data=f"{prefix}_1"),
+            InlineKeyboardButton("2", callback_data=f"{prefix}_2"),
+            InlineKeyboardButton("3", callback_data=f"{prefix}_3"),
         ],
         [
-            InlineKeyboardButton("4", callback_data="pin_4"),
-            InlineKeyboardButton("5", callback_data="pin_5"),
-            InlineKeyboardButton("6", callback_data="pin_6"),
+            InlineKeyboardButton("4", callback_data=f"{prefix}_4"),
+            InlineKeyboardButton("5", callback_data=f"{prefix}_5"),
+            InlineKeyboardButton("6", callback_data=f"{prefix}_6"),
         ],
         [
-            InlineKeyboardButton("7", callback_data="pin_7"),
-            InlineKeyboardButton("8", callback_data="pin_8"),
-            InlineKeyboardButton("9", callback_data="pin_9"),
+            InlineKeyboardButton("7", callback_data=f"{prefix}_7"),
+            InlineKeyboardButton("8", callback_data=f"{prefix}_8"),
+            InlineKeyboardButton("9", callback_data=f"{prefix}_9"),
         ],
         [
-            InlineKeyboardButton("0", callback_data="pin_0"),
+            InlineKeyboardButton("0", callback_data=f"{prefix}_0"),
         ],
         [
-            InlineKeyboardButton("🔙 BACK", callback_data="pin_back"),
-            InlineKeyboardButton("✅ OKEY", callback_data="pin_ok"),
+            InlineKeyboardButton("🔙 BACK", callback_data=f"{prefix}_back"),
+            InlineKeyboardButton("✅ OKEY", callback_data=f"{prefix}_ok"),
         ],
     ])
 
 def mask_pin(buf: str) -> str:
-    if not buf:
-        return "(kosong)"
-    return "•" * len(buf)
+    return "(kosong)" if not buf else ("•" * len(buf))
 
-def build_pin_prompt_text(buf: str) -> str:
-    return f"🔐 Sila masukkan PASSWORD untuk PAYMENT SETTLE\n\nPIN: {mask_pin(buf)}"
+def pin_prompt_text(title: str, buf: str) -> str:
+    return f"🔐 {title}\n\nPIN: {mask_pin(buf)}"
 
 # ================= SAFE DELETE =================
 async def safe_delete(client: Client, chat_id: int, message_id: int):
@@ -284,12 +271,6 @@ async def safe_delete(client: Client, chat_id: int, message_id: int):
         pass
 
 async def delete_bundle(client: Client, state: dict):
-    """
-    Padam SEMUA bundle:
-    - album (jika ada)
-    - control msg (jika ada)
-    - anchor msg (jika ada)
-    """
     chat_id = state["chat_id"]
 
     for mid in (state.get("album_msg_ids") or []):
@@ -306,11 +287,7 @@ async def delete_bundle(client: Client, state: dict):
 def normalize_ocr_text(s: str) -> str:
     if not s:
         return ""
-    trans = str.maketrans({
-        "O": "0", "o": "0",
-        "I": "1", "|": "1",
-        "S": "5", "s": "5",
-    })
+    trans = str.maketrans({"O": "0", "o": "0", "I": "1", "|": "1", "S": "5", "s": "5"})
     s = s.translate(trans)
     s = re.sub(r"[ \t]+", " ", s)
     return s
@@ -331,7 +308,6 @@ def format_dt(dt: datetime) -> str:
 
 def parse_datetime(text: str):
     t = normalize_ocr_text(text)
-
     p_time = re.compile(r"\b(\d{1,2})[:\.](\d{2})(?:[:\.](\d{2}))?\s*(am|pm)?\b", re.I)
 
     mon_map = {
@@ -352,9 +328,7 @@ def parse_datetime(text: str):
     def month_to_int(m: str):
         if not m:
             return None
-        m2 = m.strip().lower()
-        m2 = re.sub(r"\.+$", "", m2)
-        m2 = re.sub(r"[^a-z]", "", m2)
+        m2 = re.sub(r"[^a-z]", "", m.strip().lower())
         if not m2:
             return None
         if m2 in mon_map:
@@ -373,22 +347,9 @@ def parse_datetime(text: str):
     for m in p_ymd.finditer(t):
         dates.append((m.start(), (m.group(3), m.group(2), m.group(1))))
 
-    p_d_mon_y = re.compile(
-        r"\b(\d{1,2})(?:st|nd|rd|th|hb)?\s*(?:[\/\-\.\s])\s*([A-Za-z]+)\s*(?:[\/\-\.\s])?\s*(\d{2,4})\b",
-        re.I
-    )
+    p_d_mon_y = re.compile(r"\b(\d{1,2})\s*([A-Za-z]+)\s*(\d{2,4})\b", re.I)
     for m in p_d_mon_y.finditer(t):
         d, mon, y = m.group(1), m.group(2), m.group(3)
-        mo = month_to_int(mon)
-        if mo:
-            dates.append((m.start(), (d, str(mo), y)))
-
-    p_mon_d_y = re.compile(
-        r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th|hb)?\s*,?\s+(\d{2,4})\b",
-        re.I
-    )
-    for m in p_mon_d_y.finditer(t):
-        mon, d, y = m.group(1), m.group(2), m.group(3)
         mo = month_to_int(mon)
         if mo:
             dates.append((m.start(), (d, str(mo), y)))
@@ -445,10 +406,7 @@ def parse_amount(text: str):
         return (100 if near_kw else 0) + min(val, 999999) / 1000.0
 
     candidates = []
-    p_rm = re.compile(
-        r"\b(?:rm|myr)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b",
-        re.I
-    )
+    p_rm = re.compile(r"\b(?:rm|myr)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\b", re.I)
     for m in p_rm.finditer(t):
         num_str = m.group(1).replace(",", "")
         try:
@@ -474,7 +432,6 @@ POSITIVE_KW = [
     "pemindahan berjaya", "diterima", "telah diterima", "sudah masuk",
     "dana diterima", "dikreditkan", "diluluskan", "selesai", "telah selesai",
 ]
-
 NEGATIVE_KW = [
     "pending settlement", "scheduled transfer", "future dated", "effective date",
     "pending", "processing", "in progress", "queued", "awaiting", "awaiting confirmation",
@@ -488,19 +445,8 @@ NEGATIVE_KW = [
 
 def detect_status_original(text: str) -> str:
     t = normalize_ocr_text(text).lower()
-
-    pos_hit = None
-    for kw in sorted(POSITIVE_KW, key=len, reverse=True):
-        if kw in t:
-            pos_hit = kw
-            break
-
-    neg_hit = None
-    for kw in sorted(NEGATIVE_KW, key=len, reverse=True):
-        if kw in t:
-            neg_hit = kw
-            break
-
+    pos_hit = next((kw for kw in sorted(POSITIVE_KW, key=len, reverse=True) if kw in t), None)
+    neg_hit = next((kw for kw in sorted(NEGATIVE_KW, key=len, reverse=True) if kw in t), None)
     if pos_hit:
         return f"{pos_hit} ✅"
     if neg_hit:
@@ -534,7 +480,6 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
         line3 = f"{format_amount_rm(amt)} ✅" if amt is not None else "Total tidak dijumpai ❌"
 
         line4 = detect_status_original(text)
-
         return "\n".join([line1, line2, line3, line4])
 
     except Exception as e:
@@ -547,9 +492,6 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
                 pass
 
 async def run_ocr_for_all_receipts(client: Client, state: dict) -> list[str]:
-    """
-    ✅ OCR untuk SEMUA resit dalam state["receipts"]
-    """
     receipts = state.get("receipts") or []
     results = []
     for fid in receipts:
@@ -593,11 +535,7 @@ async def send_or_rebuild_album(client: Client, state: dict) -> int:
         control_text = "TEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI"
         control_markup = build_payment_keyboard()
 
-    control = await client.send_message(
-        chat_id=chat_id,
-        text=control_text,
-        reply_markup=control_markup
-    )
+    control = await client.send_message(chat_id=chat_id, text=control_text, reply_markup=control_markup)
 
     for mid in album_ids:
         REPLY_MAP[mid] = control.id
@@ -618,6 +556,32 @@ async def deny_if_locked(state: dict, callback) -> bool:
         return False
     return True
 
+# ================= TRANSFER TO CHANNEL =================
+async def copy_album_to_channel(client: Client, state: dict) -> None:
+    """
+    Hantar semula (copy) order + resit ke channel rasmi.
+    """
+    receipts_album = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
+    state["receipts_album"] = receipts_album
+
+    caption = build_caption(
+        state["base_caption"],
+        state.get("items", {}),
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=True,
+        receipts_count=len(receipts_album),
+        paid=True,
+        state=state,
+    )
+
+    media = [InputMediaPhoto(media=state["photo_id"], caption=caption)]
+    for r in receipts_album:
+        media.append(InputMediaPhoto(media=r))
+
+    await client.send_media_group(chat_id=OFFICIAL_CHANNEL_ID, media=media)
+
 # ================= KEYBOARDS (SEBELUM LOCK) =================
 def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
     rows = []
@@ -630,15 +594,11 @@ def build_produk_keyboard(items_dict: dict) -> InlineKeyboardMarkup:
 
 def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
-            InlineKeyboardButton("2", callback_data=f"qty_{produk_key}_2"),
-            InlineKeyboardButton("3", callback_data=f"qty_{produk_key}_3"),
-        ],
-        [
-            InlineKeyboardButton("4", callback_data=f"qty_{produk_key}_4"),
-            InlineKeyboardButton("5", callback_data=f"qty_{produk_key}_5"),
-        ],
+        [InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
+         InlineKeyboardButton("2", callback_data=f"qty_{produk_key}_2"),
+         InlineKeyboardButton("3", callback_data=f"qty_{produk_key}_3")],
+        [InlineKeyboardButton("4", callback_data=f"qty_{produk_key}_4"),
+         InlineKeyboardButton("5", callback_data=f"qty_{produk_key}_5")],
         [InlineKeyboardButton("⬅️ KEMBALI", callback_data="back_produk")]
     ])
 
@@ -774,11 +734,8 @@ async def simpan_qty_repost(client, callback):
     await callback.answer("Dikemaskini")
 
     caption_baru = build_caption(
-        state["base_caption"],
-        state["items"],
-        state.get("prices", {}),
-        state.get("dest"),
-        state.get("ship_cost"),
+        state["base_caption"], state["items"], state.get("prices", {}),
+        state.get("dest"), state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
@@ -814,11 +771,8 @@ async def submit_order(client, callback):
     await callback.answer("Submit...")
 
     caption_baru = build_caption(
-        state["base_caption"],
-        state["items"],
-        state.get("prices", {}),
-        state.get("dest"),
-        state.get("ship_cost"),
+        state["base_caption"], state["items"], state.get("prices", {}),
+        state.get("dest"), state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
@@ -895,11 +849,8 @@ async def set_harga(client, callback):
     await callback.answer("Harga diset")
 
     caption_baru = build_caption(
-        state["base_caption"],
-        state["items"],
-        state.get("prices", {}),
-        state.get("dest"),
-        state.get("ship_cost"),
+        state["base_caption"], state["items"], state.get("prices", {}),
+        state.get("dest"), state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
@@ -954,11 +905,8 @@ async def set_destinasi(client, callback):
     await callback.answer(f"Destinasi: {dest}")
 
     caption_baru = build_caption(
-        state["base_caption"],
-        state["items"],
-        state.get("prices", {}),
-        state.get("dest"),
-        state.get("ship_cost"),
+        state["base_caption"], state["items"], state.get("prices", {}),
+        state.get("dest"), state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
@@ -1033,11 +981,8 @@ async def set_kos(client, callback):
     await callback.answer(f"Kos diset: {kos}")
 
     caption_baru = build_caption(
-        state["base_caption"],
-        state["items"],
-        state.get("prices", {}),
-        state.get("dest"),
-        state.get("ship_cost"),
+        state["base_caption"], state["items"], state.get("prices", {}),
+        state.get("dest"), state.get("ship_cost"),
         locked=bool(state.get("locked")),
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
@@ -1069,7 +1014,6 @@ async def last_submit(client, callback):
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
-
     if not state.get("items"):
         await callback.answer("Item kosong.", show_alert=True)
         return
@@ -1090,11 +1034,17 @@ async def last_submit(client, callback):
     state.setdefault("paid_by", None)
     state.setdefault("ocr_results", [])
 
-    # ✅ PIN STATE
+    # PAYMENT PIN STATE
     state["pin_mode"] = False
     state["pin_active_user"] = None
     state["pin_buffer"] = ""
     state["pin_tries"] = 0
+
+    # SEMAK PIN STATE
+    state["sp_mode"] = False
+    state["sp_active_user"] = None
+    state["sp_buffer"] = ""
+    state["sp_tries"] = 0
 
     state["album_msg_ids"] = None
     state["album_first_id"] = None
@@ -1104,11 +1054,8 @@ async def last_submit(client, callback):
     await callback.answer("Last submit ✅")
 
     caption_baru = build_caption(
-        state["base_caption"],
-        state["items"],
-        state.get("prices", {}),
-        state.get("dest"),
-        state.get("ship_cost"),
+        state["base_caption"], state["items"], state.get("prices", {}),
+        state.get("dest"), state.get("ship_cost"),
         locked=True,
         receipts_count=len(state.get("receipts", [])),
         paid=False,
@@ -1122,11 +1069,7 @@ async def last_submit(client, callback):
             await msg.delete()
         except Exception:
             pass
-        new_msg = await client.send_photo(
-            chat_id=state["chat_id"],
-            photo=state["photo_id"],
-            caption=caption_baru
-        )
+        new_msg = await client.send_photo(chat_id=state["chat_id"], photo=state["photo_id"], caption=caption_baru)
         ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
         ORDER_STATE.pop(old_id, None)
         return
@@ -1135,9 +1078,6 @@ async def last_submit(client, callback):
 
 # ================= PAYMENT SETTLE (PASSWORD FLOW) =================
 async def do_payment_settle_after_pin(client: Client, callback, state: dict):
-    """
-    Proses settle sebenar: OCR semua resit + rebuild album
-    """
     receipts = state.get("receipts") or []
     if not receipts:
         await callback.answer("Tiada resit. Sila upload resit dulu.", show_alert=True)
@@ -1151,22 +1091,16 @@ async def do_payment_settle_after_pin(client: Client, callback, state: dict):
     state["paid_at"] = now.strftime("%d/%m/%Y %I:%M%p").lower()
     state["paid_by"] = callback.from_user.id if callback.from_user else None
 
-    # ✅ OCR semua resit
     state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
 
-    # reset PIN mode
     state["pin_mode"] = False
     state["pin_active_user"] = None
     state["pin_buffer"] = ""
     state["pin_tries"] = 0
 
-    # padam bundle lama (album/control/anchor)
     await delete_bundle(client, state)
-
-    # rebuild album
     new_control_id = await send_or_rebuild_album(client, state)
 
-    # rebind key state
     for k in list(ORDER_STATE.keys()):
         if ORDER_STATE.get(k) is state:
             ORDER_STATE.pop(k, None)
@@ -1174,9 +1108,6 @@ async def do_payment_settle_after_pin(client: Client, callback, state: dict):
 
 @bot.on_callback_query(filters.regex(r"^pay_settle$"))
 async def pay_settle_password_start(client, callback):
-    """
-    Bila tekan PAYMENT SETTLE -> keluar keypad PIN
-    """
     control_id = callback.message.id
     state = ORDER_STATE.get(control_id)
 
@@ -1186,8 +1117,6 @@ async def pay_settle_password_start(client, callback):
     if not state.get("locked"):
         await callback.answer("Sila LAST SUBMIT dulu.", show_alert=True)
         return
-
-    # kalau dah paid, tak perlu settle
     if state.get("paid"):
         await callback.answer("Order ini sudah PAID ✅", show_alert=True)
         return
@@ -1197,7 +1126,6 @@ async def pay_settle_password_start(client, callback):
         await callback.answer("User tidak sah.", show_alert=True)
         return
 
-    # lock keypad utk 1 user sahaja
     active = state.get("pin_active_user")
     if active and active != user_id:
         await callback.answer("Keypad sedang digunakan oleh user lain.", show_alert=True)
@@ -1210,182 +1138,285 @@ async def pay_settle_password_start(client, callback):
 
     try:
         await callback.message.edit_text(
-            build_pin_prompt_text(state["pin_buffer"]),
-            reply_markup=build_pin_keyboard()
+            pin_prompt_text("Sila masukkan PASSWORD untuk PAYMENT SETTLE", state["pin_buffer"]),
+            reply_markup=build_pin_keyboard("pin")
         )
     except Exception:
         pass
 
     await callback.answer("Masukkan password")
 
-# ===== PIN INPUT DIGITS =====
 @bot.on_callback_query(filters.regex(r"^pin_[0-9]$"))
 async def pin_press_digit(client, callback):
-    control_id = callback.message.id
-    state = ORDER_STATE.get(control_id)
-    if not state:
-        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
-        return
-
-    if not state.get("pin_mode"):
+    state = ORDER_STATE.get(callback.message.id)
+    if not state or not state.get("pin_mode"):
         await callback.answer("Sila tekan PAYMENT SETTLE dulu.", show_alert=True)
         return
-
     user_id = callback.from_user.id if callback.from_user else None
     if state.get("pin_active_user") != user_id:
         await callback.answer("Ini bukan keypad anda.", show_alert=True)
         return
 
     digit = callback.data.split("_", 1)[1]
-
-    # limit panjang buffer
     buf = state.get("pin_buffer", "")
     if len(buf) >= max(4, len(PAYMENT_PIN)):
         await callback.answer("PIN sudah cukup, tekan OKEY.", show_alert=True)
         return
 
     state["pin_buffer"] = buf + digit
-
     try:
         await callback.message.edit_text(
-            build_pin_prompt_text(state["pin_buffer"]),
-            reply_markup=build_pin_keyboard()
+            pin_prompt_text("Sila masukkan PASSWORD untuk PAYMENT SETTLE", state["pin_buffer"]),
+            reply_markup=build_pin_keyboard("pin")
         )
     except Exception:
         pass
-
     await callback.answer()
 
-# ===== PIN BACK =====
 @bot.on_callback_query(filters.regex(r"^pin_back$"))
 async def pin_back(client, callback):
-    control_id = callback.message.id
-    state = ORDER_STATE.get(control_id)
+    state = ORDER_STATE.get(callback.message.id)
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
-
     user_id = callback.from_user.id if callback.from_user else None
     if state.get("pin_active_user") and state.get("pin_active_user") != user_id:
         await callback.answer("Ini bukan keypad anda.", show_alert=True)
         return
 
-    # reset pin mode
     state["pin_mode"] = False
     state["pin_active_user"] = None
     state["pin_buffer"] = ""
     state["pin_tries"] = 0
 
     try:
-        await callback.message.edit_text(
-            "TEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI",
-            reply_markup=build_payment_keyboard()
-        )
+        await callback.message.edit_text("TEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI", reply_markup=build_payment_keyboard())
     except Exception:
         pass
-
     await callback.answer("Kembali")
 
-# ===== PIN OKEY =====
 @bot.on_callback_query(filters.regex(r"^pin_ok$"))
 async def pin_ok(client, callback):
-    control_id = callback.message.id
-    state = ORDER_STATE.get(control_id)
-    if not state:
-        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
-        return
-
-    if not state.get("pin_mode"):
+    state = ORDER_STATE.get(callback.message.id)
+    if not state or not state.get("pin_mode"):
         await callback.answer("Sila tekan PAYMENT SETTLE dulu.", show_alert=True)
         return
-
     user_id = callback.from_user.id if callback.from_user else None
     if state.get("pin_active_user") != user_id:
         await callback.answer("Ini bukan keypad anda.", show_alert=True)
         return
 
     buf = state.get("pin_buffer", "")
-
     if not buf:
         await callback.answer("PIN kosong. Sila tekan nombor.", show_alert=True)
         return
 
-    # semak
     if buf == PAYMENT_PIN:
-        # betul
         await do_payment_settle_after_pin(client, callback, state)
         return
 
-    # salah
     state["pin_tries"] = int(state.get("pin_tries", 0)) + 1
     state["pin_buffer"] = ""
 
     if state["pin_tries"] >= MAX_PIN_TRIES:
-        # reset & keluar
         state["pin_mode"] = False
         state["pin_active_user"] = None
         state["pin_tries"] = 0
         state["pin_buffer"] = ""
-
         try:
-            await callback.message.edit_text(
-                "❌ Password salah terlalu banyak kali.\n\nTEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI",
-                reply_markup=build_payment_keyboard()
-            )
+            await callback.message.edit_text("❌ Password salah terlalu banyak kali.\n\nTEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI", reply_markup=build_payment_keyboard())
         except Exception:
             pass
-
         await callback.answer("Salah banyak kali. Reset.", show_alert=True)
         return
 
     try:
         await callback.message.edit_text(
-            f"❌ Password salah. Cuba lagi.\n\n{build_pin_prompt_text(state['pin_buffer'])}",
-            reply_markup=build_pin_keyboard()
+            "❌ Password salah. Cuba lagi.\n\n" + pin_prompt_text("Sila masukkan PASSWORD untuk PAYMENT SETTLE", ""),
+            reply_markup=build_pin_keyboard("pin")
         )
     except Exception:
         pass
-
     await callback.answer("Password salah", show_alert=True)
 
-# ================= BUTANG SEMAK BAYARAN (OCR semua resit + update caption) =================
+# ================= SEMAK BAYARAN (AUTH + PIN + MOVE CHANNEL) =================
+def is_semak_allowed(user_id: int | None) -> bool:
+    if not user_id:
+        return False
+    if not SEMAK_ALLOWED_IDS:
+        # kalau list kosong, anggap semua boleh (tapi saya syor isi SEMAK_ALLOWED_IDS)
+        return True
+    return user_id in SEMAK_ALLOWED_IDS
+
+async def back_to_semak_page(callback, state: dict):
+    try:
+        await callback.message.edit_text("SEMAK OCR BAYARAN", reply_markup=build_semak_keyboard())
+    except Exception:
+        pass
+
 @bot.on_callback_query(filters.regex(r"^semak_bayaran$"))
-async def semak_bayaran(client, callback):
+async def semak_bayaran_start_pin(client, callback):
+    """
+    Bila tekan BUTANG SEMAK BAYARAN -> keluar keypad SEMAK_PIN (hanya untuk user yang dibenarkan)
+    """
     control_id = callback.message.id
     state = ORDER_STATE.get(control_id)
+
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
         return
 
-    receipts = state.get("receipts") or []
-    if not receipts:
+    user_id = callback.from_user.id if callback.from_user else None
+    if not is_semak_allowed(user_id):
+        await callback.answer("❌ Anda tidak dibenarkan tekan butang ini.", show_alert=True)
+        return
+
+    if not (state.get("receipts") or []):
         await callback.answer("Tiada resit untuk disemak.", show_alert=True)
         return
 
-    await callback.answer("Semak OCR semua resit...")
+    # lock keypad utk 1 user sahaja
+    active = state.get("sp_active_user")
+    if active and active != user_id:
+        await callback.answer("Keypad sedang digunakan oleh user lain.", show_alert=True)
+        return
 
-    state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
+    state["sp_mode"] = True
+    state["sp_active_user"] = user_id
+    state["sp_buffer"] = ""
+    state["sp_tries"] = 0
 
-    if state.get("album_first_id"):
-        new_caption = build_caption(
-            state["base_caption"],
-            state.get("items", {}),
-            state.get("prices", {}),
-            state.get("dest"),
-            state.get("ship_cost"),
-            locked=True,
-            receipts_count=len(state.get("receipts_album", []) or []),
-            paid=True,
-            state=state,
+    try:
+        await callback.message.edit_text(
+            pin_prompt_text("Sila masukkan PASSWORD untuk PINDAH ke CHANNEL", state["sp_buffer"]),
+            reply_markup=build_pin_keyboard("sp")
         )
+    except Exception:
+        pass
+
+    await callback.answer("Masukkan password")
+
+@bot.on_callback_query(filters.regex(r"^sp_[0-9]$"))
+async def sp_press_digit(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
+    if not state or not state.get("sp_mode"):
+        await callback.answer("Sila tekan BUTANG SEMAK BAYARAN dulu.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else None
+    if state.get("sp_active_user") != user_id:
+        await callback.answer("Ini bukan keypad anda.", show_alert=True)
+        return
+
+    digit = callback.data.split("_", 1)[1]
+    buf = state.get("sp_buffer", "")
+    if len(buf) >= max(4, len(SEMAK_PIN)):
+        await callback.answer("PIN sudah cukup, tekan OKEY.", show_alert=True)
+        return
+
+    state["sp_buffer"] = buf + digit
+    try:
+        await callback.message.edit_text(
+            pin_prompt_text("Sila masukkan PASSWORD untuk PINDAH ke CHANNEL", state["sp_buffer"]),
+            reply_markup=build_pin_keyboard("sp")
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+@bot.on_callback_query(filters.regex(r"^sp_back$"))
+async def sp_back(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else None
+    if state.get("sp_active_user") and state.get("sp_active_user") != user_id:
+        await callback.answer("Ini bukan keypad anda.", show_alert=True)
+        return
+
+    state["sp_mode"] = False
+    state["sp_active_user"] = None
+    state["sp_buffer"] = ""
+    state["sp_tries"] = 0
+
+    await back_to_semak_page(callback, state)
+    await callback.answer("Kembali")
+
+@bot.on_callback_query(filters.regex(r"^sp_ok$"))
+async def sp_ok_move(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
+    if not state or not state.get("sp_mode"):
+        await callback.answer("Sila tekan BUTANG SEMAK BAYARAN dulu.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else None
+    if state.get("sp_active_user") != user_id:
+        await callback.answer("Ini bukan keypad anda.", show_alert=True)
+        return
+
+    buf = state.get("sp_buffer", "")
+    if not buf:
+        await callback.answer("PIN kosong. Sila tekan nombor.", show_alert=True)
+        return
+
+    if buf != SEMAK_PIN:
+        state["sp_tries"] = int(state.get("sp_tries", 0)) + 1
+        state["sp_buffer"] = ""
+        if state["sp_tries"] >= MAX_PIN_TRIES:
+            state["sp_mode"] = False
+            state["sp_active_user"] = None
+            state["sp_tries"] = 0
+            state["sp_buffer"] = ""
+            await back_to_semak_page(callback, state)
+            await callback.answer("❌ Salah banyak kali. Reset.", show_alert=True)
+            return
+
         try:
-            await client.edit_message_caption(
-                chat_id=state["chat_id"],
-                message_id=state["album_first_id"],
-                caption=new_caption
+            await callback.message.edit_text(
+                "❌ Password salah. Cuba lagi.\n\n" + pin_prompt_text("Sila masukkan PASSWORD untuk PINDAH ke CHANNEL", ""),
+                reply_markup=build_pin_keyboard("sp")
             )
         except Exception:
             pass
+        await callback.answer("Password salah", show_alert=True)
+        return
+
+    # ✅ BETUL: OCR + COPY ke channel + delete bundle
+    await callback.answer("Proses pindah ke channel...")
+
+    # Pastikan ada OCR terbaru (auto run sebelum pindah)
+    state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
+
+    # reset semak pin
+    state["sp_mode"] = False
+    state["sp_active_user"] = None
+    state["sp_buffer"] = ""
+    state["sp_tries"] = 0
+
+    # 1) copy ke channel
+    try:
+        await copy_album_to_channel(client, state)
+    except Exception as e:
+        # kalau gagal post ke channel (bot tak admin / channel id salah)
+        await callback.answer(f"❌ Gagal hantar ke channel: {type(e).__name__}", show_alert=True)
+        await back_to_semak_page(callback, state)
+        return
+
+    # 2) delete bundle dalam group
+    await delete_bundle(client, state)
+
+    # 3) buang state dari memori (supaya tak clash)
+    for k in list(ORDER_STATE.keys()):
+        if ORDER_STATE.get(k) is state:
+            ORDER_STATE.pop(k, None)
+
+    # 4) mesej ringkas dalam group
+    try:
+        await client.send_message(chat_id=state["chat_id"], text="✅ Order ini sudah dipindahkan ke channel rasmi.")
+    except Exception:
+        pass
 
 # ================= PHOTO HANDLER =================
 @bot.on_message(filters.photo & ~filters.bot)
@@ -1443,9 +1474,7 @@ async def handle_photo(client, message):
     jam = now.strftime("%I:%M%p").lower()
     base_caption = f"{hari} | {tarikh} | {jam}"
 
-    keyboard_awal = InlineKeyboardMarkup([
-        [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]
-    ])
+    keyboard_awal = InlineKeyboardMarkup([[InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]])
 
     try:
         await message.delete()
@@ -1454,12 +1483,7 @@ async def handle_photo(client, message):
     except Exception:
         pass
 
-    sent = await client.send_photo(
-        chat_id=chat_id,
-        photo=photo_id,
-        caption=base_caption,
-        reply_markup=keyboard_awal
-    )
+    sent = await client.send_photo(chat_id=chat_id, photo=photo_id, caption=base_caption, reply_markup=keyboard_awal)
 
     ORDER_STATE[sent.id] = {
         "chat_id": chat_id,
@@ -1483,11 +1507,17 @@ async def handle_photo(client, message):
 
         "ocr_results": [],
 
-        # PIN
+        # PAYMENT PIN
         "pin_mode": False,
         "pin_active_user": None,
         "pin_buffer": "",
         "pin_tries": 0,
+
+        # SEMAK PIN
+        "sp_mode": False,
+        "sp_active_user": None,
+        "sp_buffer": "",
+        "sp_tries": 0,
     }
 
 if __name__ == "__main__":
