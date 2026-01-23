@@ -30,7 +30,7 @@ PAYMENT_PIN = os.getenv("PAYMENT_PIN", "1234").strip()
 MAX_PIN_TRIES = 5
 
 # ================= SEMAK BAYARAN (ROLE + PIN + CHANNEL) =================
-OFFICIAL_CHANNEL_ID = int(os.getenv("OFFICIAL_CHANNEL_ID", "-3573894188"))  # contoh: -1001234567890
+OFFICIAL_CHANNEL_ID = int(os.getenv("OFFICIAL_CHANNEL_ID", "-1003573894188"))  # contoh: -1001234567890
 if not OFFICIAL_CHANNEL_ID:
     raise RuntimeError("Missing env var: OFFICIAL_CHANNEL_ID (channel rasmi)")
 
