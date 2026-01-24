@@ -7,6 +7,11 @@
 # + BACK (GLOBAL): undo 1 langkah + padam selection 1 langkah
 # + INPUT HARGA & KOS TRANSPORT: keypad nombor manual (0-9) + BACKSPACE + OKEY
 #   - BACK pada keypad = padam 1 digit (kalau kosong, cancel balik 1 halaman)
+#
+# ✅ UPDATE (ikut request):
+# - Harga produk TIDAK didarab dengan kuantiti.
+# - Paparan RM ikut harga yang user masukkan sahaja.
+# - TOTAL KESELURUHAN = jumlah semua harga yang user masukkan + kos transport.
 # =========================
 
 import os, io, re, tempfile, traceback
@@ -145,13 +150,16 @@ def is_all_prices_done(items_dict: Dict[str, int], prices_dict: Dict[str, int]) 
 
 
 def calc_products_total(items_dict: Dict[str, int], prices_dict: Dict[str, int]) -> int:
+    """
+    ✅ UPDATE: total produk = jumlah harga yang user isi sahaja (TIDAK darab qty)
+    """
     total = 0
-    for k, qty in items_dict.items():
-        unit = prices_dict.get(k)
-        if unit is None:
+    for k in items_dict.keys():
+        v = prices_dict.get(k)
+        if v is None:
             continue
         try:
-            total += int(unit) * int(qty)
+            total += int(v)
         except Exception:
             pass
     return total
@@ -193,14 +201,16 @@ def build_caption(
         for k, q in items_dict.items():
             nama = PRODUK_LIST.get(k, k)
             unit_price = prices_dict.get(k)
+
+            # ✅ UPDATE: Papar harga yang user masukkan sahaja (tidak darab qty)
             if unit_price is None:
                 harga_display = "-"
             else:
                 try:
-                    total_line = int(unit_price) * int(q)
-                    harga_display = f"RM{total_line}"
+                    harga_display = f"RM{int(unit_price)}"
                 except Exception:
                     harga_display = f"RM{unit_price}"
+
             lines.append(bold(f"{nama} | {q} | {harga_display}"))
 
     if dest:
@@ -368,12 +378,10 @@ def mask_pin(buf: str) -> str:
 
 
 def pin_prompt_text(title: str, buf: str) -> str:
-    # kekal utk payment settle
     return f"🔐 {title}\n\nPIN: {mask_pin(buf)}"
 
 
 def semak_pin_prompt_text(buf: str) -> str:
-    # ikut permintaan user (bold + ayat baru)
     return f"{TXT_SEMAK_PIN_TITLE}\n\nPIN: {mask_pin(buf)}"
 
 
@@ -401,10 +409,6 @@ async def delete_bundle(client: Client, state: Dict[str, Any]):
 
 # ================= MESSAGE RENDER (EDIT / FALLBACK REPOST) =================
 async def replace_order_message(client: Client, msg, state: Dict[str, Any], caption: str, keyboard: Optional[InlineKeyboardMarkup]):
-    """
-    Cuba edit caption+keyboard. Kalau gagal, delete & hantar semula (stabil).
-    Pastikan ORDER_STATE key ikut message id terbaru.
-    """
     old_id = msg.id
     try:
         await msg.edit_caption(caption=caption, reply_markup=keyboard)
@@ -441,13 +445,11 @@ VIEW_AFTER_DEST = "after_dest"
 VIEW_KOS_INPUT = "kos_input"
 VIEW_AFTER_COST = "after_cost"
 
-# callback prefix keypad harga/kos
 PRICE_PREFIX = "pr"
 KOS_PREFIX = "tr"
 
 
 def build_awal_keyboard() -> InlineKeyboardMarkup:
-    # ✅ HALAMAN PERTAMA: TIADA BUTANG BACK
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")],
     ])
@@ -467,7 +469,6 @@ def build_produk_keyboard(items_dict: Dict[str, int]) -> InlineKeyboardMarkup:
 
 
 def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
-    # ✅ (1) keypad kuantiti 1-15
     rows: List[List[InlineKeyboardButton]] = []
     nums = list(range(1, 16))
     for i in range(0, len(nums), 3):
@@ -556,7 +557,6 @@ def build_extra_lines_for_input(state: Dict[str, Any]) -> Optional[List[str]]:
     buf = (ctx.get("num_buf") or "").strip()
 
     if view == VIEW_HARGA_INPUT:
-        # ✅ (2) buang ayat “Tekan nombor 0-9...”
         pk = ctx.get("produk_key", "")
         nama = PRODUK_LIST.get(pk, pk) or "PRODUK"
         shown = buf if buf else "-"
@@ -567,7 +567,6 @@ def build_extra_lines_for_input(state: Dict[str, Any]) -> Optional[List[str]]:
         ]
 
     if view == VIEW_KOS_INPUT:
-        # ✅ (3) buang ayat “Tekan nombor 0-9...”
         shown = buf if buf else "-"
         return [
             bold("MASUKKAN KOS TRANSPORT"),
@@ -903,11 +902,9 @@ async def send_or_rebuild_album(client: Client, state: Dict[str, Any]) -> int:
     album_ids = [m.id for m in album_msgs]
 
     if state.get("paid"):
-        # ✅ (5) ubah ayat semak bayaran (bold)
         control_text = TXT_SEMAK_CONTROL
         control_markup = build_semak_keyboard()
     else:
-        # ✅ (4) ubah ayat payment settle (bold)
         control_text = TXT_PAYMENT_CONTROL
         control_markup = build_payment_keyboard()
 
@@ -1007,7 +1004,6 @@ async def simpan_qty(client, callback):
         await callback.answer("Format kuantiti tidak sah.", show_alert=True)
         return
 
-    # safety: hanya 1-15
     if qty < 1 or qty > 15:
         await callback.answer("Kuantiti mesti 1 hingga 15.", show_alert=True)
         return
@@ -1046,7 +1042,6 @@ async def submit_order(client, callback):
     await callback.answer("Set harga")
 
 
-# ====== HARGA: BUKA KEYPAD ======
 @bot.on_callback_query(filters.regex(r"^harga_"))
 async def buka_harga_keypad(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -1104,7 +1099,6 @@ async def harga_backspace_or_cancel(client, callback):
         await callback.answer("Padam 1 digit")
         return
 
-    # kalau kosong: cancel balik 1 halaman (undo langkah masuk keypad)
     if pop_history_restore(state):
         await render_order(client, callback, state)
         await callback.answer("Kembali")
@@ -1145,14 +1139,12 @@ async def harga_okey_set(client, callback):
 
     state.setdefault("prices", {})[produk_key] = harga
 
-    # balik ke menu harga
     state["view"] = VIEW_HARGA_MENU
     state["ctx"] = {}
     await render_order(client, callback, state)
     await callback.answer("Harga diset ✅")
 
 
-# ====== DESTINASI ======
 @bot.on_callback_query(filters.regex(r"^destinasi$"))
 async def buka_destinasi(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -1202,7 +1194,6 @@ async def set_destinasi(client, callback):
     await callback.answer(f"Destinasi: {dest}")
 
 
-# ====== KOS TRANSPORT: KEYPAD ======
 @bot.on_callback_query(filters.regex(r"^kos_transport$"))
 async def buka_kos_transport_keypad(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -1216,7 +1207,7 @@ async def buka_kos_transport_keypad(client, callback):
     push_history(state, prev_view=state.get("view", VIEW_AFTER_DEST), prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
     state["view"] = VIEW_KOS_INPUT
-    state["ctx"] = {"num_buf": ""}  # kos tidak perlukan produk_key
+    state["ctx"] = {"num_buf": ""}
     await render_order(client, callback, state)
     await callback.answer("Masukkan kos transport")
 
@@ -1262,7 +1253,6 @@ async def kos_backspace_or_cancel(client, callback):
         await callback.answer("Padam 1 digit")
         return
 
-    # kosong: cancel balik 1 halaman (undo langkah masuk keypad)
     if pop_history_restore(state):
         await render_order(client, callback, state)
         await callback.answer("Kembali")
@@ -1308,7 +1298,6 @@ async def kos_okey_set(client, callback):
     await callback.answer("Kos diset ✅")
 
 
-# ====== LAST SUBMIT (LOCK) ======
 @bot.on_callback_query(filters.regex(r"^last_submit$"))
 async def last_submit(client, callback):
     msg = callback.message
@@ -1330,7 +1319,6 @@ async def last_submit(client, callback):
         await callback.answer("Kos transport belum dipilih.", show_alert=True)
         return
 
-    # lock
     state["locked"] = True
     state.setdefault("receipts", [])
     state.setdefault("paid", False)
@@ -1338,18 +1326,15 @@ async def last_submit(client, callback):
     state.setdefault("paid_by", None)
     state.setdefault("ocr_results", [])
 
-    # reset view/history (lepas lock, memang tiada BACK flow)
     state["view"] = VIEW_AWAL
     state["ctx"] = {}
     state["history"] = []
 
-    # PAYMENT PIN STATE
     state["pin_mode"] = False
     state["pin_active_user"] = None
     state["pin_buffer"] = ""
     state["pin_tries"] = 0
 
-    # SEMAK PIN STATE
     state["sp_mode"] = False
     state["sp_active_user"] = None
     state["sp_buffer"] = ""
@@ -1602,7 +1587,6 @@ async def semak_bayaran_start_pin(client, callback):
     state["sp_tries"] = 0
 
     try:
-        # ✅ (6) ayat baru + bold
         await callback.message.edit_text(
             semak_pin_prompt_text(state["sp_buffer"]),
             reply_markup=build_pin_keyboard("sp")
@@ -1705,7 +1689,6 @@ async def sp_ok_move(client, callback):
     await callback.answer("Proses pindah ke channel...")
 
     try:
-        # 0) test channel access
         try:
             await client.get_chat(OFFICIAL_CHANNEL_ID)
         except Exception as e:
@@ -1716,16 +1699,13 @@ async def sp_ok_move(client, callback):
             await back_to_semak_page(callback, state)
             return
 
-        # 1) OCR semua resit
         state["ocr_results"] = await run_ocr_for_all_receipts(client, state)
 
-        # reset semak pin
         state["sp_mode"] = False
         state["sp_active_user"] = None
         state["sp_buffer"] = ""
         state["sp_tries"] = 0
 
-        # 2) copy album ke channel
         try:
             await copy_album_to_channel(client, state)
         except Exception as e:
@@ -1736,7 +1716,6 @@ async def sp_ok_move(client, callback):
             await back_to_semak_page(callback, state)
             return
 
-        # 3) delete bundle dalam group
         try:
             await delete_bundle(client, state)
         except Exception as e:
@@ -1745,12 +1724,10 @@ async def sp_ok_move(client, callback):
                 text=f"⚠️ DEBUG: Hantar channel berjaya, tapi gagal delete dalam group.\nPastikan bot admin group + Delete messages ON.\n{type(e).__name__}: {e}"
             )
 
-        # 4) buang state dari memori
         for k in list(ORDER_STATE.keys()):
             if ORDER_STATE.get(k) is state:
                 ORDER_STATE.pop(k, None)
 
-        # ✅ TIADA mesej ditinggalkan dalam group
         return
 
     except Exception as e:
@@ -1770,7 +1747,6 @@ async def sp_ok_move(client, callback):
 async def handle_photo(client, message):
     chat_id = message.chat.id
 
-    # ---------- KES B: RESIT (SWIPE REPLY) ----------
     if message.reply_to_message:
         replied_id = message.reply_to_message.id
 
@@ -1809,7 +1785,6 @@ async def handle_photo(client, message):
             ORDER_STATE[new_control_id] = state
             return
 
-    # ---------- KES A: ORDER BARU ----------
     photo_id = message.photo.file_id
 
     tz = pytz.timezone("Asia/Kuala_Lumpur")
@@ -1857,18 +1832,15 @@ async def handle_photo(client, message):
 
         "ocr_results": [],
 
-        # FLOW STATE
         "view": VIEW_AWAL,
         "ctx": {},
         "history": [],
 
-        # PAYMENT PIN
         "pin_mode": False,
         "pin_active_user": None,
         "pin_buffer": "",
         "pin_tries": 0,
 
-        # SEMAK PIN
         "sp_mode": False,
         "sp_active_user": None,
         "sp_buffer": "",
