@@ -132,8 +132,8 @@ def bold(text: str) -> str:
 
 
 # ================= CUSTOM TEXT (USER REQUEST) =================
-TXT_PAYMENT_CONTROL = bold("⏬Tekan butang sahkan bayaran⏬")
-TXT_SEMAK_CONTROL = bold("🔻Semak pembayaran dengan segera🔻")
+TXT_PAYMENT_CONTROL = bold("Tekan butang sahkan bayaran")
+TXT_SEMAK_CONTROL = bold("Semak pembayaran dengan segera")
 TXT_SEMAK_PIN_TITLE = bold("ISI PASWORD JIKA BAYARAN TELAH DISEMAK")
 
 
