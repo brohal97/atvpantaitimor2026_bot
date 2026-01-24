@@ -131,6 +131,12 @@ def bold(text: str) -> str:
     return (text or "").translate(BOLD_MAP)
 
 
+# ================= CUSTOM TEXT (USER REQUEST) =================
+TXT_PAYMENT_CONTROL = bold("⬇️Tekan butang sahkan pembayaran⬇️")
+TXT_SEMAK_CONTROL = bold("🚨Semak pembayaran dengan segera🚨")
+TXT_SEMAK_PIN_TITLE = bold("ISI PASWORD JIKA BAYARAN TELAH DISEMAK")
+
+
 # ================= UTIL (ORDER) =================
 def is_all_prices_done(items_dict: Dict[str, int], prices_dict: Dict[str, int]) -> bool:
     if not items_dict:
@@ -362,7 +368,13 @@ def mask_pin(buf: str) -> str:
 
 
 def pin_prompt_text(title: str, buf: str) -> str:
+    # kekal utk payment settle
     return f"🔐 {title}\n\nPIN: {mask_pin(buf)}"
+
+
+def semak_pin_prompt_text(buf: str) -> str:
+    # ikut permintaan user (bold + ayat baru)
+    return f"{TXT_SEMAK_PIN_TITLE}\n\nPIN: {mask_pin(buf)}"
 
 
 # ================= SAFE DELETE =================
@@ -455,14 +467,14 @@ def build_produk_keyboard(items_dict: Dict[str, int]) -> InlineKeyboardMarkup:
 
 
 def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
-         InlineKeyboardButton("2", callback_data=f"qty_{produk_key}_2"),
-         InlineKeyboardButton("3", callback_data=f"qty_{produk_key}_3")],
-        [InlineKeyboardButton("4", callback_data=f"qty_{produk_key}_4"),
-         InlineKeyboardButton("5", callback_data=f"qty_{produk_key}_5")],
-        kb_back_row()
-    ])
+    # ✅ (1) keypad kuantiti 1-15
+    rows: List[List[InlineKeyboardButton]] = []
+    nums = list(range(1, 16))
+    for i in range(0, len(nums), 3):
+        chunk = nums[i:i+3]
+        rows.append([InlineKeyboardButton(str(n), callback_data=f"qty_{produk_key}_{n}") for n in chunk])
+    rows.append(kb_back_row())
+    return InlineKeyboardMarkup(rows)
 
 
 def build_harga_menu_keyboard(items_dict: Dict[str, int], prices_dict: Dict[str, int]) -> InlineKeyboardMarkup:
@@ -544,6 +556,7 @@ def build_extra_lines_for_input(state: Dict[str, Any]) -> Optional[List[str]]:
     buf = (ctx.get("num_buf") or "").strip()
 
     if view == VIEW_HARGA_INPUT:
+        # ✅ (2) buang ayat “Tekan nombor 0-9...”
         pk = ctx.get("produk_key", "")
         nama = PRODUK_LIST.get(pk, pk) or "PRODUK"
         shown = buf if buf else "-"
@@ -551,15 +564,14 @@ def build_extra_lines_for_input(state: Dict[str, Any]) -> Optional[List[str]]:
             bold("MASUKKAN HARGA PRODUK"),
             f"{nama}",
             f"HARGA: {bold('RM' + shown)}",
-            "Tekan nombor 0-9, kemudian tekan ✅ OKEY."
         ]
 
     if view == VIEW_KOS_INPUT:
+        # ✅ (3) buang ayat “Tekan nombor 0-9...”
         shown = buf if buf else "-"
         return [
             bold("MASUKKAN KOS TRANSPORT"),
             f"KOS: {bold('RM' + shown)}",
-            "Tekan nombor 0-9, kemudian tekan ✅ OKEY."
         ]
 
     return None
@@ -891,10 +903,12 @@ async def send_or_rebuild_album(client: Client, state: Dict[str, Any]) -> int:
     album_ids = [m.id for m in album_msgs]
 
     if state.get("paid"):
-        control_text = "SEMAK OCR BAYARAN"
+        # ✅ (5) ubah ayat semak bayaran (bold)
+        control_text = TXT_SEMAK_CONTROL
         control_markup = build_semak_keyboard()
     else:
-        control_text = "TEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI"
+        # ✅ (4) ubah ayat payment settle (bold)
+        control_text = TXT_PAYMENT_CONTROL
         control_markup = build_payment_keyboard()
 
     control = await client.send_message(chat_id=chat_id, text=control_text, reply_markup=control_markup)
@@ -991,6 +1005,11 @@ async def simpan_qty(client, callback):
         qty = int(qty_str)
     except Exception:
         await callback.answer("Format kuantiti tidak sah.", show_alert=True)
+        return
+
+    # safety: hanya 1-15
+    if qty < 1 or qty > 15:
+        await callback.answer("Kuantiti mesti 1 hingga 15.", show_alert=True)
         return
 
     prev_qty = state.get("items", {}).get(produk_key)
@@ -1484,7 +1503,7 @@ async def pin_back(client, callback):
     state["pin_tries"] = 0
 
     try:
-        await callback.message.edit_text("TEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI", reply_markup=build_payment_keyboard())
+        await callback.message.edit_text(TXT_PAYMENT_CONTROL, reply_markup=build_payment_keyboard())
     except Exception:
         pass
     await callback.answer("Kembali")
@@ -1520,7 +1539,7 @@ async def pin_ok(client, callback):
         state["pin_buffer"] = ""
         try:
             await callback.message.edit_text(
-                "❌ Password salah terlalu banyak kali.\n\nTEKAN BUTANG DIBAWAH SAHKAN PEMBAYARAN SELESAI",
+                "❌ Password salah terlalu banyak kali.\n\n" + TXT_PAYMENT_CONTROL,
                 reply_markup=build_payment_keyboard()
             )
         except Exception:
@@ -1549,7 +1568,7 @@ def is_semak_allowed(user_id: Optional[int]) -> bool:
 
 async def back_to_semak_page(callback, state: Dict[str, Any]):
     try:
-        await callback.message.edit_text("SEMAK OCR BAYARAN", reply_markup=build_semak_keyboard())
+        await callback.message.edit_text(TXT_SEMAK_CONTROL, reply_markup=build_semak_keyboard())
     except Exception:
         pass
 
@@ -1583,8 +1602,9 @@ async def semak_bayaran_start_pin(client, callback):
     state["sp_tries"] = 0
 
     try:
+        # ✅ (6) ayat baru + bold
         await callback.message.edit_text(
-            pin_prompt_text("Sila masukkan PASSWORD untuk PINDAH ke CHANNEL", state["sp_buffer"]),
+            semak_pin_prompt_text(state["sp_buffer"]),
             reply_markup=build_pin_keyboard("sp")
         )
     except Exception:
@@ -1614,7 +1634,7 @@ async def sp_press_digit(client, callback):
     state["sp_buffer"] = buf + digit
     try:
         await callback.message.edit_text(
-            pin_prompt_text("Sila masukkan PASSWORD untuk PINDAH ke CHANNEL", state["sp_buffer"]),
+            semak_pin_prompt_text(state["sp_buffer"]),
             reply_markup=build_pin_keyboard("sp")
         )
     except Exception:
@@ -1674,7 +1694,7 @@ async def sp_ok_move(client, callback):
 
         try:
             await callback.message.edit_text(
-                "❌ Password salah. Cuba lagi.\n\n" + pin_prompt_text("Sila masukkan PASSWORD untuk PINDAH ke CHANNEL", ""),
+                "❌ Password salah. Cuba lagi.\n\n" + semak_pin_prompt_text(""),
                 reply_markup=build_pin_keyboard("sp")
             )
         except Exception:
@@ -1858,3 +1878,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
