@@ -4,7 +4,7 @@
 # + PAYMENT SETTLE ada password keypad
 # + SEMAK BAYARAN: hanya user tertentu + keypad password
 #   - betul -> OCR semua resit -> COPY ke channel rasmi -> delete dalam group
-#   - BACK -> kembali ke halaman BUTANG SEMAK BAYARAN
+#   - BACK (GLOBAL): undo 1 langkah + padam selection 1 langkah
 # =========================
 
 import os, io, re, tempfile, traceback
@@ -88,7 +88,7 @@ bot = Client(
 
 
 # ================= TEMP STATE (RAM) =================
-ORDER_STATE: Dict[int, Dict[str, Any]] = {}   # key = anchor msg id (sebelum lock) / control msg id (selepas rebuild)
+ORDER_STATE: Dict[int, Dict[str, Any]] = {}   # key = message_id (order msg sebelum lock) / control msg id (selepas rebuild)
 REPLY_MAP: Dict[int, int] = {}               # album message id -> control msg id
 
 
@@ -189,7 +189,6 @@ def build_caption(
     prices_dict = prices_dict or {}
 
     lines = [bold(base_caption)]
-    has_detail = False
 
     if items_dict:
         for k, q in items_dict.items():
@@ -203,22 +202,18 @@ def build_caption(
                     harga_display = f"RM{total_line}"
                 except Exception:
                     harga_display = f"RM{unit_price}"
-
             lines.append(bold(f"{nama} | {q} | {harga_display}"))
-            has_detail = True
 
     if dest:
         if ship_cost is None:
             lines.append(f"Destinasi : {bold(dest)}")
         else:
             lines.append(f"Destinasi : {bold(f'{dest} | RM{int(ship_cost)}')}")
-        has_detail = True
 
     if items_dict and is_all_prices_done(items_dict, prices_dict) and ship_cost is not None:
         prod_total = calc_products_total(items_dict, prices_dict)
         grand_total = prod_total + int(ship_cost)
         lines.append(f"TOTAL KESELURUHAN : {bold(f'RM{grand_total}')}")
-        has_detail = True
 
     if locked:
         if paid and state:
@@ -226,7 +221,7 @@ def build_caption(
             ocr_block = build_ocr_block(state)
             lines.append(ocr_block if ocr_block else "❌ OCR belum ada (tekan BUTANG SEMAK BAYARAN).")
         else:
-            lines.append("")  # 1 perenggan kosong sebelum arahan slide
+            lines.append("")
             if receipts_count <= 0:
                 lines.append("⬅️" + bold("SLIDE KIRI UPLOAD RESIT"))
             else:
@@ -238,7 +233,64 @@ def build_caption(
     return cap
 
 
+# ================= GLOBAL BACK (UNDO) =================
+BACK_CB = "nav_back"
+
+
+def push_history(state: Dict[str, Any], prev_view: str, prev_ctx: Dict[str, Any], undo: Optional[Dict[str, Any]] = None):
+    state.setdefault("history", [])
+    # simpan snapshot ringan
+    state["history"].append({
+        "view": prev_view,
+        "ctx": dict(prev_ctx or {}),
+        "undo": undo
+    })
+
+
+def apply_undo(state: Dict[str, Any], undo: Dict[str, Any]):
+    if not undo:
+        return
+
+    t = undo.get("type")
+
+    if t == "set_qty":
+        k = undo["produk_key"]
+        prev = undo.get("prev")  # None => remove
+        if prev is None:
+            state.get("items", {}).pop(k, None)
+            # bila item dipadam, harga item juga padam
+            state.get("prices", {}).pop(k, None)
+        else:
+            state.setdefault("items", {})[k] = int(prev)
+
+    elif t == "set_price":
+        k = undo["produk_key"]
+        prev = undo.get("prev")
+        if prev is None:
+            state.get("prices", {}).pop(k, None)
+        else:
+            state.setdefault("prices", {})[k] = int(prev)
+
+    elif t == "set_dest":
+        state["dest"] = undo.get("prev_dest")
+        state["ship_cost"] = undo.get("prev_ship_cost")
+
+    elif t == "set_ship_cost":
+        state["ship_cost"] = undo.get("prev")
+
+    # kemas: kalau tiada items, reset bawah
+    if not state.get("items"):
+        state["items"] = {}
+        state["prices"] = {}
+        state["dest"] = None
+        state["ship_cost"] = None
+
+
 # ================= KEYBOARDS =================
+def kb_back_row() -> List[InlineKeyboardButton]:
+    return [InlineKeyboardButton("⬅️ BACK", callback_data=BACK_CB)]
+
+
 def build_payment_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("PAYMENT SETTLE", callback_data="pay_settle")]])
 
@@ -300,6 +352,228 @@ async def delete_bundle(client: Client, state: Dict[str, Any]):
 
     if state.get("anchor_msg_id"):
         await safe_delete(client, chat_id, state["anchor_msg_id"])
+
+
+# ================= MESSAGE RENDER (EDIT / FALLBACK REPOST) =================
+async def replace_order_message(client: Client, msg, state: Dict[str, Any], caption: str, keyboard: Optional[InlineKeyboardMarkup]):
+    """
+    Cuba edit caption+keyboard. Kalau gagal, delete & hantar semula (stabil).
+    Pastikan ORDER_STATE key ikut message id terbaru.
+    """
+    old_id = msg.id
+    try:
+        await msg.edit_caption(caption=caption, reply_markup=keyboard)
+        return msg  # id kekal
+    except Exception:
+        pass
+
+    # fallback: repost
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    new_msg = await client.send_photo(
+        chat_id=state["chat_id"],
+        photo=state["photo_id"],
+        caption=caption,
+        reply_markup=keyboard
+    )
+
+    # re-key state
+    ORDER_STATE.pop(old_id, None)
+    ORDER_STATE[new_msg.id] = state
+    state["anchor_msg_id"] = new_msg.id
+    return new_msg
+
+
+# ================= FLOW VIEWS =================
+VIEW_AWAL = "awal"
+VIEW_PRODUK = "produk"
+VIEW_QTY = "qty"
+VIEW_HARGA_MENU = "harga_menu"
+VIEW_HARGA_SELECT = "harga_select"
+VIEW_DEST = "dest"
+VIEW_AFTER_DEST = "after_dest"
+VIEW_KOS_SELECT = "kos_select"
+VIEW_AFTER_COST = "after_cost"
+
+
+def build_awal_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")],
+        kb_back_row()
+    ])
+
+
+def build_produk_keyboard(items_dict: Dict[str, int]) -> InlineKeyboardMarkup:
+    rows = []
+    for key, name in PRODUK_LIST.items():
+        if key not in items_dict:
+            rows.append([InlineKeyboardButton(name, callback_data=f"produk_{key}")])
+
+    if items_dict:
+        rows.append([InlineKeyboardButton("✅ SUBMIT", callback_data="submit")])
+
+    rows.append(kb_back_row())
+    return InlineKeyboardMarkup(rows)
+
+
+def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
+         InlineKeyboardButton("2", callback_data=f"qty_{produk_key}_2"),
+         InlineKeyboardButton("3", callback_data=f"qty_{produk_key}_3")],
+        [InlineKeyboardButton("4", callback_data=f"qty_{produk_key}_4"),
+         InlineKeyboardButton("5", callback_data=f"qty_{produk_key}_5")],
+        kb_back_row()
+    ])
+
+
+def build_harga_menu_keyboard(items_dict: Dict[str, int], prices_dict: Dict[str, int]) -> InlineKeyboardMarkup:
+    rows = []
+    for k in items_dict.keys():
+        if k in prices_dict:
+            continue
+        nama = PRODUK_LIST.get(k, k)
+        rows.append([InlineKeyboardButton(f"HARGA - {nama}", callback_data=f"harga_{k}")])
+
+    if items_dict and all(k in prices_dict for k in items_dict.keys()):
+        rows.append([InlineKeyboardButton("📍 DESTINASI", callback_data="destinasi")])
+
+    rows.append(kb_back_row())
+    return InlineKeyboardMarkup(rows)
+
+
+def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboardMarkup:
+    total = len(HARGA_LIST)
+    start = page * HARGA_PER_PAGE
+    end = start + HARGA_PER_PAGE
+    chunk = HARGA_LIST[start:end]
+
+    rows = []
+    for i in range(0, len(chunk), 5):
+        row_prices = chunk[i:i + 5]
+        rows.append([InlineKeyboardButton(str(p), callback_data=f"setharga_{produk_key}_{p}") for p in row_prices])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ PREV", callback_data=f"harga_page_{produk_key}_{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("NEXT ➡️", callback_data=f"harga_page_{produk_key}_{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append(kb_back_row())
+    return InlineKeyboardMarkup(rows)
+
+
+def build_dest_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(DEST_LIST), 2):
+        left = InlineKeyboardButton(DEST_LIST[i], callback_data=f"setdest_{i}")
+        if i + 1 < len(DEST_LIST):
+            right = InlineKeyboardButton(DEST_LIST[i + 1], callback_data=f"setdest_{i + 1}")
+            rows.append([left, right])
+        else:
+            rows.append([left])
+    rows.append(kb_back_row())
+    return InlineKeyboardMarkup(rows)
+
+
+def build_after_dest_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚚 KOS PENGHANTARAN", callback_data="kos_penghantaran")],
+        [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
+        kb_back_row()
+    ])
+
+
+def build_select_kos_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+    total = len(KOS_LIST)
+    start = page * KOS_PER_PAGE
+    end = start + KOS_PER_PAGE
+    chunk = KOS_LIST[start:end]
+
+    rows = []
+    for i in range(0, len(chunk), 5):
+        row_cost = chunk[i:i + 5]
+        rows.append([InlineKeyboardButton(str(c), callback_data=f"setkos_{c}") for c in row_cost])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ PREV", callback_data=f"kos_page_{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("NEXT ➡️", callback_data=f"kos_page_{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append(kb_back_row())
+    return InlineKeyboardMarkup(rows)
+
+
+def build_after_cost_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ LAST SUBMIT", callback_data="last_submit")],
+        [InlineKeyboardButton("✏️ TUKAR KOS PENGHANTARAN", callback_data="kos_penghantaran")],
+        [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
+        kb_back_row()
+    ])
+
+
+def get_keyboard_for_view(state: Dict[str, Any]) -> InlineKeyboardMarkup:
+    view = state.get("view", VIEW_AWAL)
+    ctx = state.get("ctx", {}) or {}
+    items = state.get("items", {}) or {}
+    prices = state.get("prices", {}) or {}
+
+    if view == VIEW_AWAL:
+        return build_awal_keyboard()
+    if view == VIEW_PRODUK:
+        return build_produk_keyboard(items)
+    if view == VIEW_QTY:
+        return build_qty_keyboard(ctx.get("produk_key", ""))
+    if view == VIEW_HARGA_MENU:
+        return build_harga_menu_keyboard(items, prices)
+    if view == VIEW_HARGA_SELECT:
+        return build_select_harga_keyboard(ctx.get("harga_produk", ""), int(ctx.get("harga_page", 0)))
+    if view == VIEW_DEST:
+        return build_dest_keyboard()
+    if view == VIEW_AFTER_DEST:
+        return build_after_dest_keyboard()
+    if view == VIEW_KOS_SELECT:
+        return build_select_kos_keyboard(int(ctx.get("kos_page", 0)))
+    if view == VIEW_AFTER_COST:
+        return build_after_cost_keyboard()
+
+    return build_awal_keyboard()
+
+
+async def render_order(client: Client, callback, state: Dict[str, Any]):
+    caption = build_caption(
+        state["base_caption"],
+        state.get("items", {}),
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
+        locked=False,
+        receipts_count=len(state.get("receipts", [])),
+        paid=bool(state.get("paid")),
+        state=state
+    )
+    kb = get_keyboard_for_view(state)
+    new_msg = await replace_order_message(client, callback.message, state, caption, kb)
+    return new_msg
+
+
+async def deny_if_locked(state: Optional[Dict[str, Any]], callback) -> bool:
+    if not state:
+        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        return False
+    if state.get("locked"):
+        await callback.answer("Order ini sudah LAST SUBMIT (LOCK).", show_alert=True)
+        return False
+    return True
 
 
 # ================= OCR skrip (helpers) =================
@@ -441,7 +715,6 @@ def parse_datetime(text: str) -> Optional[datetime]:
 
 def parse_amount(text: str) -> Optional[float]:
     t = normalize_for_digits(text).lower()
-
     keywords = ["amount", "total", "jumlah", "amaun", "grand total", "payment", "paid", "pay", "transfer", "successful"]
 
     def score_match(val: float, start: int) -> float:
@@ -494,27 +767,16 @@ NEGATIVE_KW = [
 ]
 
 
-# ================= OCR OUTPUT FORMAT (✅ sebelah kiri) =================
 def with_icon_left(line: str, ok: bool) -> str:
-    """
-    ✅/❌ sentiasa di sebelah kiri (tanpa jarak).
-    """
     icon = "✅" if ok else "❌"
     return f"{icon}{(line or '').strip()}"
 
 
 def detect_status_clean(full_text: str) -> (str, bool):
-    """
-    Output macam contoh awak:
-    ✅successful
-    ❌pending
-    dll.
-    """
     t = normalize_for_text(full_text).lower()
 
     neg_hit = next((kw for kw in sorted(NEGATIVE_KW, key=len, reverse=True) if kw in t), None)
     if neg_hit:
-        # ringkaskan label
         if "pending" in neg_hit:
             return ("pending", False)
         if "failed" in neg_hit or "unsuccessful" in neg_hit or "rejected" in neg_hit or "declined" in neg_hit:
@@ -525,22 +787,13 @@ def detect_status_clean(full_text: str) -> (str, bool):
     if pos_hit:
         return ("successful", True)
 
-    # fallback longgar
     if "success" in t or "berjaya" in t or "selesai" in t:
         return ("successful", True)
 
     return ("status tidak pasti", False)
 
 
-# ================= OCR skrip (core) =================
 async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
-    """
-    FORMAT OCR (ikut permintaan user):
-    ✅{tarikh|masa bold}
-    ✅{akaun+bank bold}
-    ✅successful
-    ✅{amount bold}
-    """
     tmp_path = None
     try:
         tmp_path = await client.download_media(file_id)
@@ -557,19 +810,15 @@ async def run_ocr_on_receipt_file_id(client: Client, file_id: str) -> str:
         if not text:
             return with_icon_left("OCR tak jumpa teks (cuba gambar lebih jelas).", False)
 
-        # 1) Tarikh & waktu
         dt = parse_datetime(text)
         line1 = with_icon_left(format_dt(dt), True) if dt else with_icon_left("Tarikh tidak dijumpai", False)
 
-        # 2) No akaun/bank
         ok_acc = account_found(text)
         line2 = with_icon_left(bold(f"{TARGET_ACC} {TARGET_BANK}"), True) if ok_acc else with_icon_left("No akaun tidak sah", False)
 
-        # 3) Status
         st_label, st_ok = detect_status_clean(text)
         line3 = with_icon_left(st_label, st_ok)
 
-        # 4) Total/Amount
         amt = parse_amount(text)
         line4 = with_icon_left(bold(format_amount_rm(amt)), True) if amt is not None else with_icon_left("Total tidak dijumpai", False)
 
@@ -642,16 +891,6 @@ async def send_or_rebuild_album(client: Client, state: Dict[str, Any]) -> int:
     return control.id
 
 
-async def deny_if_locked(state: Optional[Dict[str, Any]], callback) -> bool:
-    if not state:
-        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
-        return False
-    if state.get("locked"):
-        await callback.answer("Order ini sudah LAST SUBMIT (LOCK).", show_alert=True)
-        return False
-    return True
-
-
 # ================= TRANSFER TO CHANNEL =================
 async def copy_album_to_channel(client: Client, state: Dict[str, Any]) -> None:
     receipts_album = list(state.get("receipts", []))[-MAX_RECEIPTS_IN_ALBUM:]
@@ -676,157 +915,43 @@ async def copy_album_to_channel(client: Client, state: Dict[str, Any]) -> None:
     await client.send_media_group(chat_id=OFFICIAL_CHANNEL_ID, media=media)
 
 
-# ================= KEYBOARDS (SEBELUM LOCK) =================
-# ✅ keyboard awal (NAMA PRODUK)
-def build_awal_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")]])
+# ================= CALLBACKS: GLOBAL BACK =================
+@bot.on_callback_query(filters.regex(rf"^{BACK_CB}$"))
+async def nav_back(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
+    if not await deny_if_locked(state, callback):
+        return
+
+    hist = state.get("history", [])
+    if not hist:
+        await callback.answer("Tiada langkah untuk undur.", show_alert=True)
+        return
+
+    last = hist.pop()  # pop 1 langkah
+    undo = last.get("undo")
+    if undo:
+        apply_undo(state, undo)
+
+    state["view"] = last.get("view", VIEW_AWAL)
+    state["ctx"] = last.get("ctx", {}) or {}
+
+    await render_order(client, callback, state)
+    await callback.answer("Undo ✅")
 
 
-# ✅ SENARAI PRODUK + tambah BACK (kembali ke keyboard awal)
-def build_produk_keyboard(items_dict: Dict[str, int]) -> InlineKeyboardMarkup:
-    rows = []
-    for key, name in PRODUK_LIST.items():
-        if key not in items_dict:
-            rows.append([InlineKeyboardButton(name, callback_data=f"produk_{key}")])
-
-    if items_dict:
-        rows.append([InlineKeyboardButton("✅ SUBMIT", callback_data="submit")])
-
-    # ✅ BUTANG BACK (kembali ke halaman sebelum tekan NAMA PRODUK)
-    rows.append([InlineKeyboardButton("⬅️ BACK", callback_data="back_awal")])
-
-    return InlineKeyboardMarkup(rows)
-
-
-def build_qty_keyboard(produk_key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1", callback_data=f"qty_{produk_key}_1"),
-         InlineKeyboardButton("2", callback_data=f"qty_{produk_key}_2"),
-         InlineKeyboardButton("3", callback_data=f"qty_{produk_key}_3")],
-        [InlineKeyboardButton("4", callback_data=f"qty_{produk_key}_4"),
-         InlineKeyboardButton("5", callback_data=f"qty_{produk_key}_5")],
-        [InlineKeyboardButton("⬅️ KEMBALI", callback_data="back_produk")]
-    ])
-
-
-def build_harga_keyboard(items_dict: Dict[str, int], prices_dict: Optional[Dict[str, int]] = None) -> InlineKeyboardMarkup:
-    prices_dict = prices_dict or {}
-    rows = []
-    for k in items_dict.keys():
-        if k in prices_dict:
-            continue
-        nama = PRODUK_LIST.get(k, k)
-        rows.append([InlineKeyboardButton(f"HARGA - {nama}", callback_data=f"harga_{k}")])
-
-    if items_dict and all(k in prices_dict for k in items_dict.keys()):
-        rows.append([InlineKeyboardButton("📍 DESTINASI", callback_data="destinasi")])
-
-    rows.append([InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboardMarkup:
-    total = len(HARGA_LIST)
-    start = page * HARGA_PER_PAGE
-    end = start + HARGA_PER_PAGE
-    chunk = HARGA_LIST[start:end]
-
-    rows = []
-    for i in range(0, len(chunk), 5):
-        row_prices = chunk[i:i + 5]
-        rows.append([InlineKeyboardButton(str(p), callback_data=f"setharga_{produk_key}_{p}") for p in row_prices])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ PREV", callback_data=f"harga_page_{produk_key}_{page - 1}"))
-    if end < total:
-        nav.append(InlineKeyboardButton("NEXT ➡️", callback_data=f"harga_page_{produk_key}_{page + 1}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton("⬅️ BACK (HARGA MENU)", callback_data="back_harga_menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_dest_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for i in range(0, len(DEST_LIST), 2):
-        left = InlineKeyboardButton(DEST_LIST[i], callback_data=f"setdest_{i}")
-        if i + 1 < len(DEST_LIST):
-            right = InlineKeyboardButton(DEST_LIST[i + 1], callback_data=f"setdest_{i + 1}")
-            rows.append([left, right])
-        else:
-            rows.append([left])
-    rows.append([InlineKeyboardButton("⬅️ BACK (HARGA MENU)", callback_data="back_harga_menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_after_dest_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚚 KOS PENGHANTARAN", callback_data="kos_penghantaran")],
-        [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
-        [InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")]
-    ])
-
-
-def build_select_kos_keyboard(page: int = 0) -> InlineKeyboardMarkup:
-    total = len(KOS_LIST)
-    start = page * KOS_PER_PAGE
-    end = start + KOS_PER_PAGE
-    chunk = KOS_LIST[start:end]
-
-    rows = []
-    for i in range(0, len(chunk), 5):
-        row_cost = chunk[i:i + 5]
-        rows.append([InlineKeyboardButton(str(c), callback_data=f"setkos_{c}") for c in row_cost])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ PREV", callback_data=f"kos_page_{page - 1}"))
-    if end < total:
-        nav.append(InlineKeyboardButton("NEXT ➡️", callback_data=f"kos_page_{page + 1}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton("⬅️ BACK (MENU DESTINASI)", callback_data="back_after_dest")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_after_cost_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ LAST SUBMIT", callback_data="last_submit")],
-        [InlineKeyboardButton("✏️ TUKAR KOS PENGHANTARAN", callback_data="kos_penghantaran")],
-        [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
-        [InlineKeyboardButton("⬅️ KEMBALI PRODUK", callback_data="back_produk")],
-    ])
-
-
-# ================= CALLBACKS =================
+# ================= CALLBACKS: ORDER FLOW =================
 @bot.on_callback_query(filters.regex(r"^hantar_detail$"))
 async def senarai_produk(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
-    await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
-    await callback.answer()
 
+    # push back ke AWAL (undo tiada)
+    push_history(state, prev_view=VIEW_AWAL, prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
-# ✅ BACK dari senarai produk -> kembali ke paparan asal (butang NAMA PRODUK sahaja)
-@bot.on_callback_query(filters.regex(r"^back_awal$"))
-async def back_awal(client, callback):
-    state = ORDER_STATE.get(callback.message.id)
-    if not await deny_if_locked(state, callback):
-        return
-    await callback.message.edit_reply_markup(reply_markup=build_awal_keyboard())
-    await callback.answer("Kembali")
-
-
-@bot.on_callback_query(filters.regex(r"^back_produk$"))
-async def back_produk(client, callback):
-    state = ORDER_STATE.get(callback.message.id)
-    if not await deny_if_locked(state, callback):
-        return
-    await callback.message.edit_reply_markup(reply_markup=build_produk_keyboard(state["items"]))
+    state["view"] = VIEW_PRODUK
+    state["ctx"] = {}
+    await render_order(client, callback, state)
     await callback.answer()
 
 
@@ -835,93 +960,67 @@ async def pilih_kuantiti(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
+
     produk_key = callback.data.replace("produk_", "", 1)
-    await callback.message.edit_reply_markup(reply_markup=build_qty_keyboard(produk_key))
+
+    # push back ke PRODUK (undo tiada)
+    push_history(state, prev_view=VIEW_PRODUK, prev_ctx=state.get("ctx", {}) or {}, undo=None)
+
+    state["view"] = VIEW_QTY
+    state["ctx"] = {"produk_key": produk_key}
+    await render_order(client, callback, state)
     await callback.answer("Pilih kuantiti")
 
 
 @bot.on_callback_query(filters.regex(r"^qty_"))
-async def simpan_qty_repost(client, callback):
-    msg = callback.message
-    old_id = msg.id
-    state = ORDER_STATE.get(old_id)
+async def simpan_qty(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
 
+    payload = callback.data[len("qty_"):]
     try:
-        payload = callback.data[len("qty_"):]
         produk_key, qty_str = payload.rsplit("_", 1)
         qty = int(qty_str)
     except Exception:
         await callback.answer("Format kuantiti tidak sah.", show_alert=True)
         return
 
-    state["items"][produk_key] = qty
-    await callback.answer("Dikemaskini")
-
-    caption_baru = build_caption(
-        state["base_caption"], state["items"], state.get("prices", {}),
-        state.get("dest"), state.get("ship_cost"),
-        locked=bool(state.get("locked")),
-        receipts_count=len(state.get("receipts", [])),
-        paid=bool(state.get("paid")),
-        state=state,
+    # undo: restore qty lama / delete qty jika sebelum ni tiada
+    prev_qty = state.get("items", {}).get(produk_key)
+    push_history(
+        state,
+        prev_view=VIEW_QTY,
+        prev_ctx=state.get("ctx", {}) or {},
+        undo={"type": "set_qty", "produk_key": produk_key, "prev": prev_qty}
     )
 
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    state.setdefault("items", {})[produk_key] = qty
 
-    new_msg = await client.send_photo(
-        chat_id=state["chat_id"],
-        photo=state["photo_id"],
-        caption=caption_baru,
-        reply_markup=build_produk_keyboard(state["items"]),
-    )
-
-    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
-    ORDER_STATE.pop(old_id, None)
+    # lepas pilih qty -> balik ke PRODUK list
+    state["view"] = VIEW_PRODUK
+    state["ctx"] = {}
+    await render_order(client, callback, state)
+    await callback.answer("Disimpan")
 
 
 @bot.on_callback_query(filters.regex(r"^submit$"))
 async def submit_order(client, callback):
-    msg = callback.message
-    old_id = msg.id
-    state = ORDER_STATE.get(old_id)
+    state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
-    if not state["items"]:
+
+    if not state.get("items"):
         await callback.answer("Sila pilih sekurang-kurangnya 1 produk dulu.", show_alert=True)
         return
 
-    await callback.answer("Submit...")
+    # push back ke PRODUK (undo tiada)
+    push_history(state, prev_view=VIEW_PRODUK, prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
-    caption_baru = build_caption(
-        state["base_caption"], state["items"], state.get("prices", {}),
-        state.get("dest"), state.get("ship_cost"),
-        locked=bool(state.get("locked")),
-        receipts_count=len(state.get("receipts", [])),
-        paid=bool(state.get("paid")),
-        state=state,
-    )
-
-    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
-
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    new_msg = await client.send_photo(
-        chat_id=state["chat_id"],
-        photo=state["photo_id"],
-        caption=caption_baru,
-        reply_markup=kb
-    )
-
-    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
-    ORDER_STATE.pop(old_id, None)
+    state["view"] = VIEW_HARGA_MENU
+    state["ctx"] = {}
+    await render_order(client, callback, state)
+    await callback.answer("Set harga")
 
 
 @bot.on_callback_query(filters.regex(r"^harga_"))
@@ -929,8 +1028,15 @@ async def buka_senarai_harga(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
+
     produk_key = callback.data.replace("harga_", "", 1)
-    await callback.message.edit_reply_markup(reply_markup=build_select_harga_keyboard(produk_key, page=0))
+
+    # push back ke HARGA MENU (undo tiada)
+    push_history(state, prev_view=VIEW_HARGA_MENU, prev_ctx=state.get("ctx", {}) or {}, undo=None)
+
+    state["view"] = VIEW_HARGA_SELECT
+    state["ctx"] = {"harga_produk": produk_key, "harga_page": 0}
+    await render_order(client, callback, state)
     await callback.answer("Pilih harga")
 
 
@@ -939,6 +1045,7 @@ async def harga_pagination(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
+
     payload = callback.data[len("harga_page_"):]
     try:
         produk_key, page_str = payload.rsplit("_", 1)
@@ -946,25 +1053,16 @@ async def harga_pagination(client, callback):
     except Exception:
         await callback.answer("Pagination tidak sah.", show_alert=True)
         return
-    await callback.message.edit_reply_markup(reply_markup=build_select_harga_keyboard(produk_key, page=page))
-    await callback.answer()
 
-
-@bot.on_callback_query(filters.regex(r"^back_harga_menu$"))
-async def back_harga_menu(client, callback):
-    state = ORDER_STATE.get(callback.message.id)
-    if not await deny_if_locked(state, callback):
-        return
-    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
-    await callback.message.edit_reply_markup(reply_markup=kb)
+    state["view"] = VIEW_HARGA_SELECT
+    state["ctx"] = {"harga_produk": produk_key, "harga_page": page}
+    await render_order(client, callback, state)
     await callback.answer()
 
 
 @bot.on_callback_query(filters.regex(r"^setharga_"))
 async def set_harga(client, callback):
-    msg = callback.message
-    old_id = msg.id
-    state = ORDER_STATE.get(old_id)
+    state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
 
@@ -976,34 +1074,21 @@ async def set_harga(client, callback):
         await callback.answer("Format harga tidak sah.", show_alert=True)
         return
 
-    state["prices"][produk_key] = harga
+    prev_price = state.get("prices", {}).get(produk_key)
+    push_history(
+        state,
+        prev_view=VIEW_HARGA_SELECT,
+        prev_ctx=state.get("ctx", {}) or {},
+        undo={"type": "set_price", "produk_key": produk_key, "prev": prev_price}
+    )
+
+    state.setdefault("prices", {})[produk_key] = harga
+
+    # lepas set harga -> balik HARGA MENU
+    state["view"] = VIEW_HARGA_MENU
+    state["ctx"] = {}
+    await render_order(client, callback, state)
     await callback.answer("Harga diset")
-
-    caption_baru = build_caption(
-        state["base_caption"], state["items"], state.get("prices", {}),
-        state.get("dest"), state.get("ship_cost"),
-        locked=bool(state.get("locked")),
-        receipts_count=len(state.get("receipts", [])),
-        paid=bool(state.get("paid")),
-        state=state,
-    )
-
-    kb = build_harga_keyboard(state["items"], state.get("prices", {}))
-
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    new_msg = await client.send_photo(
-        chat_id=state["chat_id"],
-        photo=state["photo_id"],
-        caption=caption_baru,
-        reply_markup=kb
-    )
-
-    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
-    ORDER_STATE.pop(old_id, None)
 
 
 @bot.on_callback_query(filters.regex(r"^destinasi$"))
@@ -1011,18 +1096,23 @@ async def buka_destinasi(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
+
     if not is_all_prices_done(state.get("items", {}), state.get("prices", {})):
         await callback.answer("Sila lengkapkan harga dulu.", show_alert=True)
         return
-    await callback.message.edit_reply_markup(reply_markup=build_dest_keyboard())
+
+    # push back ke HARGA MENU (undo tiada)
+    push_history(state, prev_view=VIEW_HARGA_MENU, prev_ctx=state.get("ctx", {}) or {}, undo=None)
+
+    state["view"] = VIEW_DEST
+    state["ctx"] = {}
+    await render_order(client, callback, state)
     await callback.answer("Pilih destinasi")
 
 
 @bot.on_callback_query(filters.regex(r"^setdest_"))
 async def set_destinasi(client, callback):
-    msg = callback.message
-    old_id = msg.id
-    state = ORDER_STATE.get(old_id)
+    state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
 
@@ -1033,45 +1123,22 @@ async def set_destinasi(client, callback):
         await callback.answer("Destinasi tidak sah.", show_alert=True)
         return
 
+    prev_dest = state.get("dest")
+    prev_ship = state.get("ship_cost")
+    push_history(
+        state,
+        prev_view=VIEW_DEST,
+        prev_ctx=state.get("ctx", {}) or {},
+        undo={"type": "set_dest", "prev_dest": prev_dest, "prev_ship_cost": prev_ship}
+    )
+
     state["dest"] = dest
     state["ship_cost"] = None
+
+    state["view"] = VIEW_AFTER_DEST
+    state["ctx"] = {}
+    await render_order(client, callback, state)
     await callback.answer(f"Destinasi: {dest}")
-
-    caption_baru = build_caption(
-        state["base_caption"], state["items"], state.get("prices", {}),
-        state.get("dest"), state.get("ship_cost"),
-        locked=bool(state.get("locked")),
-        receipts_count=len(state.get("receipts", [])),
-        paid=bool(state.get("paid")),
-        state=state,
-    )
-
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    new_msg = await client.send_photo(
-        chat_id=state["chat_id"],
-        photo=state["photo_id"],
-        caption=caption_baru,
-        reply_markup=build_after_dest_keyboard()
-    )
-
-    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
-    ORDER_STATE.pop(old_id, None)
-
-
-@bot.on_callback_query(filters.regex(r"^back_after_dest$"))
-async def back_after_dest(client, callback):
-    state = ORDER_STATE.get(callback.message.id)
-    if not await deny_if_locked(state, callback):
-        return
-    if state.get("ship_cost") is not None:
-        await callback.message.edit_reply_markup(reply_markup=build_after_cost_keyboard())
-    else:
-        await callback.message.edit_reply_markup(reply_markup=build_after_dest_keyboard())
-    await callback.answer()
 
 
 @bot.on_callback_query(filters.regex(r"^kos_penghantaran$"))
@@ -1079,10 +1146,18 @@ async def buka_kos_penghantaran(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
+
     if not state.get("dest"):
         await callback.answer("Sila pilih DESTINASI dulu.", show_alert=True)
         return
-    await callback.message.edit_reply_markup(reply_markup=build_select_kos_keyboard(page=0))
+
+    # push back ke view semasa (undo tiada) -> supaya dari kos page boleh back semula
+    cur_view = state.get("view", VIEW_AFTER_DEST)
+    push_history(state, prev_view=cur_view, prev_ctx=state.get("ctx", {}) or {}, undo=None)
+
+    state["view"] = VIEW_KOS_SELECT
+    state["ctx"] = {"kos_page": 0}
+    await render_order(client, callback, state)
     await callback.answer("Pilih kos penghantaran")
 
 
@@ -1091,20 +1166,22 @@ async def kos_pagination(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
+
     try:
         page = int(callback.data.replace("kos_page_", "", 1))
     except Exception:
         await callback.answer("Pagination tidak sah.", show_alert=True)
         return
-    await callback.message.edit_reply_markup(reply_markup=build_select_kos_keyboard(page=page))
+
+    state["view"] = VIEW_KOS_SELECT
+    state["ctx"] = {"kos_page": page}
+    await render_order(client, callback, state)
     await callback.answer()
 
 
 @bot.on_callback_query(filters.regex(r"^setkos_"))
 async def set_kos(client, callback):
-    msg = callback.message
-    old_id = msg.id
-    state = ORDER_STATE.get(old_id)
+    state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
 
@@ -1114,40 +1191,27 @@ async def set_kos(client, callback):
         await callback.answer("Kos tidak sah.", show_alert=True)
         return
 
+    prev_cost = state.get("ship_cost")
+    push_history(
+        state,
+        prev_view=VIEW_KOS_SELECT,
+        prev_ctx=state.get("ctx", {}) or {},
+        undo={"type": "set_ship_cost", "prev": prev_cost}
+    )
+
     state["ship_cost"] = kos
+
+    state["view"] = VIEW_AFTER_COST
+    state["ctx"] = {}
+    await render_order(client, callback, state)
     await callback.answer(f"Kos diset: {kos}")
-
-    caption_baru = build_caption(
-        state["base_caption"], state["items"], state.get("prices", {}),
-        state.get("dest"), state.get("ship_cost"),
-        locked=bool(state.get("locked")),
-        receipts_count=len(state.get("receipts", [])),
-        paid=bool(state.get("paid")),
-        state=state,
-    )
-
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    new_msg = await client.send_photo(
-        chat_id=state["chat_id"],
-        photo=state["photo_id"],
-        caption=caption_baru,
-        reply_markup=build_after_cost_keyboard()
-    )
-
-    ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
-    ORDER_STATE.pop(old_id, None)
 
 
 # ====== LAST SUBMIT (LOCK) ======
 @bot.on_callback_query(filters.regex(r"^last_submit$"))
 async def last_submit(client, callback):
     msg = callback.message
-    old_id = msg.id
-    state = ORDER_STATE.get(old_id)
+    state = ORDER_STATE.get(msg.id)
 
     if not state:
         await callback.answer("Rekod tidak dijumpai.", show_alert=True)
@@ -1165,12 +1229,18 @@ async def last_submit(client, callback):
         await callback.answer("Kos penghantaran belum dipilih.", show_alert=True)
         return
 
+    # lock
     state["locked"] = True
     state.setdefault("receipts", [])
     state.setdefault("paid", False)
     state.setdefault("paid_at", None)
     state.setdefault("paid_by", None)
     state.setdefault("ocr_results", [])
+
+    # reset view/history supaya flow bersih (lepas lock, memang tiada BACK flow)
+    state["view"] = VIEW_AWAL
+    state["ctx"] = {}
+    state["history"] = []
 
     # PAYMENT PIN STATE
     state["pin_mode"] = False
@@ -1186,13 +1256,16 @@ async def last_submit(client, callback):
 
     state["album_msg_ids"] = None
     state["control_msg_id"] = None
-    state["anchor_msg_id"] = old_id
+    state["anchor_msg_id"] = msg.id
 
     await callback.answer("Last submit ✅")
 
     caption_baru = build_caption(
-        state["base_caption"], state["items"], state.get("prices", {}),
-        state.get("dest"), state.get("ship_cost"),
+        state["base_caption"],
+        state.get("items", {}),
+        state.get("prices", {}),
+        state.get("dest"),
+        state.get("ship_cost"),
         locked=True,
         receipts_count=len(state.get("receipts", [])),
         paid=False,
@@ -1207,11 +1280,9 @@ async def last_submit(client, callback):
         except Exception:
             pass
         new_msg = await client.send_photo(chat_id=state["chat_id"], photo=state["photo_id"], caption=caption_baru)
-        ORDER_STATE[new_msg.id] = {**state, "anchor_msg_id": new_msg.id}
-        ORDER_STATE.pop(old_id, None)
-        return
-
-    ORDER_STATE[old_id] = state
+        ORDER_STATE.pop(msg.id, None)
+        ORDER_STATE[new_msg.id] = state
+        state["anchor_msg_id"] = new_msg.id
 
 
 # ================= PAYMENT SETTLE (PASSWORD FLOW) =================
@@ -1492,10 +1563,6 @@ async def sp_back(client, callback):
 
 @bot.on_callback_query(filters.regex(r"^sp_ok$"))
 async def sp_ok_move(client, callback):
-    """
-    ✅ Lepas pindah channel: TAK tinggal apa-apa mesej dalam group
-    ✅ OCR output: ✅ di kiri (ikut format yang awak nak)
-    """
     state = ORDER_STATE.get(callback.message.id)
     if not state or not state.get("sp_mode"):
         await callback.answer("Sila tekan BUTANG SEMAK BAYARAN dulu.", show_alert=True)
@@ -1581,7 +1648,7 @@ async def sp_ok_move(client, callback):
             if ORDER_STATE.get(k) is state:
                 ORDER_STATE.pop(k, None)
 
-        # ✅ 5) TIADA mesej ditinggalkan dalam group
+        # ✅ TIADA mesej ditinggalkan dalam group
         return
 
     except Exception as e:
@@ -1651,8 +1718,6 @@ async def handle_photo(client, message):
     jam = now.strftime("%I:%M%p").lower()
     base_caption = f"{hari} | {tarikh} | {jam}"
 
-    keyboard_awal = build_awal_keyboard()
-
     try:
         await message.delete()
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -1664,17 +1729,19 @@ async def handle_photo(client, message):
         chat_id=chat_id,
         photo=photo_id,
         caption=bold(base_caption),
-        reply_markup=keyboard_awal
+        reply_markup=build_awal_keyboard()
     )
 
     ORDER_STATE[sent.id] = {
         "chat_id": chat_id,
         "photo_id": photo_id,
         "base_caption": base_caption,
+
         "items": {},
         "prices": {},
         "dest": None,
         "ship_cost": None,
+
         "receipts": [],
         "receipts_album": [],
         "paid": False,
@@ -1687,6 +1754,11 @@ async def handle_photo(client, message):
         "control_msg_id": None,
 
         "ocr_results": [],
+
+        # FLOW STATE
+        "view": VIEW_AWAL,
+        "ctx": {},
+        "history": [],
 
         # PAYMENT PIN
         "pin_mode": False,
