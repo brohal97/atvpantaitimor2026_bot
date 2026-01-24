@@ -108,7 +108,7 @@ PRODUK_LIST = {
 
 DEST_LIST = [
     "JOHOR", "KEDAH", "KELANTAN", "MELAKA", "NEGERI SEMBILAN", "PAHANG", "PERAK", "PERLIS",
-    "PULAU PINANG", "SELANGOR", "TERENGGANU", "LANGKAWI", "PICKUP SENDIRI", "LORI KITA HANTAR",
+    "PULAU PINANG", "SELANGOR", "TERENGGANU", "LANGKAWI", "PICKUP SENDIRI", "KITA HANTAR",
 ]
 
 MAX_RECEIPTS_IN_ALBUM = 9
@@ -132,8 +132,8 @@ def bold(text: str) -> str:
 
 
 # ================= CUSTOM TEXT (USER REQUEST) =================
-TXT_PAYMENT_CONTROL = bold("⬇️Tekan butang sahkan pembayaran⬇️")
-TXT_SEMAK_CONTROL = bold("🚨Semak pembayaran dengan segera🚨")
+TXT_PAYMENT_CONTROL = bold("⏬Tekan butang sahkan bayaran⏬")
+TXT_SEMAK_CONTROL = bold("🔻Semak pembayaran dengan segera🔻")
 TXT_SEMAK_PIN_TITLE = bold("ISI PASWORD JIKA BAYARAN TELAH DISEMAK")
 
 
@@ -301,7 +301,7 @@ def pop_history_restore(state: Dict[str, Any]) -> bool:
 
 # ================= KEYBOARDS =================
 def kb_back_row() -> List[InlineKeyboardButton]:
-    return [InlineKeyboardButton("⬅️ BACK", callback_data=BACK_CB)]
+    return [InlineKeyboardButton("🔙 BACK", callback_data=BACK_CB)]
 
 
 def build_payment_keyboard() -> InlineKeyboardMarkup:
@@ -357,7 +357,7 @@ def build_num_keyboard(prefix: str) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("0", callback_data=f"{prefix}_0")],
         [
-            InlineKeyboardButton("⬅️ BACK", callback_data=f"{prefix}_back"),
+            InlineKeyboardButton("🔙 BACK", callback_data=f"{prefix}_back"),
             InlineKeyboardButton("✅ OKEY", callback_data=f"{prefix}_ok"),
         ],
     ])
