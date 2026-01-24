@@ -4,12 +4,14 @@
 # + PAYMENT SETTLE ada password keypad
 # + SEMAK BAYARAN: hanya user tertentu + keypad password
 #   - betul -> OCR semua resit -> COPY ke channel rasmi -> delete dalam group
-#   - BACK (GLOBAL): undo 1 langkah + padam selection 1 langkah
+# + BACK (GLOBAL): undo 1 langkah + padam selection 1 langkah
+# + INPUT HARGA & KOS TRANSPORT: keypad nombor manual (0-9) + BACKSPACE + OKEY
+#   - BACK pada keypad = padam 1 digit (kalau kosong, cancel balik 1 halaman)
 # =========================
 
 import os, io, re, tempfile, traceback
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 
 import pytz
 from pyrogram import Client, filters
@@ -104,25 +106,16 @@ PRODUK_LIST = {
     "TROLI_PLASTIK": "TROLI PLASTIK",
 }
 
-HARGA_START = 2500
-HARGA_END = 3000
-HARGA_STEP = 10
-HARGA_LIST = list(range(HARGA_START, HARGA_END + 1, HARGA_STEP))
-HARGA_PER_PAGE = 15
-
 DEST_LIST = [
     "JOHOR", "KEDAH", "KELANTAN", "MELAKA", "NEGERI SEMBILAN", "PAHANG", "PERAK", "PERLIS",
     "PULAU PINANG", "SELANGOR", "TERENGGANU", "LANGKAWI", "PICKUP SENDIRI", "LORI KITA HANTAR",
 ]
 
-KOS_START = 0
-KOS_END = 1500
-KOS_STEP = 10
-KOS_LIST = list(range(KOS_START, KOS_END + 1, KOS_STEP))
-KOS_PER_PAGE = 15
-
 MAX_RECEIPTS_IN_ALBUM = 9
 MAX_OCR_RESULTS_IN_CAPTION = 10
+
+# input keypad limit (harga/kos) - boleh ubah kalau perlu
+MAX_NUM_DIGITS = 6  # contoh: 999999
 
 
 # ================= TEXT STYLE =================
@@ -185,9 +178,9 @@ def build_caption(
     receipts_count: int = 0,
     paid: bool = False,
     state: Optional[Dict[str, Any]] = None,
+    extra_lines: Optional[List[str]] = None,
 ) -> str:
     prices_dict = prices_dict or {}
-
     lines = [bold(base_caption)]
 
     if items_dict:
@@ -215,6 +208,10 @@ def build_caption(
         grand_total = prod_total + int(ship_cost)
         lines.append(f"TOTAL KESELURUHAN : {bold(f'RM{grand_total}')}")
 
+    if extra_lines:
+        lines.append("")
+        lines.extend(extra_lines)
+
     if locked:
         if paid and state:
             lines.append("")
@@ -239,7 +236,6 @@ BACK_CB = "nav_back"
 
 def push_history(state: Dict[str, Any], prev_view: str, prev_ctx: Dict[str, Any], undo: Optional[Dict[str, Any]] = None):
     state.setdefault("history", [])
-    # simpan snapshot ringan
     state["history"].append({
         "view": prev_view,
         "ctx": dict(prev_ctx or {}),
@@ -258,8 +254,7 @@ def apply_undo(state: Dict[str, Any], undo: Dict[str, Any]):
         prev = undo.get("prev")  # None => remove
         if prev is None:
             state.get("items", {}).pop(k, None)
-            # bila item dipadam, harga item juga padam
-            state.get("prices", {}).pop(k, None)
+            state.get("prices", {}).pop(k, None)  # bila item dipadam, harga item juga padam
         else:
             state.setdefault("items", {})[k] = int(prev)
 
@@ -278,12 +273,24 @@ def apply_undo(state: Dict[str, Any], undo: Dict[str, Any]):
     elif t == "set_ship_cost":
         state["ship_cost"] = undo.get("prev")
 
-    # kemas: kalau tiada items, reset bawah
     if not state.get("items"):
         state["items"] = {}
         state["prices"] = {}
         state["dest"] = None
         state["ship_cost"] = None
+
+
+def pop_history_restore(state: Dict[str, Any]) -> bool:
+    hist = state.get("history", [])
+    if not hist:
+        return False
+    last = hist.pop()
+    undo = last.get("undo")
+    if undo:
+        apply_undo(state, undo)
+    state["view"] = last.get("view")
+    state["ctx"] = last.get("ctx", {}) or {}
+    return True
 
 
 # ================= KEYBOARDS =================
@@ -319,6 +326,32 @@ def build_pin_keyboard(prefix: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("0", callback_data=f"{prefix}_0")],
         [
             InlineKeyboardButton("🔙 BACK", callback_data=f"{prefix}_back"),
+            InlineKeyboardButton("✅ OKEY", callback_data=f"{prefix}_ok"),
+        ],
+    ])
+
+
+# keypad nombor (harga/kos)
+def build_num_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1", callback_data=f"{prefix}_1"),
+            InlineKeyboardButton("2", callback_data=f"{prefix}_2"),
+            InlineKeyboardButton("3", callback_data=f"{prefix}_3"),
+        ],
+        [
+            InlineKeyboardButton("4", callback_data=f"{prefix}_4"),
+            InlineKeyboardButton("5", callback_data=f"{prefix}_5"),
+            InlineKeyboardButton("6", callback_data=f"{prefix}_6"),
+        ],
+        [
+            InlineKeyboardButton("7", callback_data=f"{prefix}_7"),
+            InlineKeyboardButton("8", callback_data=f"{prefix}_8"),
+            InlineKeyboardButton("9", callback_data=f"{prefix}_9"),
+        ],
+        [InlineKeyboardButton("0", callback_data=f"{prefix}_0")],
+        [
+            InlineKeyboardButton("⬅️ BACK", callback_data=f"{prefix}_back"),
             InlineKeyboardButton("✅ OKEY", callback_data=f"{prefix}_ok"),
         ],
     ])
@@ -363,11 +396,10 @@ async def replace_order_message(client: Client, msg, state: Dict[str, Any], capt
     old_id = msg.id
     try:
         await msg.edit_caption(caption=caption, reply_markup=keyboard)
-        return msg  # id kekal
+        return msg
     except Exception:
         pass
 
-    # fallback: repost
     try:
         await msg.delete()
     except Exception:
@@ -380,7 +412,6 @@ async def replace_order_message(client: Client, msg, state: Dict[str, Any], capt
         reply_markup=keyboard
     )
 
-    # re-key state
     ORDER_STATE.pop(old_id, None)
     ORDER_STATE[new_msg.id] = state
     state["anchor_msg_id"] = new_msg.id
@@ -392,17 +423,21 @@ VIEW_AWAL = "awal"
 VIEW_PRODUK = "produk"
 VIEW_QTY = "qty"
 VIEW_HARGA_MENU = "harga_menu"
-VIEW_HARGA_SELECT = "harga_select"
+VIEW_HARGA_INPUT = "harga_input"
 VIEW_DEST = "dest"
 VIEW_AFTER_DEST = "after_dest"
-VIEW_KOS_SELECT = "kos_select"
+VIEW_KOS_INPUT = "kos_input"
 VIEW_AFTER_COST = "after_cost"
+
+# callback prefix keypad harga/kos
+PRICE_PREFIX = "pr"
+KOS_PREFIX = "tr"
 
 
 def build_awal_keyboard() -> InlineKeyboardMarkup:
+    # ✅ HALAMAN PERTAMA: TIADA BUTANG BACK
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("NAMA PRODUK", callback_data="hantar_detail")],
-        kb_back_row()
     ])
 
 
@@ -445,29 +480,6 @@ def build_harga_menu_keyboard(items_dict: Dict[str, int], prices_dict: Dict[str,
     return InlineKeyboardMarkup(rows)
 
 
-def build_select_harga_keyboard(produk_key: str, page: int = 0) -> InlineKeyboardMarkup:
-    total = len(HARGA_LIST)
-    start = page * HARGA_PER_PAGE
-    end = start + HARGA_PER_PAGE
-    chunk = HARGA_LIST[start:end]
-
-    rows = []
-    for i in range(0, len(chunk), 5):
-        row_prices = chunk[i:i + 5]
-        rows.append([InlineKeyboardButton(str(p), callback_data=f"setharga_{produk_key}_{p}") for p in row_prices])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ PREV", callback_data=f"harga_page_{produk_key}_{page - 1}"))
-    if end < total:
-        nav.append(InlineKeyboardButton("NEXT ➡️", callback_data=f"harga_page_{produk_key}_{page + 1}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append(kb_back_row())
-    return InlineKeyboardMarkup(rows)
-
-
 def build_dest_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for i in range(0, len(DEST_LIST), 2):
@@ -483,39 +495,16 @@ def build_dest_keyboard() -> InlineKeyboardMarkup:
 
 def build_after_dest_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚚 KOS PENGHANTARAN", callback_data="kos_penghantaran")],
+        [InlineKeyboardButton("🚚 KOS TRANSPORT", callback_data="kos_transport")],
         [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
         kb_back_row()
     ])
 
 
-def build_select_kos_keyboard(page: int = 0) -> InlineKeyboardMarkup:
-    total = len(KOS_LIST)
-    start = page * KOS_PER_PAGE
-    end = start + KOS_PER_PAGE
-    chunk = KOS_LIST[start:end]
-
-    rows = []
-    for i in range(0, len(chunk), 5):
-        row_cost = chunk[i:i + 5]
-        rows.append([InlineKeyboardButton(str(c), callback_data=f"setkos_{c}") for c in row_cost])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ PREV", callback_data=f"kos_page_{page - 1}"))
-    if end < total:
-        nav.append(InlineKeyboardButton("NEXT ➡️", callback_data=f"kos_page_{page + 1}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append(kb_back_row())
-    return InlineKeyboardMarkup(rows)
-
-
 def build_after_cost_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ LAST SUBMIT", callback_data="last_submit")],
-        [InlineKeyboardButton("✏️ TUKAR KOS PENGHANTARAN", callback_data="kos_penghantaran")],
+        [InlineKeyboardButton("✏️ TUKAR KOS TRANSPORT", callback_data="kos_transport")],
         [InlineKeyboardButton("🗺️ TUKAR DESTINASI", callback_data="destinasi")],
         kb_back_row()
     ])
@@ -535,21 +524,49 @@ def get_keyboard_for_view(state: Dict[str, Any]) -> InlineKeyboardMarkup:
         return build_qty_keyboard(ctx.get("produk_key", ""))
     if view == VIEW_HARGA_MENU:
         return build_harga_menu_keyboard(items, prices)
-    if view == VIEW_HARGA_SELECT:
-        return build_select_harga_keyboard(ctx.get("harga_produk", ""), int(ctx.get("harga_page", 0)))
+    if view == VIEW_HARGA_INPUT:
+        return build_num_keyboard(PRICE_PREFIX)
     if view == VIEW_DEST:
         return build_dest_keyboard()
     if view == VIEW_AFTER_DEST:
         return build_after_dest_keyboard()
-    if view == VIEW_KOS_SELECT:
-        return build_select_kos_keyboard(int(ctx.get("kos_page", 0)))
+    if view == VIEW_KOS_INPUT:
+        return build_num_keyboard(KOS_PREFIX)
     if view == VIEW_AFTER_COST:
         return build_after_cost_keyboard()
 
     return build_awal_keyboard()
 
 
+def build_extra_lines_for_input(state: Dict[str, Any]) -> Optional[List[str]]:
+    view = state.get("view")
+    ctx = state.get("ctx", {}) or {}
+    buf = (ctx.get("num_buf") or "").strip()
+
+    if view == VIEW_HARGA_INPUT:
+        pk = ctx.get("produk_key", "")
+        nama = PRODUK_LIST.get(pk, pk) or "PRODUK"
+        shown = buf if buf else "-"
+        return [
+            bold("MASUKKAN HARGA PRODUK"),
+            f"{nama}",
+            f"HARGA: {bold('RM' + shown)}",
+            "Tekan nombor 0-9, kemudian tekan ✅ OKEY."
+        ]
+
+    if view == VIEW_KOS_INPUT:
+        shown = buf if buf else "-"
+        return [
+            bold("MASUKKAN KOS TRANSPORT"),
+            f"KOS: {bold('RM' + shown)}",
+            "Tekan nombor 0-9, kemudian tekan ✅ OKEY."
+        ]
+
+    return None
+
+
 async def render_order(client: Client, callback, state: Dict[str, Any]):
+    extra = build_extra_lines_for_input(state)
     caption = build_caption(
         state["base_caption"],
         state.get("items", {}),
@@ -559,7 +576,8 @@ async def render_order(client: Client, callback, state: Dict[str, Any]):
         locked=False,
         receipts_count=len(state.get("receipts", [])),
         paid=bool(state.get("paid")),
-        state=state
+        state=state,
+        extra_lines=extra
     )
     kb = get_keyboard_for_view(state)
     new_msg = await replace_order_message(client, callback.message, state, caption, kb)
@@ -772,7 +790,7 @@ def with_icon_left(line: str, ok: bool) -> str:
     return f"{icon}{(line or '').strip()}"
 
 
-def detect_status_clean(full_text: str) -> (str, bool):
+def detect_status_clean(full_text: str) -> Tuple[str, bool]:
     t = normalize_for_text(full_text).lower()
 
     neg_hit = next((kw for kw in sorted(NEGATIVE_KW, key=len, reverse=True) if kw in t), None)
@@ -922,18 +940,9 @@ async def nav_back(client, callback):
     if not await deny_if_locked(state, callback):
         return
 
-    hist = state.get("history", [])
-    if not hist:
+    if not pop_history_restore(state):
         await callback.answer("Tiada langkah untuk undur.", show_alert=True)
         return
-
-    last = hist.pop()  # pop 1 langkah
-    undo = last.get("undo")
-    if undo:
-        apply_undo(state, undo)
-
-    state["view"] = last.get("view", VIEW_AWAL)
-    state["ctx"] = last.get("ctx", {}) or {}
 
     await render_order(client, callback, state)
     await callback.answer("Undo ✅")
@@ -946,7 +955,6 @@ async def senarai_produk(client, callback):
     if not await deny_if_locked(state, callback):
         return
 
-    # push back ke AWAL (undo tiada)
     push_history(state, prev_view=VIEW_AWAL, prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
     state["view"] = VIEW_PRODUK
@@ -963,7 +971,6 @@ async def pilih_kuantiti(client, callback):
 
     produk_key = callback.data.replace("produk_", "", 1)
 
-    # push back ke PRODUK (undo tiada)
     push_history(state, prev_view=VIEW_PRODUK, prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
     state["view"] = VIEW_QTY
@@ -986,7 +993,6 @@ async def simpan_qty(client, callback):
         await callback.answer("Format kuantiti tidak sah.", show_alert=True)
         return
 
-    # undo: restore qty lama / delete qty jika sebelum ni tiada
     prev_qty = state.get("items", {}).get(produk_key)
     push_history(
         state,
@@ -997,7 +1003,6 @@ async def simpan_qty(client, callback):
 
     state.setdefault("items", {})[produk_key] = qty
 
-    # lepas pilih qty -> balik ke PRODUK list
     state["view"] = VIEW_PRODUK
     state["ctx"] = {}
     await render_order(client, callback, state)
@@ -1014,7 +1019,6 @@ async def submit_order(client, callback):
         await callback.answer("Sila pilih sekurang-kurangnya 1 produk dulu.", show_alert=True)
         return
 
-    # push back ke PRODUK (undo tiada)
     push_history(state, prev_view=VIEW_PRODUK, prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
     state["view"] = VIEW_HARGA_MENU
@@ -1023,74 +1027,113 @@ async def submit_order(client, callback):
     await callback.answer("Set harga")
 
 
+# ====== HARGA: BUKA KEYPAD ======
 @bot.on_callback_query(filters.regex(r"^harga_"))
-async def buka_senarai_harga(client, callback):
+async def buka_harga_keypad(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
 
     produk_key = callback.data.replace("harga_", "", 1)
 
-    # push back ke HARGA MENU (undo tiada)
     push_history(state, prev_view=VIEW_HARGA_MENU, prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
-    state["view"] = VIEW_HARGA_SELECT
-    state["ctx"] = {"harga_produk": produk_key, "harga_page": 0}
+    state["view"] = VIEW_HARGA_INPUT
+    state["ctx"] = {"produk_key": produk_key, "num_buf": ""}
     await render_order(client, callback, state)
-    await callback.answer("Pilih harga")
+    await callback.answer("Masukkan harga")
 
 
-@bot.on_callback_query(filters.regex(r"^harga_page_"))
-async def harga_pagination(client, callback):
+@bot.on_callback_query(filters.regex(rf"^{PRICE_PREFIX}_[0-9]$"))
+async def harga_digit(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
-
-    payload = callback.data[len("harga_page_"):]
-    try:
-        produk_key, page_str = payload.rsplit("_", 1)
-        page = int(page_str)
-    except Exception:
-        await callback.answer("Pagination tidak sah.", show_alert=True)
+    if state.get("view") != VIEW_HARGA_INPUT:
+        await callback.answer("Bukan halaman harga.", show_alert=True)
         return
 
-    state["view"] = VIEW_HARGA_SELECT
-    state["ctx"] = {"harga_produk": produk_key, "harga_page": page}
+    digit = callback.data.split("_", 1)[1]
+    ctx = state.get("ctx", {}) or {}
+    buf = (ctx.get("num_buf") or "")
+
+    if len(buf) >= MAX_NUM_DIGITS:
+        await callback.answer("Digit sudah maksimum.", show_alert=True)
+        return
+
+    ctx["num_buf"] = buf + digit
+    state["ctx"] = ctx
     await render_order(client, callback, state)
     await callback.answer()
 
 
-@bot.on_callback_query(filters.regex(r"^setharga_"))
-async def set_harga(client, callback):
+@bot.on_callback_query(filters.regex(rf"^{PRICE_PREFIX}_back$"))
+async def harga_backspace_or_cancel(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
+    if state.get("view") != VIEW_HARGA_INPUT:
+        await callback.answer("Bukan halaman harga.", show_alert=True)
+        return
 
-    payload = callback.data[len("setharga_"):]
+    ctx = state.get("ctx", {}) or {}
+    buf = (ctx.get("num_buf") or "")
+    if buf:
+        ctx["num_buf"] = buf[:-1]
+        state["ctx"] = ctx
+        await render_order(client, callback, state)
+        await callback.answer("Padam 1 digit")
+        return
+
+    # kalau kosong: cancel balik 1 halaman (undo langkah masuk keypad)
+    if pop_history_restore(state):
+        await render_order(client, callback, state)
+        await callback.answer("Kembali")
+    else:
+        await callback.answer("Tiada langkah untuk undur.", show_alert=True)
+
+
+@bot.on_callback_query(filters.regex(rf"^{PRICE_PREFIX}_ok$"))
+async def harga_okey_set(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
+    if not await deny_if_locked(state, callback):
+        return
+    if state.get("view") != VIEW_HARGA_INPUT:
+        await callback.answer("Bukan halaman harga.", show_alert=True)
+        return
+
+    ctx = state.get("ctx", {}) or {}
+    buf = (ctx.get("num_buf") or "").strip()
+    produk_key = ctx.get("produk_key", "")
+
+    if not buf:
+        await callback.answer("Sila masukkan nombor harga.", show_alert=True)
+        return
+
     try:
-        produk_key, harga_str = payload.rsplit("_", 1)
-        harga = int(harga_str)
+        harga = int(buf)
     except Exception:
-        await callback.answer("Format harga tidak sah.", show_alert=True)
+        await callback.answer("Harga tidak sah.", show_alert=True)
         return
 
     prev_price = state.get("prices", {}).get(produk_key)
     push_history(
         state,
-        prev_view=VIEW_HARGA_SELECT,
-        prev_ctx=state.get("ctx", {}) or {},
+        prev_view=VIEW_HARGA_INPUT,
+        prev_ctx=dict(ctx),
         undo={"type": "set_price", "produk_key": produk_key, "prev": prev_price}
     )
 
     state.setdefault("prices", {})[produk_key] = harga
 
-    # lepas set harga -> balik HARGA MENU
+    # balik ke menu harga
     state["view"] = VIEW_HARGA_MENU
     state["ctx"] = {}
     await render_order(client, callback, state)
-    await callback.answer("Harga diset")
+    await callback.answer("Harga diset ✅")
 
 
+# ====== DESTINASI ======
 @bot.on_callback_query(filters.regex(r"^destinasi$"))
 async def buka_destinasi(client, callback):
     state = ORDER_STATE.get(callback.message.id)
@@ -1101,7 +1144,6 @@ async def buka_destinasi(client, callback):
         await callback.answer("Sila lengkapkan harga dulu.", show_alert=True)
         return
 
-    # push back ke HARGA MENU (undo tiada)
     push_history(state, prev_view=VIEW_HARGA_MENU, prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
     state["view"] = VIEW_DEST
@@ -1141,8 +1183,9 @@ async def set_destinasi(client, callback):
     await callback.answer(f"Destinasi: {dest}")
 
 
-@bot.on_callback_query(filters.regex(r"^kos_penghantaran$"))
-async def buka_kos_penghantaran(client, callback):
+# ====== KOS TRANSPORT: KEYPAD ======
+@bot.on_callback_query(filters.regex(r"^kos_transport$"))
+async def buka_kos_transport_keypad(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
@@ -1151,42 +1194,81 @@ async def buka_kos_penghantaran(client, callback):
         await callback.answer("Sila pilih DESTINASI dulu.", show_alert=True)
         return
 
-    # push back ke view semasa (undo tiada) -> supaya dari kos page boleh back semula
-    cur_view = state.get("view", VIEW_AFTER_DEST)
-    push_history(state, prev_view=cur_view, prev_ctx=state.get("ctx", {}) or {}, undo=None)
+    push_history(state, prev_view=state.get("view", VIEW_AFTER_DEST), prev_ctx=state.get("ctx", {}) or {}, undo=None)
 
-    state["view"] = VIEW_KOS_SELECT
-    state["ctx"] = {"kos_page": 0}
+    state["view"] = VIEW_KOS_INPUT
+    state["ctx"] = {"num_buf": ""}  # kos tidak perlukan produk_key
     await render_order(client, callback, state)
-    await callback.answer("Pilih kos penghantaran")
+    await callback.answer("Masukkan kos transport")
 
 
-@bot.on_callback_query(filters.regex(r"^kos_page_"))
-async def kos_pagination(client, callback):
+@bot.on_callback_query(filters.regex(rf"^{KOS_PREFIX}_[0-9]$"))
+async def kos_digit(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
-
-    try:
-        page = int(callback.data.replace("kos_page_", "", 1))
-    except Exception:
-        await callback.answer("Pagination tidak sah.", show_alert=True)
+    if state.get("view") != VIEW_KOS_INPUT:
+        await callback.answer("Bukan halaman kos.", show_alert=True)
         return
 
-    state["view"] = VIEW_KOS_SELECT
-    state["ctx"] = {"kos_page": page}
+    digit = callback.data.split("_", 1)[1]
+    ctx = state.get("ctx", {}) or {}
+    buf = (ctx.get("num_buf") or "")
+
+    if len(buf) >= MAX_NUM_DIGITS:
+        await callback.answer("Digit sudah maksimum.", show_alert=True)
+        return
+
+    ctx["num_buf"] = buf + digit
+    state["ctx"] = ctx
     await render_order(client, callback, state)
     await callback.answer()
 
 
-@bot.on_callback_query(filters.regex(r"^setkos_"))
-async def set_kos(client, callback):
+@bot.on_callback_query(filters.regex(rf"^{KOS_PREFIX}_back$"))
+async def kos_backspace_or_cancel(client, callback):
     state = ORDER_STATE.get(callback.message.id)
     if not await deny_if_locked(state, callback):
         return
+    if state.get("view") != VIEW_KOS_INPUT:
+        await callback.answer("Bukan halaman kos.", show_alert=True)
+        return
+
+    ctx = state.get("ctx", {}) or {}
+    buf = (ctx.get("num_buf") or "")
+    if buf:
+        ctx["num_buf"] = buf[:-1]
+        state["ctx"] = ctx
+        await render_order(client, callback, state)
+        await callback.answer("Padam 1 digit")
+        return
+
+    # kosong: cancel balik 1 halaman (undo langkah masuk keypad)
+    if pop_history_restore(state):
+        await render_order(client, callback, state)
+        await callback.answer("Kembali")
+    else:
+        await callback.answer("Tiada langkah untuk undur.", show_alert=True)
+
+
+@bot.on_callback_query(filters.regex(rf"^{KOS_PREFIX}_ok$"))
+async def kos_okey_set(client, callback):
+    state = ORDER_STATE.get(callback.message.id)
+    if not await deny_if_locked(state, callback):
+        return
+    if state.get("view") != VIEW_KOS_INPUT:
+        await callback.answer("Bukan halaman kos.", show_alert=True)
+        return
+
+    ctx = state.get("ctx", {}) or {}
+    buf = (ctx.get("num_buf") or "").strip()
+
+    if not buf:
+        await callback.answer("Sila masukkan nombor kos.", show_alert=True)
+        return
 
     try:
-        kos = int(callback.data.replace("setkos_", "", 1))
+        kos = int(buf)
     except Exception:
         await callback.answer("Kos tidak sah.", show_alert=True)
         return
@@ -1194,8 +1276,8 @@ async def set_kos(client, callback):
     prev_cost = state.get("ship_cost")
     push_history(
         state,
-        prev_view=VIEW_KOS_SELECT,
-        prev_ctx=state.get("ctx", {}) or {},
+        prev_view=VIEW_KOS_INPUT,
+        prev_ctx=dict(ctx),
         undo={"type": "set_ship_cost", "prev": prev_cost}
     )
 
@@ -1204,7 +1286,7 @@ async def set_kos(client, callback):
     state["view"] = VIEW_AFTER_COST
     state["ctx"] = {}
     await render_order(client, callback, state)
-    await callback.answer(f"Kos diset: {kos}")
+    await callback.answer("Kos diset ✅")
 
 
 # ====== LAST SUBMIT (LOCK) ======
@@ -1226,7 +1308,7 @@ async def last_submit(client, callback):
         await callback.answer("Destinasi belum dipilih.", show_alert=True)
         return
     if state.get("ship_cost") is None:
-        await callback.answer("Kos penghantaran belum dipilih.", show_alert=True)
+        await callback.answer("Kos transport belum dipilih.", show_alert=True)
         return
 
     # lock
@@ -1237,7 +1319,7 @@ async def last_submit(client, callback):
     state.setdefault("paid_by", None)
     state.setdefault("ocr_results", [])
 
-    # reset view/history supaya flow bersih (lepas lock, memang tiada BACK flow)
+    # reset view/history (lepas lock, memang tiada BACK flow)
     state["view"] = VIEW_AWAL
     state["ctx"] = {}
     state["history"] = []
