@@ -5,6 +5,7 @@ from difflib import SequenceMatcher
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError, MessageDeleteForbidden, ChatAdminRequired
+from pyrogram.types import InputMediaPhoto
 
 
 # ================= ENV =================
@@ -368,17 +369,13 @@ def calc_total(lines):
 
 
 def stylize_line_for_caption(line: str) -> str:
-    """
-    ✅ PERMINTAAN BARU:
-    - Untuk baris kos/transport: "Ipoh Perak" mesti gaya sama seperti "Lori kita hantar" (bold2).
-    - Yang lain jangan usik.
-    """
+    # baris kos/transport: tempat + jenis guna bold2, RM guna bold biasa
     if is_cost_or_transport_line(line):
         parts = _split_pipes(line)
         if len(parts) >= 3:
-            seg0 = bold2(parts[0])       # ✅ TEMPAT guna bold2 (sama macam transport)
-            seg1 = bold2(parts[1])       # jenis transport guna bold2
-            seg_last = bold(parts[-1])   # RMxxx kekal bold biasa
+            seg0 = bold2(parts[0])
+            seg1 = bold2(parts[1])
+            seg_last = bold(parts[-1])
             mid = []
             if len(parts) > 3:
                 for p in parts[2:-1]:
@@ -394,7 +391,6 @@ def build_caption(user_caption: str) -> str:
 
     detail_lines_raw = extract_lines(user_caption)
     detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
-
     total = calc_total(detail_lines)
 
     parts = []
@@ -413,15 +409,144 @@ def build_caption(user_caption: str) -> str:
     return cap
 
 
-# ================= HANDLER =================
+# =========================================================
+# ✅ NEW: RECEIPT REPLY -> PADAM & REPOST DALAM BENTUK ALBUM
+# =========================================================
+RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
+
+_pending_receipt_groups = {}   # key=(chat_id, media_group_id, reply_to_id) -> {"msgs":[Message], "task":Task}
+_pending_lock = asyncio.Lock()
+
+
+def is_reply_to_any_message(message) -> bool:
+    try:
+        return bool(message.reply_to_message and message.reply_to_message.id)
+    except:
+        return False
+
+
+async def _delete_message_safe(msg):
+    try:
+        await tg_call(msg.delete)
+    except (MessageDeleteForbidden, ChatAdminRequired):
+        pass
+    except:
+        pass
+
+
+async def _process_receipt_group(client: Client, chat_id: int, media_group_id: str, reply_to_id: int):
+    # tunggu sekejap supaya semua keping album sempat sampai
+    await asyncio.sleep(RECEIPT_DELAY_SEC)
+
+    async with _pending_lock:
+        key = (chat_id, media_group_id, reply_to_id)
+        data = _pending_receipt_groups.pop(key, None)
+
+    if not data:
+        return
+
+    msgs = data.get("msgs", [])
+    if not msgs:
+        return
+
+    # susun ikut message id (lebih stabil)
+    msgs = sorted(msgs, key=lambda m: m.id)
+
+    # ambil file_id
+    medias = []
+    for m in msgs:
+        if not m.photo:
+            continue
+        medias.append(InputMediaPhoto(media=m.photo.file_id))
+
+    if not medias:
+        # tetap padam asal jika ada
+        for m in msgs:
+            await _delete_message_safe(m)
+        return
+
+    # padam semua mesej asal (album user)
+    for m in msgs:
+        await _delete_message_safe(m)
+
+    # repost sebagai album, reply pada message asal yang user swipe kiri
+    try:
+        await tg_call(
+            client.send_media_group,
+            chat_id=chat_id,
+            media=medias,
+            reply_to_message_id=reply_to_id
+        )
+    except:
+        # fallback: kalau send_media_group fail, hantar satu-satu
+        for med in medias:
+            try:
+                await tg_call(
+                    client.send_photo,
+                    chat_id=chat_id,
+                    photo=med.media,
+                    reply_to_message_id=reply_to_id
+                )
+            except:
+                pass
+
+
+async def handle_receipt_photo(client: Client, message):
+    """
+    Bila user swipe kiri (reply) dan hantar gambar resit:
+    - padam semua
+    - repost album
+    """
+    chat_id = message.chat.id
+    reply_to_id = message.reply_to_message.id
+
+    # jika dia album
+    if message.media_group_id:
+        key = (chat_id, str(message.media_group_id), reply_to_id)
+
+        async with _pending_lock:
+            if key not in _pending_receipt_groups:
+                _pending_receipt_groups[key] = {"msgs": [], "task": None}
+                task = asyncio.create_task(_process_receipt_group(client, chat_id, str(message.media_group_id), reply_to_id))
+                _pending_receipt_groups[key]["task"] = task
+
+            _pending_receipt_groups[key]["msgs"].append(message)
+        return
+
+    # jika 1 keping sahaja (bukan album)
+    await _delete_message_safe(message)
+    try:
+        await tg_call(
+            client.send_photo,
+            chat_id=chat_id,
+            photo=message.photo.file_id,
+            reply_to_message_id=reply_to_id
+        )
+    except:
+        pass
+
+
+# ================= HANDLER (GABUNG) =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
+    """
+    PRIORITI:
+    1) Jika user swipe kiri (reply) + hantar resit => proses resit album (JANGAN ubah caption).
+    2) Kalau bukan reply => ini post produk biasa => bot format caption & repost.
+    """
+    # ✅ 1) receipt mode (reply)
+    if is_reply_to_any_message(message):
+        await handle_receipt_photo(client, message)
+        return
+
+    # ✅ 2) normal mode (repost caption kemas)
     chat_id = message.chat.id
     photo_id = message.photo.file_id
     user_caption = message.caption or ""
 
     new_caption = build_caption(user_caption)
 
+    # padam mesej asal
     try:
         await tg_call(message.delete)
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -429,6 +554,7 @@ async def handle_photo(client, message):
     except:
         pass
 
+    # repost versi kemas
     await tg_call(
         client.send_photo,
         chat_id=chat_id,
@@ -439,3 +565,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
