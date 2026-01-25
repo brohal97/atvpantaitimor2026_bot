@@ -2088,6 +2088,7 @@ async def handle_photo(client, message):
 
         "_lock": asyncio.Lock(),
         "_rebuild_task": None,
+        "_ui_task": None,
     }
 
 
