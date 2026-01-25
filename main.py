@@ -156,6 +156,43 @@ async def tg_call(fn, *args, **kwargs):
         except Exception:
             raise
 
+# ================= FAST ACK (elak "loading...") =================
+async def fast_ack(callback, text: str = "", alert: bool = False):
+    try:
+        # cache_time=0 supaya Telegram tak simpan jawapan lama
+        await callback.answer(text, show_alert=alert, cache_time=0)
+    except Exception:
+        pass
+
+
+# ================= DEBOUNCE UI RENDER (keypad digit) =================
+UI_DEBOUNCE_SECONDS = float(os.getenv("UI_DEBOUNCE_SECONDS", "0.35"))
+
+
+async def _render_after_delay(client: Client, msg, state: Dict[str, Any], delay: float):
+    try:
+        await asyncio.sleep(delay)
+        # state mungkin dah dibuang
+        if state not in ORDER_STATE.values():
+            return
+
+        dummy_cb = type(
+            "CB",
+            (),
+            {"message": msg, "answer": lambda *a, **k: None}
+        )()
+
+        await render_order(client, dummy_cb, state)
+    except Exception:
+        pass
+
+
+def schedule_ui_render(client: Client, msg, state: Dict[str, Any], delay: float = UI_DEBOUNCE_SECONDS):
+    task: Optional[asyncio.Task] = state.get("_ui_task")
+    if task and not task.done():
+        task.cancel()
+    state["_ui_task"] = asyncio.create_task(_render_after_delay(client, msg, state, delay))
+
 
 def unregister_state(state: Dict[str, Any]):
     """
@@ -201,7 +238,6 @@ def ensure_state_lock(state: Dict[str, Any]) -> asyncio.Lock:
     lk = asyncio.Lock()
     state["_lock"] = lk
     return lk
-
 
 # ================= TEXT STYLE =================
 BOLD_MAP = str.maketrans(
