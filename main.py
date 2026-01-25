@@ -1,4 +1,4 @@
-import os, re, asyncio
+import os, re, asyncio, time
 from datetime import datetime
 import pytz
 from difflib import SequenceMatcher
@@ -331,7 +331,6 @@ def normalize_detail_line(line: str) -> str:
     if len(parts) < 2:
         return line
 
-    # ===== segmen 1: produk/destinasi =====
     first = parts[0]
     best_name, score = best_product_match(first)
 
@@ -339,20 +338,17 @@ def normalize_detail_line(line: str) -> str:
         parts[0] = best_name
     else:
         if is_cost_or_transport_line(line):
-            parts[0] = place_title_case(first)  # tempat: huruf depan sahaja
+            parts[0] = place_title_case(first)
         else:
             parts[0] = first.upper()
 
-    # ===== segmen 2: jenis transport (untuk baris kos/destinasi) =====
     if len(parts) >= 3 and is_cost_or_transport_line(line):
         user_type = parts[1]
         best_t, tscore = best_transport_match(user_type)
         if best_t and tscore >= TRANSPORT_THRESHOLD:
             parts[1] = best_t
 
-    # ===== segmen last: RM =====
     parts[-1] = _normalize_rm_value(parts[-1])
-
     return _join_pipes(parts)
 
 
@@ -369,7 +365,6 @@ def calc_total(lines):
 
 
 def stylize_line_for_caption(line: str) -> str:
-    # baris kos/transport: tempat + jenis guna bold2, RM guna bold biasa
     if is_cost_or_transport_line(line):
         parts = _split_pipes(line)
         if len(parts) >= 3:
@@ -380,8 +375,7 @@ def stylize_line_for_caption(line: str) -> str:
             if len(parts) > 3:
                 for p in parts[2:-1]:
                     mid.append(bold(p))
-            out_parts = [seg0, seg1] + mid + [seg_last]
-            return " | ".join(out_parts)
+            return " | ".join([seg0, seg1] + mid + [seg_last])
 
     return bold(line)
 
@@ -396,10 +390,8 @@ def build_caption(user_caption: str) -> str:
     parts = []
     parts.append(stamp)
     parts.append("")
-
     for ln in detail_lines:
         parts.append(stylize_line_for_caption(ln))
-
     parts.append("")
     parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
 
@@ -410,11 +402,27 @@ def build_caption(user_caption: str) -> str:
 
 
 # =========================================================
-# ✅ NEW: RECEIPT REPLY -> PADAM & REPOST DALAM BENTUK ALBUM
+# ✅ STORE POST PRODUK BOT (supaya boleh gabung dgn resit)
+# =========================================================
+PRODUCT_TTL_SEC = float(os.getenv("PRODUCT_TTL_SEC", "86400"))  # 24 jam
+PRODUCT_POSTS = {}  # key=(chat_id, msg_id) -> {"photo": file_id, "caption": str, "ts": epoch}
+
+def _cleanup_product_posts():
+    now = time.time()
+    to_del = []
+    for k, v in PRODUCT_POSTS.items():
+        if now - float(v.get("ts", now)) > PRODUCT_TTL_SEC:
+            to_del.append(k)
+    for k in to_del:
+        PRODUCT_POSTS.pop(k, None)
+
+
+# =========================================================
+# ✅ RECEIPT REPLY -> PADAM & REPOST ALBUM BERSAMA PRODUK
 # =========================================================
 RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
 
-_pending_receipt_groups = {}   # key=(chat_id, media_group_id, reply_to_id) -> {"msgs":[Message], "task":Task}
+_pending_receipt_groups = {}  # key=(chat_id, media_group_id, reply_to_id) -> {"msgs":[Message], "task":Task}
 _pending_lock = asyncio.Lock()
 
 
@@ -434,8 +442,59 @@ async def _delete_message_safe(msg):
         pass
 
 
+async def _repost_album_with_product(client: Client, chat_id: int, reply_to_id: int, receipt_file_ids: list):
+    """
+    Padam post produk bot + padam resit, kemudian hantar album:
+    [produk (dengan caption)] + [resit-resit]
+    """
+    _cleanup_product_posts()
+    prod = PRODUCT_POSTS.get((chat_id, reply_to_id))
+    if not prod:
+        return False
+
+    prod_photo = prod["photo"]
+    prod_caption = prod.get("caption", "")
+
+    media = [InputMediaPhoto(media=prod_photo, caption=prod_caption)]
+    for fid in receipt_file_ids:
+        media.append(InputMediaPhoto(media=fid))
+
+    # Telegram limit media_group = 10 item
+    # Kalau resit banyak, dia akan hantar batch 10-10 (produk batch pertama sahaja).
+    chunks = []
+    cur = []
+    for m in media:
+        cur.append(m)
+        if len(cur) == 10:
+            chunks.append(cur)
+            cur = []
+    if cur:
+        chunks.append(cur)
+
+    # padam post produk bot dulu
+    try:
+        await tg_call(client.delete_messages, chat_id, reply_to_id)
+    except:
+        pass
+
+    # send batch pertama (ada produk+caption)
+    ok = True
+    for idx, ch in enumerate(chunks):
+        try:
+            await tg_call(client.send_media_group, chat_id=chat_id, media=ch)
+        except:
+            ok = False
+            break
+
+        # batch seterusnya: jangan ulang caption (kalau ada)
+        if idx == 0 and len(chunks) > 1:
+            # buang caption pada first media untuk batch seterusnya (safety)
+            pass
+
+    return ok
+
+
 async def _process_receipt_group(client: Client, chat_id: int, media_group_id: str, reply_to_id: int):
-    # tunggu sekejap supaya semua keping album sempat sampai
     await asyncio.sleep(RECEIPT_DELAY_SEC)
 
     async with _pending_lock:
@@ -445,83 +504,58 @@ async def _process_receipt_group(client: Client, chat_id: int, media_group_id: s
     if not data:
         return
 
-    msgs = data.get("msgs", [])
-    if not msgs:
-        return
+    msgs = sorted(data.get("msgs", []), key=lambda m: m.id)
+    receipt_file_ids = [m.photo.file_id for m in msgs if m.photo]
 
-    # susun ikut message id (lebih stabil)
-    msgs = sorted(msgs, key=lambda m: m.id)
-
-    # ambil file_id
-    medias = []
-    for m in msgs:
-        if not m.photo:
-            continue
-        medias.append(InputMediaPhoto(media=m.photo.file_id))
-
-    if not medias:
-        # tetap padam asal jika ada
-        for m in msgs:
-            await _delete_message_safe(m)
-        return
-
-    # padam semua mesej asal (album user)
+    # padam semua mesej resit user
     for m in msgs:
         await _delete_message_safe(m)
 
-    # repost sebagai album, reply pada message asal yang user swipe kiri
+    if not receipt_file_ids:
+        return
+
+    # cuba gabung bersama produk (kalau reply pada post produk bot)
+    merged = await _repost_album_with_product(client, chat_id, reply_to_id, receipt_file_ids)
+    if merged:
+        return
+
+    # fallback (kalau bukan reply pada post produk bot): repost resit sahaja sebagai album reply
     try:
-        await tg_call(
-            client.send_media_group,
-            chat_id=chat_id,
-            media=medias,
-            reply_to_message_id=reply_to_id
-        )
+        medias = [InputMediaPhoto(media=fid) for fid in receipt_file_ids]
+        await tg_call(client.send_media_group, chat_id=chat_id, media=medias, reply_to_message_id=reply_to_id)
     except:
-        # fallback: kalau send_media_group fail, hantar satu-satu
-        for med in medias:
-            try:
-                await tg_call(
-                    client.send_photo,
-                    chat_id=chat_id,
-                    photo=med.media,
-                    reply_to_message_id=reply_to_id
-                )
-            except:
-                pass
+        pass
 
 
 async def handle_receipt_photo(client: Client, message):
-    """
-    Bila user swipe kiri (reply) dan hantar gambar resit:
-    - padam semua
-    - repost album
-    """
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
 
-    # jika dia album
+    # album
     if message.media_group_id:
         key = (chat_id, str(message.media_group_id), reply_to_id)
-
         async with _pending_lock:
             if key not in _pending_receipt_groups:
                 _pending_receipt_groups[key] = {"msgs": [], "task": None}
-                task = asyncio.create_task(_process_receipt_group(client, chat_id, str(message.media_group_id), reply_to_id))
-                _pending_receipt_groups[key]["task"] = task
-
+                _pending_receipt_groups[key]["task"] = asyncio.create_task(
+                    _process_receipt_group(client, chat_id, str(message.media_group_id), reply_to_id)
+                )
             _pending_receipt_groups[key]["msgs"].append(message)
         return
 
-    # jika 1 keping sahaja (bukan album)
+    # single photo resit
+    receipt_fid = message.photo.file_id if message.photo else None
     await _delete_message_safe(message)
+    if not receipt_fid:
+        return
+
+    merged = await _repost_album_with_product(client, chat_id, reply_to_id, [receipt_fid])
+    if merged:
+        return
+
+    # fallback: repost single resit reply
     try:
-        await tg_call(
-            client.send_photo,
-            chat_id=chat_id,
-            photo=message.photo.file_id,
-            reply_to_message_id=reply_to_id
-        )
+        await tg_call(client.send_photo, chat_id=chat_id, photo=receipt_fid, reply_to_message_id=reply_to_id)
     except:
         pass
 
@@ -530,23 +564,22 @@ async def handle_receipt_photo(client: Client, message):
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
     """
-    PRIORITI:
-    1) Jika user swipe kiri (reply) + hantar resit => proses resit album (JANGAN ubah caption).
-    2) Kalau bukan reply => ini post produk biasa => bot format caption & repost.
+    1) Jika user reply (swipe kiri) dan hantar resit => padam semua & repost album bersama produk (jika reply pada post bot).
+    2) Kalau bukan reply => post produk biasa => bot format caption & repost.
     """
-    # ✅ 1) receipt mode (reply)
+    # ✅ receipt mode (reply)
     if is_reply_to_any_message(message):
         await handle_receipt_photo(client, message)
         return
 
-    # ✅ 2) normal mode (repost caption kemas)
+    # ✅ normal mode (repost caption kemas)
     chat_id = message.chat.id
     photo_id = message.photo.file_id
     user_caption = message.caption or ""
 
     new_caption = build_caption(user_caption)
 
-    # padam mesej asal
+    # padam mesej asal (user)
     try:
         await tg_call(message.delete)
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -554,13 +587,25 @@ async def handle_photo(client, message):
     except:
         pass
 
-    # repost versi kemas
-    await tg_call(
+    # repost versi kemas (bot) + SIMPAN untuk gabung resit nanti
+    sent = await tg_call(
         client.send_photo,
         chat_id=chat_id,
         photo=photo_id,
         caption=new_caption
     )
+
+    # simpan info post bot
+    try:
+        if sent and sent.photo:
+            PRODUCT_POSTS[(chat_id, sent.id)] = {
+                "photo": sent.photo.file_id,
+                "caption": sent.caption or new_caption,
+                "ts": time.time()
+            }
+            _cleanup_product_posts()
+    except:
+        pass
 
 
 if __name__ == "__main__":
