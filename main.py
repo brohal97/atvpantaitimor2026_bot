@@ -59,19 +59,6 @@ def make_stamp() -> str:
     return f"{hari} | {tarikh} | {jam}"
 
 
-def is_separator_line(ln: str) -> bool:
-    """
-    Buang line yang user taip seperti:
-    -----
-    _____
-    ─────
-    """
-    s = (ln or "").strip()
-    if not s:
-        return True
-    return bool(re.match(r"^[\s\-_─—=]{3,}$", s))
-
-
 def extract_lines(text: str):
     lines = []
     for ln in (text or "").splitlines():
@@ -81,99 +68,67 @@ def extract_lines(text: str):
         # buang baris total lama kalau ada
         if re.search(r"\btotal\b", ln, flags=re.IGNORECASE):
             continue
-        # buang separator yang user buat sendiri
-        if is_separator_line(ln):
-            continue
         lines.append(ln)
     return lines
 
 
 def _normalize_rm_value(val: str) -> str:
     """
-    Pastikan nilai akhir format RM<angka> (RM huruf besar).
+    Jadikan nilai akhir sentiasa format: RM<angka>
     - "200" -> "RM200"
     - "rm200" / "Rm 200" -> "RM200"
     - "RM200" -> "RM200"
+    Jika tak jumpa nombor, pulangkan asal.
     """
     s = (val or "").strip()
     if not s:
         return s
 
-    m = re.search(r"(?i)\brm\s*([0-9]{1,12})\b", s)
-    if m:
-        return f"RM{m.group(1)}"
+    # cari nombor pertama (support koma/spasi)
+    m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
+    if not m:
+        # kalau user tulis macam "rm 300." atau ada simbol pelik, cuba cari digits sahaja
+        m2 = re.search(r"([0-9]{1,12})", s)
+        if not m2:
+            return s
+        num = m2.group(1)
+        return f"RM{num}"
 
-    m2 = re.search(r"\b([0-9]{1,12})\b", s)
-    if m2:
-        return f"RM{m2.group(1)}"
-
-    return s
+    num = m.group(1)
+    return f"RM{num}"
 
 
 def normalize_detail_line(line: str) -> str:
     """
-    - Segmen pertama (nama produk) -> UPPERCASE
-    - Segmen terakhir -> auto RM huruf besar + auto tambah RM jika user lupa
+    Rules:
+    1) Segmen pertama (nama produk/destinasi) -> UPPERCASE (ikut request: untuk nama produk sahaja,
+       tetapi kita apply pada segmen pertama jika format ada '|', sebab user minta auto huruf besar di situ)
+    2) Segmen terakhir -> pastikan bermula 'RM' uppercase, auto tambah jika user lupa.
+    Contoh:
+      "125cc full spec | 2 | 200"   -> "125CC FULL SPEC | 2 | RM200"
+      "125cc full spec | 2 | rm200" -> "125CC FULL SPEC | 2 | RM200"
+      "Ipoh Perak | Transport luar | rm300" -> "IPOH PERAK | Transport luar | RM300"
     """
     if "|" not in line:
-        return line.strip()
+        return line
 
     parts = [p.strip() for p in line.split("|")]
     if len(parts) < 2:
-        return line.strip()
+        return line
 
-    # segmen pertama uppercase (nama produk / tempat)
+    # segmen pertama: uppercase
     parts[0] = parts[0].upper()
 
-    # segmen terakhir normalize RM
+    # segmen terakhir: normalize RM
     parts[-1] = _normalize_rm_value(parts[-1])
 
     return " | ".join(parts)
 
 
-def is_transport_line(line: str) -> bool:
-    """
-    Kesan baris transport:
-    contoh: "IPOH PERAK | Transport luar | RM300"
-    """
-    if "|" not in line:
-        return False
-    parts = [p.strip() for p in line.split("|")]
-    if len(parts) < 3:
-        return False
-    return bool(re.search(r"transport", parts[1], flags=re.IGNORECASE))
-
-
-def make_separator_for_transport(line: str) -> str:
-    """
-    ✅ Garisan berhujung pada nilai RM dalam baris transport.
-    Contoh: "IPOH PERAK | Transport luar | RM300"
-    Garisan panjang = sampai hujung "RM300" sahaja.
-    """
-    # kemaskan spacing dulu supaya ukuran stabil
-    clean = re.sub(r"\s+", " ", (line or "").strip())
-    clean = re.sub(r"\s*\|\s*", " | ", clean).strip()
-
-    # ambil substring sampai hujung RMxxxx
-    m = re.search(r"\bRM\s*[0-9]{1,12}\b", clean, flags=re.IGNORECASE)
-    if m:
-        clean = clean[:m.end()].strip()
-
-    # clamp (supaya tak jadi pelik)
-    MIN_SEP = int(os.getenv("MIN_SEP_LEN", "12"))
-    MAX_SEP = int(os.getenv("MAX_SEP_LEN", "45"))  # ✅ kecilkan default max
-    n = len(clean)
-    if n < MIN_SEP:
-        n = MIN_SEP
-    if n > MAX_SEP:
-        n = MAX_SEP
-
-    return "─" * n
-
-
 def calc_total(lines):
     total = 0
     for ln in lines:
+        # kira semua nombor selepas RM (case-insensitive)
         nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", ln)
         for n in nums:
             try:
@@ -186,35 +141,27 @@ def calc_total(lines):
 def build_caption(user_caption: str) -> str:
     stamp = bold(make_stamp())
 
-    raw_lines = extract_lines(user_caption)
-    detail_lines = [normalize_detail_line(x) for x in raw_lines]
-    total = calc_total(detail_lines)
+    detail_lines_raw = extract_lines(user_caption)
+    # normalize dulu (supaya total kira betul walaupun user tak tulis RM)
+    detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
 
-    # cari baris transport terakhir (kalau ada)
-    transport_idx = None
-    transport_line = None
-    for i, ln in enumerate(detail_lines):
-        if is_transport_line(ln):
-            transport_idx = i
-            transport_line = ln
+    total = calc_total(detail_lines)
 
     parts = []
     parts.append(stamp)
     parts.append("")  # perenggan kosong
 
-    for i, ln in enumerate(detail_lines):
-        # sebelum baris transport, letak 1 separator sahaja (ikut hujung RM)
-        if transport_idx is not None and i == transport_idx and transport_line:
-            parts.append(make_separator_for_transport(transport_line))
-
+    for ln in detail_lines:
         parts.append(bold(ln))
 
     parts.append("")  # perenggan kosong
     parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
 
     cap = "\n".join(parts)
+
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
+
     return cap
 
 
@@ -246,3 +193,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
