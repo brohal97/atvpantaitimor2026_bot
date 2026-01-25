@@ -1,16 +1,21 @@
 # =========================
-# ATV PANTAI TIMOR BOT
+# ATV PANTAI TIMOR BOT (VERSI KEMAS & STABIL)
 # - Repost gambar produk + caption auto kemas
 # - Nama tempat: Title Case (huruf depan besar)
 # - TEMPAT + JENIS TRANSPORT guna bold2
 # - Harga TIDAK didarab kuantiti (total = jumlah semua RM pada baris)
-# - Jika user lupa isi (atau caption kosong), auto isi ❓ pada segment yang kosong
+# - Auto ❓ jika user lupa isi segmen (produk / penghantaran)
 # - Jika caption kosong: auto buat 2 baris:
 #     ❓ | ❓ | ❓   (produk)
 #     ❓ | ❓ | ❓   (penghantaran)
-# - Jika user swipe kiri (reply) & hantar resit:
+# - Jika user reply (swipe kiri) & hantar resit:
 #   bot padam resit asal + padam album lama, repost semula sebagai album
 #   [produk+caption] + [semua resit terkumpul] (repeatable)
+#
+# ✅ FIX TERBARU:
+# - Jika user taip penghantaran tanpa tempat: "transport luar 350"
+#   output WAJIB: "❓ | Transport luar | RM350"
+#   (bukan "Transport luar | ❓ | RM350")
 # =========================
 
 import os, re, asyncio, time
@@ -228,9 +233,7 @@ def place_title_case(s: str) -> str:
 # ================= DETECT TRANSPORT-LIKE =================
 def is_transport_like_parts(parts) -> bool:
     """
-    Anggap baris penghantaran jika:
-    - segmen 2 match jenis transport (walau kos ❓)
-    selain itu, produk.
+    Baris penghantaran jika segmen-2 match jenis transport (walau kos ❓).
     """
     if not parts or len(parts) < 2:
         return False
@@ -278,6 +281,9 @@ def _best_transport_suffix(words):
 
 
 def _try_parse_cost_no_pipes(line: str):
+    """
+    Accept: "ipoh perak lori kita hantar 350" => "ipoh perak | lori kita hantar | RM350"
+    """
     head, money = _extract_tail_money(line)
     if not money:
         return None
@@ -305,25 +311,44 @@ def auto_insert_pipes_if_missing(line: str) -> str:
     if ("|" in s) or ("｜" in s):
         return s
 
-    # produk lengkap (mesti ada qty)
+    # 1) produk lengkap (mesti ada qty)
     as_product = _try_parse_product_no_pipes_strict(s)
     if as_product:
         return as_product
 
-    # penghantaran lengkap (dest + type + kos)
+    # 2) penghantaran lengkap (dest + type + kos)
     as_cost = _try_parse_cost_no_pipes(s)
     if as_cost:
         return as_cost
 
-    # fallback separa: ada harga di hujung
+    # 3) fallback separa: ada harga di hujung
     head, money = _extract_tail_money(s)
     if money:
         head = head.strip()
+
+        # ✅ FIX: jika head itu sendiri match jenis transport (contoh "transport luar 350")
+        best_t, tscore = best_transport_match(head)
+        if best_t and tscore >= TRANSPORT_THRESHOLD:
+            return f"❓ | {best_t} | {money}"
+
+        # ✅ FIX: jika head mengandungi "dest + transport" tapi dest kosong (jarang),
+        # cuba detect suffix transport dan bila dest kosong => letak ❓
+        words = [w for w in re.split(r"\s+", head) if w]
+        if words:
+            tname, score, cut = _best_transport_suffix(words)
+            if tname and score >= TRANSPORT_THRESHOLD:
+                dest = " ".join(words[:cut]).strip()
+                if not dest:
+                    return f"❓ | {tname} | {money}"
+                # kalau dest ada, sebenarnya patut masuk _try_parse_cost_no_pipes, tapi kita cover safety:
+                return f"{dest} | {tname} | {money}"
+
+        # default: treat as "seg1 | ❓ | money"
         if not head:
             return f"❓ | ❓ | {money}"
         return f"{head} | ❓ | {money}"
 
-    # tiada nombor pun
+    # 4) tiada nombor pun
     return f"{s} | ❓ | ❓"
 
 
@@ -348,10 +373,9 @@ def normalize_detail_line(line: str) -> str:
     raw_parts = _split_pipes(line)
     parts = fill_missing_segments(raw_parts, 3)
 
-    # detect transport hanya jika segmen2 match transport
     transport_like = is_transport_like_parts(parts)
 
-    # seg1: produk/destinasi
+    # seg1
     if transport_like:
         if parts[0] != "❓":
             parts[0] = place_title_case(parts[0])
@@ -363,13 +387,13 @@ def normalize_detail_line(line: str) -> str:
             else:
                 parts[0] = parts[0].upper()
 
-    # seg2: type transport (jika ada)
+    # seg2
     if transport_like and parts[1] != "❓":
         best_t, tscore = best_transport_match(parts[1])
         if best_t and tscore >= TRANSPORT_THRESHOLD:
             parts[1] = best_t
 
-    # seg3: RM
+    # seg3
     if parts[2] != "❓":
         parts[2] = _normalize_rm_value(parts[2])
 
@@ -409,8 +433,7 @@ def build_caption(user_caption: str) -> str:
     detail_lines_raw = extract_lines(user_caption)
     detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
 
-    # ✅ kalau user hantar gambar sahaja (caption kosong)
-    # wajib keluar 2 baris: produk + penghantaran
+    # ✅ jika caption kosong, paksa 2 baris: produk + penghantaran
     if not detail_lines:
         detail_lines = [
             "❓ | ❓ | ❓",  # produk
@@ -422,7 +445,6 @@ def build_caption(user_caption: str) -> str:
     parts = [stamp, ""]
     for idx, ln in enumerate(detail_lines):
         if not user_caption.strip() and idx == 1:
-            # baris kedua placeholder: paksa gaya penghantaran (bold2)
             parts.append(stylize_line_for_caption(ln, force_transport=True))
         else:
             parts.append(stylize_line_for_caption(ln))
@@ -441,11 +463,8 @@ def build_caption(user_caption: str) -> str:
 STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))  # 24 jam
 RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
 
-# (chat_id, root_id) -> {"product_file_id","caption","receipts","msg_ids","ts"}
-ORDER_STATES = {}
-# (chat_id, msg_id) -> (chat_id, root_id)
-MSGID_TO_STATE = {}
-
+ORDER_STATES = {}   # (chat_id, root_id) -> state
+MSGID_TO_STATE = {} # (chat_id, msg_id) -> (chat_id, root_id)
 _state_lock = asyncio.Lock()
 
 def _cleanup_states():
@@ -485,7 +504,6 @@ async def _send_album_and_update_state(client: Client, chat_id: int, state_id, p
     for fid in receipts:
         media.append(InputMediaPhoto(media=fid))
 
-    # chunk max 10
     chunks, cur = [], []
     for m in media:
         cur.append(m)
@@ -497,13 +515,11 @@ async def _send_album_and_update_state(client: Client, chat_id: int, state_id, p
 
     sent_msg_ids = []
     for idx, ch in enumerate(chunks):
-        # caption hanya pada first chunk
         if idx > 0:
             try:
                 ch[0].caption = None
             except:
                 pass
-
         res = await tg_call(client.send_media_group, chat_id=chat_id, media=ch)
         try:
             for m in res:
@@ -585,7 +601,6 @@ async def _process_receipt_group(client: Client, chat_id: int, media_group_id: s
     msgs = sorted(data.get("msgs", []), key=lambda m: m.id)
     receipt_file_ids = [m.photo.file_id for m in msgs if m.photo]
 
-    # padam semua mesej resit user
     for m in msgs:
         await _delete_message_safe(m)
 
@@ -687,6 +702,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
-
-
