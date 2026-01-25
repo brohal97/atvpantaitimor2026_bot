@@ -59,6 +59,19 @@ def make_stamp() -> str:
     return f"{hari} | {tarikh} | {jam}"
 
 
+def is_separator_line(ln: str) -> bool:
+    """
+    Buang line yang user taip seperti:
+    -----
+    _____
+    ─────
+    """
+    s = (ln or "").strip()
+    if not s:
+        return True
+    return bool(re.match(r"^[\s\-_─—=]{3,}$", s))
+
+
 def extract_lines(text: str):
     lines = []
     for ln in (text or "").splitlines():
@@ -67,6 +80,9 @@ def extract_lines(text: str):
             continue
         # buang baris total lama kalau ada
         if re.search(r"\btotal\b", ln, flags=re.IGNORECASE):
+            continue
+        # buang separator yang user buat sendiri
+        if is_separator_line(ln):
             continue
         lines.append(ln)
     return lines
@@ -83,14 +99,15 @@ def _normalize_rm_value(val: str) -> str:
     if not s:
         return s
 
-    m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
-    if not m:
-        m2 = re.search(r"([0-9]{1,12})", s)
-        if not m2:
-            return s
+    m = re.search(r"(?i)\brm\s*([0-9]{1,12})\b", s)
+    if m:
+        return f"RM{m.group(1)}"
+
+    m2 = re.search(r"\b([0-9]{1,12})\b", s)
+    if m2:
         return f"RM{m2.group(1)}"
 
-    return f"RM{m.group(1)}"
+    return s
 
 
 def normalize_detail_line(line: str) -> str:
@@ -99,13 +116,13 @@ def normalize_detail_line(line: str) -> str:
     - Segmen terakhir -> auto RM huruf besar + auto tambah RM jika user lupa
     """
     if "|" not in line:
-        return line
+        return line.strip()
 
     parts = [p.strip() for p in line.split("|")]
     if len(parts) < 2:
-        return line
+        return line.strip()
 
-    # segmen pertama uppercase
+    # segmen pertama uppercase (nama produk / tempat)
     parts[0] = parts[0].upper()
 
     # segmen terakhir normalize RM
@@ -118,28 +135,34 @@ def is_transport_line(line: str) -> bool:
     """
     Kesan baris transport:
     contoh: "IPOH PERAK | Transport luar | RM300"
-    Kita check segmen tengah ada perkataan 'transport'
     """
     if "|" not in line:
         return False
     parts = [p.strip() for p in line.split("|")]
     if len(parts) < 3:
         return False
-    mid = parts[1]
-    return bool(re.search(r"transport", mid, flags=re.IGNORECASE))
+    return bool(re.search(r"transport", parts[1], flags=re.IGNORECASE))
 
 
-def make_separator_for_line(line: str) -> str:
+def make_separator_for_transport(line: str) -> str:
     """
-    Buat garisan sama panjang dengan line transport (ikut hujung RMxxx).
-    Nota: Telegram font bukan monospaced 100%, tapi biasanya nampak kemas.
+    ✅ Garisan berhujung pada nilai RM dalam baris transport.
+    Contoh: "IPOH PERAK | Transport luar | RM300"
+    Garisan panjang = sampai hujung "RM300" sahaja.
     """
-    # Clamp supaya tak jadi terlalu panjang / pendek kalau user buat line pelik
+    # kemaskan spacing dulu supaya ukuran stabil
+    clean = re.sub(r"\s+", " ", (line or "").strip())
+    clean = re.sub(r"\s*\|\s*", " | ", clean).strip()
+
+    # ambil substring sampai hujung RMxxxx
+    m = re.search(r"\bRM\s*[0-9]{1,12}\b", clean, flags=re.IGNORECASE)
+    if m:
+        clean = clean[:m.end()].strip()
+
+    # clamp (supaya tak jadi pelik)
     MIN_SEP = int(os.getenv("MIN_SEP_LEN", "12"))
-    MAX_SEP = int(os.getenv("MAX_SEP_LEN", "80"))
-
-    ln = (line or "").strip()
-    n = len(ln)
+    MAX_SEP = int(os.getenv("MAX_SEP_LEN", "45"))  # ✅ kecilkan default max
+    n = len(clean)
     if n < MIN_SEP:
         n = MIN_SEP
     if n > MAX_SEP:
@@ -164,24 +187,25 @@ def build_caption(user_caption: str) -> str:
     stamp = bold(make_stamp())
 
     raw_lines = extract_lines(user_caption)
-    # normalize dulu supaya RM auto masuk & uppercase product
     detail_lines = [normalize_detail_line(x) for x in raw_lines]
     total = calc_total(detail_lines)
 
     # cari baris transport terakhir (kalau ada)
     transport_idx = None
+    transport_line = None
     for i, ln in enumerate(detail_lines):
         if is_transport_line(ln):
             transport_idx = i
+            transport_line = ln
 
     parts = []
     parts.append(stamp)
     parts.append("")  # perenggan kosong
 
     for i, ln in enumerate(detail_lines):
-        # sebelum baris transport, letak separator auto panjang sama hujung RM
-        if transport_idx is not None and i == transport_idx:
-            parts.append(make_separator_for_line(ln))
+        # sebelum baris transport, letak 1 separator sahaja (ikut hujung RM)
+        if transport_idx is not None and i == transport_idx and transport_line:
+            parts.append(make_separator_for_transport(transport_line))
 
         parts.append(bold(ln))
 
@@ -189,10 +213,8 @@ def build_caption(user_caption: str) -> str:
     parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
 
     cap = "\n".join(parts)
-
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
-
     return cap
 
 
