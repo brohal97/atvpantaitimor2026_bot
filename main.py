@@ -101,13 +101,8 @@ def _normalize_rm_value(val: str) -> str:
 def normalize_detail_line(line: str) -> str:
     """
     Rules:
-    1) Segmen pertama (nama produk/destinasi) -> UPPERCASE (ikut request: untuk nama produk sahaja,
-       tetapi kita apply pada segmen pertama jika format ada '|', sebab user minta auto huruf besar di situ)
+    1) Segmen pertama (nama produk/destinasi) -> UPPERCASE
     2) Segmen terakhir -> pastikan bermula 'RM' uppercase, auto tambah jika user lupa.
-    Contoh:
-      "125cc full spec | 2 | 200"   -> "125CC FULL SPEC | 2 | RM200"
-      "125cc full spec | 2 | rm200" -> "125CC FULL SPEC | 2 | RM200"
-      "Ipoh Perak | Transport luar | rm300" -> "IPOH PERAK | Transport luar | RM300"
     """
     if "|" not in line:
         return line
@@ -123,6 +118,19 @@ def normalize_detail_line(line: str) -> str:
     parts[-1] = _normalize_rm_value(parts[-1])
 
     return " | ".join(parts)
+
+
+# ✅ TAMBAHAN SAHAJA: kesan baris transport + separator 10 dash
+SEP_10_DASH = "-" * 10
+
+def is_transport_line(line: str) -> bool:
+    # Kesan baris seperti: "IPOH PERAK | Transport luar | RM300"
+    if "|" not in (line or ""):
+        return False
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) < 3:
+        return False
+    return bool(re.search(r"\btransport\b", parts[1], flags=re.IGNORECASE))
 
 
 def calc_total(lines):
@@ -151,7 +159,13 @@ def build_caption(user_caption: str) -> str:
     parts.append(stamp)
     parts.append("")  # perenggan kosong
 
+    inserted_sep = False
     for ln in detail_lines:
+        # ✅ TAMBAHAN SAHAJA: auto letak 10 dash sebelum baris transport (sekali sahaja)
+        if (not inserted_sep) and is_transport_line(ln):
+            parts.append(SEP_10_DASH)
+            inserted_sep = True
+
         parts.append(bold(ln))
 
     parts.append("")  # perenggan kosong
@@ -193,4 +207,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
