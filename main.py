@@ -1605,7 +1605,7 @@ async def do_payment_settle_after_pin(client: Client, callback, state: Dict[str,
         await callback.answer("Tiada resit. Sila upload resit dulu.", show_alert=True)
         return
 
-    await callback.answer("Proses OCR semua resit & settle...")
+    await fast_ack(callback, "Proses OCR semua resit & settle...")
 
     tz = pytz.timezone("Asia/Kuala_Lumpur")
     now = datetime.now(tz)
