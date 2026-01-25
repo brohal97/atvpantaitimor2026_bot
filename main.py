@@ -39,7 +39,7 @@ def bold(text: str) -> str:
     return (text or "").translate(BOLD_MAP)
 
 
-# ================= BOLD STYLE 2 (KHAS UNTUK JENIS TRANSPORT) =================
+# ================= BOLD STYLE 2 (KHAS UNTUK TEMPAT + JENIS TRANSPORT) =================
 ALT_BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
@@ -217,14 +217,9 @@ def _cap_word(w: str) -> str:
     return w.lower().capitalize()
 
 def place_title_case(s: str) -> str:
-    """
-    "IPOH PERAK" -> "Ipoh Perak"
-    "yan kedah TS 50" -> "Yan Kedah TS 50"
-    """
     s = (s or "").strip()
     if not s:
         return s
-    # pecah ikut space, tapi kekalkan '-' dalam token
     tokens = [t for t in re.split(r"\s+", s) if t]
     out = []
     for t in tokens:
@@ -340,14 +335,11 @@ def normalize_detail_line(line: str) -> str:
     best_name, score = best_product_match(first)
 
     if best_name and score >= FUZZY_THRESHOLD:
-        # ✅ PRODUK: guna nama rasmi (jangan usik)
         parts[0] = best_name
     else:
-        # ✅ NAMA TEMPAT SAHAJA: huruf depan sahaja (Title Case) jika ini baris kos/transport
         if is_cost_or_transport_line(line):
-            parts[0] = place_title_case(first)
+            parts[0] = place_title_case(first)  # tempat: huruf depan sahaja
         else:
-            # selain tempat (kalau ada), kekalkan uppercase seperti biasa
             parts[0] = first.upper()
 
     # ===== segmen 2: jenis transport (untuk baris kos/destinasi) =====
@@ -377,16 +369,16 @@ def calc_total(lines):
 
 def stylize_line_for_caption(line: str) -> str:
     """
-    - Produk: gaya bold biasa (𝗔𝗕𝗖...)
-    - Kos/transport: segmen ke-2 (jenis transport) guna bold2 (𝐀𝐁𝐂...),
-      segmen lain kekal bold biasa.
+    ✅ PERMINTAAN BARU:
+    - Untuk baris kos/transport: "Ipoh Perak" mesti gaya sama seperti "Lori kita hantar" (bold2).
+    - Yang lain jangan usik.
     """
     if is_cost_or_transport_line(line):
         parts = _split_pipes(line)
         if len(parts) >= 3:
-            seg0 = bold(parts[0])        # nama tempat (Title Case)
-            seg1 = bold2(parts[1])       # jenis transport (style lain)
-            seg_last = bold(parts[-1])   # RMxxx
+            seg0 = bold2(parts[0])       # ✅ TEMPAT guna bold2 (sama macam transport)
+            seg1 = bold2(parts[1])       # jenis transport guna bold2
+            seg_last = bold(parts[-1])   # RMxxx kekal bold biasa
             mid = []
             if len(parts) > 3:
                 for p in parts[2:-1]:
