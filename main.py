@@ -1,6 +1,7 @@
 import os, re, asyncio
 from datetime import datetime
 import pytz
+from difflib import SequenceMatcher
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError, MessageDeleteForbidden, ChatAdminRequired
@@ -50,6 +51,58 @@ async def tg_call(fn, *args, **kwargs):
             await asyncio.sleep(0.2)
 
 
+# ================= PRODUCT FIXED NAMES =================
+PRODUCT_NAMES = [
+    "125CC FULL SPEC",
+    "125CC BIG BODY",
+    "YAMA SPORT",
+    "GY6 200CC",
+    "HAMMER ARMOUR",
+    "BIG HAMMER",
+    "TROLI PLASTIK",
+    "TROLI BESI",
+]
+
+# threshold untuk auto-betulkan (boleh ubah jika perlu)
+FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.72"))  # 0.0 - 1.0
+
+
+def _norm_key(s: str) -> str:
+    """
+    Normalisasi untuk fuzzy match:
+    - uppercase
+    - buang simbol
+    - rapatkan spaces
+    """
+    s = (s or "").upper()
+    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+PRODUCT_KEYS = {name: _norm_key(name) for name in PRODUCT_NAMES}
+
+
+def best_product_match(user_first_segment: str):
+    """
+    Cari nama produk paling hampir.
+    Return: (best_name, score)
+    """
+    u = _norm_key(user_first_segment)
+    if not u:
+        return None, 0.0
+
+    best_name = None
+    best_score = 0.0
+    for name, key in PRODUCT_KEYS.items():
+        score = SequenceMatcher(None, u, key).ratio()
+        if score > best_score:
+            best_score = score
+            best_name = name
+
+    return best_name, best_score
+
+
 # ================= CORE LOGIC =================
 def make_stamp() -> str:
     now = datetime.now(TZ)
@@ -84,7 +137,6 @@ def _normalize_rm_value(val: str) -> str:
     if not s:
         return s
 
-    # cari nombor pertama
     m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
     if not m:
         m2 = re.search(r"([0-9]{1,12})", s)
@@ -97,44 +149,9 @@ def _normalize_rm_value(val: str) -> str:
     return f"RM{num}"
 
 
-def normalize_detail_line(line: str) -> str:
-    """
-    Rules:
-    1) Segmen pertama (nama produk/destinasi) -> UPPERCASE
-    2) Segmen terakhir -> pastikan bermula 'RM' uppercase, auto tambah jika user lupa.
-    """
-    if "|" not in line:
-        return line
+# ✅ separator: 10 line chars (lebih stabil dari '-' biasa)
+SEP_10 = "──────────"
 
-    parts = [p.strip() for p in line.split("|")]
-    if len(parts) < 2:
-        return line
-
-    # segmen pertama: uppercase
-    parts[0] = parts[0].upper()
-
-    # segmen terakhir: normalize RM
-    parts[-1] = _normalize_rm_value(parts[-1])
-
-    return " | ".join(parts)
-
-
-def calc_total(lines):
-    total = 0
-    for ln in lines:
-        # kira semua nombor selepas RM (case-insensitive)
-        nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", ln)
-        for n in nums:
-            try:
-                total += int(n)
-            except:
-                pass
-    return total
-
-
-# ✅ TAMBAHAN SAHAJA: kesan baris transport + separator
-# guna char 'line' supaya Telegram tak buang, dan kita bold-kan nanti
-SEP_10_DASH = "──────────"  # 10 line chars (bukan '-' biasa)
 
 def is_transport_line(line: str) -> bool:
     # Kesan baris seperti: "IPOH PERAK | Transport luar | RM300"
@@ -146,11 +163,53 @@ def is_transport_line(line: str) -> bool:
     return bool(re.search(r"\btransport\b", parts[1], flags=re.IGNORECASE))
 
 
+def normalize_detail_line(line: str) -> str:
+    """
+    Rules:
+    1) Segmen pertama:
+       - jika mirip salah satu 8 nama produk -> auto betulkan ikut nama rasmi
+       - kalau bukan produk -> uppercase biasa (destinasi)
+    2) Segmen terakhir -> pastikan 'RM' uppercase, auto tambah jika user lupa.
+    """
+    if "|" not in line:
+        return line
+
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) < 2:
+        return line
+
+    first = parts[0]
+
+    # fuzzy betulkan nama produk
+    best_name, score = best_product_match(first)
+    if best_name and score >= FUZZY_THRESHOLD:
+        parts[0] = best_name  # guna nama rasmi
+    else:
+        # bukan produk: uppercase biasa (destinasi)
+        parts[0] = first.upper()
+
+    # segmen terakhir: normalize RM
+    parts[-1] = _normalize_rm_value(parts[-1])
+
+    return " | ".join(parts)
+
+
+def calc_total(lines):
+    total = 0
+    for ln in lines:
+        nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", ln)
+        for n in nums:
+            try:
+                total += int(n)
+            except:
+                pass
+    return total
+
+
 def build_caption(user_caption: str) -> str:
     stamp = bold(make_stamp())
 
     detail_lines_raw = extract_lines(user_caption)
-    # normalize dulu (supaya total kira betul walaupun user tak tulis RM)
     detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
 
     total = calc_total(detail_lines)
@@ -161,9 +220,9 @@ def build_caption(user_caption: str) -> str:
 
     inserted_sep = False
     for ln in detail_lines:
-        # ✅ auto letak separator sebelum baris transport (sekali sahaja)
+        # auto letak separator sebelum baris transport (sekali sahaja)
         if (not inserted_sep) and is_transport_line(ln):
-            parts.append(bold(SEP_10_DASH))
+            parts.append(bold(SEP_10))
             inserted_sep = True
 
         parts.append(bold(ln))
@@ -172,10 +231,8 @@ def build_caption(user_caption: str) -> str:
     parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
 
     cap = "\n".join(parts)
-
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
-
     return cap
 
 
