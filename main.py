@@ -2,12 +2,15 @@
 # ATV PANTAI TIMOR BOT
 # - Repost gambar produk + caption auto kemas
 # - Nama tempat: Title Case (huruf depan besar)
-# - TEMPAT + JENIS TRANSPORT guna bold2 (gaya sama)
+# - TEMPAT + JENIS TRANSPORT guna bold2
 # - Harga TIDAK didarab kuantiti (total = jumlah semua RM pada baris)
 # - Jika user lupa isi (atau caption kosong), auto isi ❓ pada segment yang kosong
-# - Jika user swipe kiri (reply) & hantar resit: bot padam resit asal + padam album lama,
-#   kemudian repost semula sebagai album [produk+caption] + [semua resit terkumpul]
-#   (repeatable: swipe kali ke-2, ke-3 pun jadi)
+# - Jika caption kosong: auto buat 2 baris:
+#     ❓ | ❓ | ❓   (produk)
+#     ❓ | ❓ | ❓   (penghantaran)
+# - Jika user swipe kiri (reply) & hantar resit:
+#   bot padam resit asal + padam album lama, repost semula sebagai album
+#   [produk+caption] + [semua resit terkumpul] (repeatable)
 # =========================
 
 import os, re, asyncio, time
@@ -181,52 +184,16 @@ def _normalize_rm_value(val: str) -> str:
     return f"RM{num}"
 
 
-def _looks_like_money(seg: str) -> bool:
-    seg = (seg or "").strip()
-    if not seg or seg == "❓":
-        return False
-    return bool(re.search(r"(?i)\b(?:rm)?\s*[0-9]{1,12}\b", seg))
-
-
-def _looks_like_qty(seg: str) -> bool:
-    seg = (seg or "").strip()
-    if not seg or seg == "❓":
-        return False
-    return bool(re.fullmatch(r"\d{1,3}", seg))
-
-
-# ===== Heuristik type line (produk vs transport) =====
-def _seg0_has_digits(seg0: str) -> bool:
-    return bool(re.search(r"\d", (seg0 or "")))
-
-
-def is_transport_like_parts(parts) -> bool:
-    """
-    Detect penghantaran walau seg2 (kos) ❓:
-    1) jika seg1 match transport types => penghantaran
-    2) jika seg0 ada digit => produk
-    3) jika seg0 match produk kuat => produk
-    4) selain itu => penghantaran
-    """
-    if not parts:
-        return False
-    seg0 = (parts[0] or "").strip()
-    seg1 = (parts[1] or "").strip() if len(parts) > 1 else ""
-
-    if seg1 and seg1 != "❓":
-        name, score = best_transport_match(seg1)
-        if name and score >= TRANSPORT_THRESHOLD:
-            return True
-
-    if _seg0_has_digits(seg0):
-        return False
-
-    if seg0 and seg0 != "❓":
-        pname, pscore = best_product_match(seg0)
-        if pname and pscore >= FUZZY_THRESHOLD:
-            return False
-
-    return True
+def _extract_tail_money(text: str):
+    s = (text or "").strip()
+    if not s:
+        return s, None
+    m = re.search(r"(?i)(?:\brm\b\s*)?([0-9]{1,12})\s*$", s)
+    if not m:
+        return s, None
+    num = m.group(1)
+    head = s[:m.start()].strip()
+    return head, f"RM{num}"
 
 
 # ================= NAMA TEMPAT: Title Case =================
@@ -258,30 +225,32 @@ def place_title_case(s: str) -> str:
     return " ".join(out)
 
 
-# ================= AUTO INSERT ' | ' IF USER TERLUPA (NO PIPES) =================
-def _extract_tail_money(text: str):
-    s = (text or "").strip()
-    if not s:
-        return s, None
-    m = re.search(r"(?i)(?:\brm\b\s*)?([0-9]{1,12})\s*$", s)
-    if not m:
-        return s, None
-    num = m.group(1)
-    head = s[:m.start()].strip()
-    return head, f"RM{num}"
+# ================= DETECT TRANSPORT-LIKE =================
+def is_transport_like_parts(parts) -> bool:
+    """
+    Anggap baris penghantaran jika:
+    - segmen 2 match jenis transport (walau kos ❓)
+    selain itu, produk.
+    """
+    if not parts or len(parts) < 2:
+        return False
+    seg1 = (parts[1] or "").strip()
+    if not seg1 or seg1 == "❓":
+        return False
+    name, score = best_transport_match(seg1)
+    return bool(name and score >= TRANSPORT_THRESHOLD)
 
 
+# ================= AUTO INSERT PIPES (NO PIPES) =================
 def _try_parse_product_no_pipes_strict(line: str):
     """
-    Hanya accept format:
-    "nama qty harga" => nama | qty | RMharga
-    Kalau "nama harga" (tanpa qty), JANGAN paksa qty; kita akan buat: nama | ❓ | RMharga (di fallback)
+    Accept: "nama qty harga"
+    Reject: "nama harga" (tiada qty) -> akan jadi "nama | ❓ | RMharga"
     """
     head, money = _extract_tail_money(line)
     if not money:
         return None
 
-    # qty mesti ada di hujung head
     mqty = re.search(r"\b(\d{1,3})\s*$", head)
     if not mqty:
         return None
@@ -309,10 +278,6 @@ def _best_transport_suffix(words):
 
 
 def _try_parse_cost_no_pipes(line: str):
-    """
-    Format:
-    "destinasi + (transport_type) + kos"
-    """
     head, money = _extract_tail_money(line)
     if not money:
         return None
@@ -333,16 +298,6 @@ def _try_parse_cost_no_pipes(line: str):
 
 
 def auto_insert_pipes_if_missing(line: str) -> str:
-    """
-    1) cuba parse produk lengkap (nama qty harga)
-    2) cuba parse penghantaran lengkap (dest type kos)
-    3) fallback:
-       - kalau ada harga di hujung tapi qty/type tak ada => letak ❓ di tengah
-         contoh: "125cc follspek 5900" => "125cc follspek | ❓ | RM5900"
-         contoh: "ipoh perak 500" => "ipoh perak | ❓ | RM500"
-       - kalau langsung tiada nombor => "text | ❓ | ❓"
-       - kalau kosong => "❓ | ❓ | ❓"
-    """
     s = (line or "").strip()
     if not s:
         return "❓ | ❓ | ❓"
@@ -350,17 +305,17 @@ def auto_insert_pipes_if_missing(line: str) -> str:
     if ("|" in s) or ("｜" in s):
         return s
 
-    # 1) produk strict (qty mesti ada)
+    # produk lengkap (mesti ada qty)
     as_product = _try_parse_product_no_pipes_strict(s)
     if as_product:
         return as_product
 
-    # 2) transport lengkap
+    # penghantaran lengkap (dest + type + kos)
     as_cost = _try_parse_cost_no_pipes(s)
     if as_cost:
         return as_cost
 
-    # 3) fallback separa
+    # fallback separa: ada harga di hujung
     head, money = _extract_tail_money(s)
     if money:
         head = head.strip()
@@ -368,11 +323,11 @@ def auto_insert_pipes_if_missing(line: str) -> str:
             return f"❓ | ❓ | {money}"
         return f"{head} | ❓ | {money}"
 
-    # tiada harga pun
+    # tiada nombor pun
     return f"{s} | ❓ | ❓"
 
 
-# ================= AUTO ISI ❓ UNTUK SEGMENT KOSONG =================
+# ================= FILL ❓ SEGMENTS =================
 def fill_missing_segments(parts, want_len=3):
     parts = list(parts or [])
     while len(parts) < want_len:
@@ -388,15 +343,15 @@ def normalize_detail_line(line: str) -> str:
     line = auto_insert_pipes_if_missing(line)
 
     if ("|" not in line) and ("｜" not in line):
-        # ini kes sangat rare (sebab auto_insert dah cover), tapi jaga-jaga:
         return "❓ | ❓ | ❓"
 
     raw_parts = _split_pipes(line)
     parts = fill_missing_segments(raw_parts, 3)
 
+    # detect transport hanya jika segmen2 match transport
     transport_like = is_transport_like_parts(parts)
 
-    # ===== segmen 1 =====
+    # seg1: produk/destinasi
     if transport_like:
         if parts[0] != "❓":
             parts[0] = place_title_case(parts[0])
@@ -408,21 +363,15 @@ def normalize_detail_line(line: str) -> str:
             else:
                 parts[0] = parts[0].upper()
 
-    # ===== segmen 2 =====
-    if transport_like:
-        if parts[1] != "❓":
-            best_t, tscore = best_transport_match(parts[1])
-            if best_t and tscore >= TRANSPORT_THRESHOLD:
-                parts[1] = best_t
-    else:
-        # qty produk: kalau user isi bukan nombor, kita biar (tapi kalau kosong dah jadi ❓)
-        pass
+    # seg2: type transport (jika ada)
+    if transport_like and parts[1] != "❓":
+        best_t, tscore = best_transport_match(parts[1])
+        if best_t and tscore >= TRANSPORT_THRESHOLD:
+            parts[1] = best_t
 
-    # ===== segmen 3 =====
+    # seg3: RM
     if parts[2] != "❓":
         parts[2] = _normalize_rm_value(parts[2])
-    else:
-        parts[2] = "❓"
 
     return _join_pipes(parts)
 
@@ -439,16 +388,18 @@ def calc_total(lines):
     return total
 
 
-def stylize_line_for_caption(line: str) -> str:
+def stylize_line_for_caption(line: str, force_transport: bool = False) -> str:
     """
-    - Penghantaran: TEMPAT + JENIS guna bold2 (walau kos ❓)
-    - Produk: bold biasa
+    force_transport=True untuk baris placeholder penghantaran (❓|❓|❓)
     """
     if ("|" in line) or ("｜" in line):
         parts = fill_missing_segments(_split_pipes(line), 3)
-        if is_transport_like_parts(parts):
+
+        if force_transport or is_transport_like_parts(parts):
             return " | ".join([bold2(parts[0]), bold2(parts[1]), bold(parts[2])])
+
         return bold(_join_pipes(parts))
+
     return bold(line)
 
 
@@ -458,15 +409,24 @@ def build_caption(user_caption: str) -> str:
     detail_lines_raw = extract_lines(user_caption)
     detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
 
-    # ✅ kalau user hantar gambar sahaja (tiada caption / tiada detail)
+    # ✅ kalau user hantar gambar sahaja (caption kosong)
+    # wajib keluar 2 baris: produk + penghantaran
     if not detail_lines:
-        detail_lines = ["❓ | ❓ | ❓"]
+        detail_lines = [
+            "❓ | ❓ | ❓",  # produk
+            "❓ | ❓ | ❓",  # penghantaran
+        ]
 
     total = calc_total(detail_lines)
 
     parts = [stamp, ""]
-    for ln in detail_lines:
-        parts.append(stylize_line_for_caption(ln))
+    for idx, ln in enumerate(detail_lines):
+        if not user_caption.strip() and idx == 1:
+            # baris kedua placeholder: paksa gaya penghantaran (bold2)
+            parts.append(stylize_line_for_caption(ln, force_transport=True))
+        else:
+            parts.append(stylize_line_for_caption(ln))
+
     parts += ["", f"Total keseluruhan : {bold('RM' + str(total))}"]
 
     cap = "\n".join(parts)
@@ -476,7 +436,7 @@ def build_caption(user_caption: str) -> str:
 
 
 # =========================================================
-# ✅ STATE: PRODUK/ALBUM (SUPAYA SWIPE KALI KE-2, KE-3 PUN BOLEH)
+# ✅ STATE: PRODUK/ALBUM (SWIPE KALI KE-2, KE-3 PUN BOLEH)
 # =========================================================
 STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))  # 24 jam
 RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
@@ -537,7 +497,7 @@ async def _send_album_and_update_state(client: Client, chat_id: int, state_id, p
 
     sent_msg_ids = []
     for idx, ch in enumerate(chunks):
-        # pastikan caption hanya pada album pertama sahaja
+        # caption hanya pada first chunk
         if idx > 0:
             try:
                 ch[0].caption = None
@@ -597,9 +557,6 @@ async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: 
             return False
 
         receipts = state.get("receipts", []) + list(new_receipt_file_ids)
-
-        # (optional) elak duplicate file_id
-        # receipts = list(dict.fromkeys(receipts))
 
         old_ids = state.get("msg_ids", [])
         await _delete_messages_safe(client, chat_id, old_ids)
@@ -682,16 +639,12 @@ async def handle_receipt_photo(client: Client, message):
 # ================= HANDLER =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
-    """
-    1) Jika user reply (swipe kiri) & hantar resit => repeatable merge album.
-    2) Kalau bukan reply => post produk biasa => bot format caption & repost + simpan state.
-    """
     # ✅ receipt mode
     if is_reply_to_any_message(message):
         await handle_receipt_photo(client, message)
         return
 
-    # ✅ normal mode (repost caption kemas)
+    # ✅ normal mode
     chat_id = message.chat.id
     photo_id = message.photo.file_id
     user_caption = message.caption or ""
@@ -724,7 +677,7 @@ async def handle_photo(client, message):
                     "product_file_id": sent.photo.file_id,
                     "caption": sent.caption or new_caption,
                     "receipts": [],
-                    "msg_ids": [sent.id],   # mula-mula single
+                    "msg_ids": [sent.id],
                     "ts": time.time(),
                 }
                 MSGID_TO_STATE[(chat_id, sent.id)] = state_id
@@ -734,5 +687,6 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
 
 
