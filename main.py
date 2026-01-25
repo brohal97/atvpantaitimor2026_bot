@@ -1335,7 +1335,7 @@ async def harga_okey_set(client, callback):
         try:
             harga = int(buf)
         except Exception:
-            await callback.answer("Harga tidak sah.", show_alert=True)
+            await fast_ack(callback, "Harga tidak sah.", alert=True)
             return
 
         prev_price = state.get("prices", {}).get(produk_key)
