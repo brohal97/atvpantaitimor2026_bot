@@ -27,6 +27,18 @@ TZ = pytz.timezone("Asia/Kuala_Lumpur")
 HARI = ["Isnin", "Selasa", "Rabu", "Khamis", "Jumaat", "Sabtu", "Ahad"]
 
 
+# ================= BOLD STYLE =================
+BOLD_MAP = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
+    "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
+    "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"
+)
+
+def bold(text: str) -> str:
+    return (text or "").translate(BOLD_MAP)
+
+
 # ================= SAFE TG CALL =================
 async def tg_call(fn, *args, **kwargs):
     while True:
@@ -38,94 +50,74 @@ async def tg_call(fn, *args, **kwargs):
             await asyncio.sleep(0.2)
 
 
-# ================= CORE HELPERS =================
+# ================= CORE LOGIC =================
 def make_stamp() -> str:
     now = datetime.now(TZ)
     hari = HARI[now.weekday()]
     tarikh = f"{now.day}/{now.month}/{now.year}"
-    jam = now.strftime("%I:%M%p").lower()  # contoh 9:30am
+    jam = now.strftime("%I:%M%p").lower()
     return f"{hari} | {tarikh} | {jam}"
 
 
-def clean_detail_text(text: str) -> str:
-    """
-    Buang baris kosong di hujung, dan buang baris yang ada 'total'
-    (supaya total baru bot kira semula).
-    """
-    if not text:
-        return ""
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]  # buang empty lines
-
-    # buang mana2 line yang mengandungi "total"
-    cleaned = []
-    for ln in lines:
+def extract_lines(text: str):
+    lines = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        # buang baris total lama kalau ada
         if re.search(r"\btotal\b", ln, flags=re.IGNORECASE):
             continue
-        cleaned.append(ln)
+        lines.append(ln)
+    return lines
 
-    return "\n".join(cleaned).strip()
 
-
-def calc_total_from_text(text: str) -> int:
-    """
-    Jumlahkan semua nilai RMxxxx / rmxxxx yang muncul dalam detail.
-    Contoh: RM5000 + RM5500 + rm300 = 10800
-    """
-    if not text:
-        return 0
-
-    # cari RM diikuti digit (boleh ada ruang)
-    nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", text)
+def calc_total(lines):
     total = 0
-    for n in nums:
-        try:
-            total += int(n)
-        except:
-            pass
+    for ln in lines:
+        nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", ln)
+        for n in nums:
+            try:
+                total += int(n)
+            except:
+                pass
     return total
 
 
 def build_caption(user_caption: str) -> str:
-    stamp = make_stamp()
+    stamp = bold(make_stamp())
 
-    # detail = semua caption user, tapi buang baris TOTAL yang mungkin user letak
-    detail = clean_detail_text(user_caption)
+    detail_lines = extract_lines(user_caption)
+    total = calc_total(detail_lines)
 
-    # kira total dari semua RM dalam detail
-    total = calc_total_from_text(detail)
+    parts = []
+    parts.append(stamp)
+    parts.append("")  # perenggan kosong
 
-    # caption akhir
-    parts = [stamp]
-    if detail:
-        parts.append(detail)
+    for ln in detail_lines:
+        parts.append(bold(ln))
 
-    parts.append(f"Total keseluruhan : RM{total}")
+    parts.append("")  # perenggan kosong
+    parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
 
-    cap = "\n".join(parts).strip()
+    cap = "\n".join(parts)
 
-    # telegram caption limit safety
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
 
     return cap
 
 
-# ================= MAIN HANDLER =================
+# ================= HANDLER =================
 @bot.on_message(filters.photo & ~filters.bot)
-async def handle_photo_with_detail(client: Client, message):
-    """
-    User hantar GAMBAR + caption (detail).
-    Bot padam mesej asal dan repost dengan stamp terkini + total automatik.
-    """
+async def handle_photo(client, message):
     chat_id = message.chat.id
     photo_id = message.photo.file_id
-    user_caption = (message.caption or "").strip()
+    user_caption = message.caption or ""
 
-    # kalau tiada detail, boleh biar (atau boleh warn). Saya biar tetap repost, total=0
     new_caption = build_caption(user_caption)
 
-    # padam mesej asal untuk kemas
+    # padam mesej asal
     try:
         await tg_call(message.delete)
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -133,7 +125,7 @@ async def handle_photo_with_detail(client: Client, message):
     except:
         pass
 
-    # repost (paling laju: terus send_photo, tanpa edit_caption)
+    # repost versi kemas
     await tg_call(
         client.send_photo,
         chat_id=chat_id,
