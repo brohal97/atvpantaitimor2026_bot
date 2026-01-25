@@ -63,8 +63,16 @@ PRODUCT_NAMES = [
     "TROLI BESI",
 ]
 
-# threshold untuk auto-betulkan (0.0 - 1.0)
-FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.72"))
+FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.72"))  # produk
+
+
+# ================= TRANSPORT FIXED TYPES (SEGMENT KE-2) =================
+TRANSPORT_TYPES = [
+    "Transport luar",
+    "Pickup sendiri",
+    "Lori kita hantar",
+]
+TRANSPORT_THRESHOLD = float(os.getenv("TRANSPORT_THRESHOLD", "0.70"))
 
 
 def _norm_key(s: str) -> str:
@@ -75,6 +83,7 @@ def _norm_key(s: str) -> str:
 
 
 PRODUCT_KEYS = {name: _norm_key(name) for name in PRODUCT_NAMES}
+TRANSPORT_KEYS = {name: _norm_key(name) for name in TRANSPORT_TYPES}
 
 
 def best_product_match(user_first_segment: str):
@@ -85,6 +94,22 @@ def best_product_match(user_first_segment: str):
     best_name = None
     best_score = 0.0
     for name, key in PRODUCT_KEYS.items():
+        score = SequenceMatcher(None, u, key).ratio()
+        if score > best_score:
+            best_score = score
+            best_name = name
+
+    return best_name, best_score
+
+
+def best_transport_match(user_transport_segment: str):
+    u = _norm_key(user_transport_segment)
+    if not u:
+        return None, 0.0
+
+    best_name = None
+    best_score = 0.0
+    for name, key in TRANSPORT_KEYS.items():
         score = SequenceMatcher(None, u, key).ratio()
         if score > best_score:
             best_score = score
@@ -108,7 +133,6 @@ def extract_lines(text: str):
         ln = ln.strip()
         if not ln:
             continue
-        # buang baris total lama kalau ada
         if re.search(r"\btotal\b", ln, flags=re.IGNORECASE):
             continue
         lines.append(ln)
@@ -116,17 +140,10 @@ def extract_lines(text: str):
 
 
 def _normalize_rm_value(val: str) -> str:
-    """
-    Jadikan nilai akhir sentiasa format: RM<angka>
-    - "200" -> "RM200"
-    - "rm200" / "Rm 200" -> "RM200"
-    - "RM200" -> "RM200"
-    """
     s = (val or "").strip()
     if not s:
         return s
 
-    # cari nombor pertama
     m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
     if not m:
         m2 = re.search(r"([0-9]{1,12})", s)
@@ -140,9 +157,6 @@ def _normalize_rm_value(val: str) -> str:
 
 
 def _split_pipes(line: str):
-    """
-    Support pipe biasa '|' dan pipe fullwidth '｜' (ramai user copy/paste).
-    """
     if "｜" in line and "|" not in line:
         return [p.strip() for p in line.split("｜")]
     return [p.strip() for p in line.split("|")]
@@ -157,11 +171,6 @@ def _looks_like_money_tail(seg: str) -> bool:
 
 
 def is_product_line(line: str) -> bool:
-    """
-    Line produk biasanya format: <produk> | <qty> | <harga>
-    - segmen kedua ialah nombor qty
-    - segmen terakhir ada nombor/RM
-    """
     if ("|" not in line) and ("｜" not in line):
         return False
     parts = _split_pipes(line)
@@ -176,22 +185,12 @@ def is_product_line(line: str) -> bool:
 
 
 def is_cost_or_transport_line(line: str) -> bool:
-    """
-    Detect baris kos/destinasi (yang kita nak letak separator sebelum dia):
-    - ada '|' dan ada nilai duit di hujung
-    - BUKAN product line (qty nombor)
-    Contoh:
-      "IPOH PERAK | Transport luar | 300"
-      "IPOH PERAK | HANTAR LUAR | RM300"
-      "KELANTAN | POS LAJU | rm40"
-    """
     if ("|" not in line) and ("｜" not in line):
         return False
     parts = _split_pipes(line)
     if len(parts) < 3:
         return False
 
-    # jika dia product line, bukan cost line
     if is_product_line(line):
         return False
 
@@ -203,14 +202,6 @@ SEP_10_DASH = "-" * 10
 
 
 def normalize_detail_line(line: str) -> str:
-    """
-    Rules:
-    1) Segmen pertama:
-       - jika mirip salah satu 8 nama produk -> auto betulkan ikut nama rasmi
-       - kalau bukan produk -> uppercase biasa (destinasi)
-    2) Segmen terakhir -> pastikan 'RM' uppercase, auto tambah jika user lupa.
-    3) Kekal guna " | " sebagai pemisah.
-    """
     if ("|" not in line) and ("｜" not in line):
         return line
 
@@ -218,16 +209,23 @@ def normalize_detail_line(line: str) -> str:
     if len(parts) < 2:
         return line
 
+    # ===== segmen 1: produk/destinasi =====
     first = parts[0]
-
-    # fuzzy betulkan nama produk
     best_name, score = best_product_match(first)
     if best_name and score >= FUZZY_THRESHOLD:
         parts[0] = best_name
     else:
         parts[0] = first.upper()
 
-    # segmen terakhir: normalize RM (untuk produk & kos)
+    # ===== segmen 2: jenis transport (hanya untuk baris kos/destinasi) =====
+    # format biasa: DESTINASI | <jenis> | RMxxx
+    if len(parts) >= 3 and is_cost_or_transport_line(line):
+        user_type = parts[1]
+        best_t, tscore = best_transport_match(user_type)
+        if best_t and tscore >= TRANSPORT_THRESHOLD:
+            parts[1] = best_t  # kekal ejaan rasmi 3 jenis sahaja
+
+    # ===== segmen last: RM =====
     parts[-1] = _normalize_rm_value(parts[-1])
 
     return _join_pipes(parts)
@@ -255,18 +253,17 @@ def build_caption(user_caption: str) -> str:
 
     parts = []
     parts.append(stamp)
-    parts.append("")  # perenggan kosong
+    parts.append("")
 
     inserted_sep = False
     for ln in detail_lines:
-        # ✅ Auto letak 10 dash sebelum baris kos/destinasi (sekali sahaja)
         if (not inserted_sep) and is_cost_or_transport_line(ln):
             parts.append(bold(SEP_10_DASH))
             inserted_sep = True
 
         parts.append(bold(ln))
 
-    parts.append("")  # perenggan kosong
+    parts.append("")
     parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
 
     cap = "\n".join(parts)
@@ -284,7 +281,6 @@ async def handle_photo(client, message):
 
     new_caption = build_caption(user_caption)
 
-    # padam mesej asal
     try:
         await tg_call(message.delete)
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -292,7 +288,6 @@ async def handle_photo(client, message):
     except:
         pass
 
-    # repost versi kemas
     await tg_call(
         client.send_photo,
         chat_id=chat_id,
