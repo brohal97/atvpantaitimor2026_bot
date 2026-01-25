@@ -35,20 +35,17 @@ BOLD_MAP = str.maketrans(
     "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
     "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"
 )
-
 def bold(text: str) -> str:
     return (text or "").translate(BOLD_MAP)
 
 
 # ================= BOLD STYLE 2 (KHAS UNTUK JENIS TRANSPORT) =================
-# (masih tebal, tapi gaya lain)
 ALT_BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
     "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳"
     "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"
 )
-
 def bold2(text: str) -> str:
     return (text or "").translate(ALT_BOLD_MAP)
 
@@ -209,6 +206,36 @@ def is_cost_or_transport_line(line: str) -> bool:
     return _looks_like_money_tail(parts[-1])
 
 
+# ================= NAMA TEMPAT: HURUF DEPAN SAHAJA (Title Case) =================
+def _cap_word(w: str) -> str:
+    if not w:
+        return w
+    if w.isdigit():
+        return w
+    if w.isalpha() and len(w) <= 2:
+        return w.upper()  # contoh: TS
+    return w.lower().capitalize()
+
+def place_title_case(s: str) -> str:
+    """
+    "IPOH PERAK" -> "Ipoh Perak"
+    "yan kedah TS 50" -> "Yan Kedah TS 50"
+    """
+    s = (s or "").strip()
+    if not s:
+        return s
+    # pecah ikut space, tapi kekalkan '-' dalam token
+    tokens = [t for t in re.split(r"\s+", s) if t]
+    out = []
+    for t in tokens:
+        if "-" in t:
+            parts = t.split("-")
+            out.append("-".join(_cap_word(p) for p in parts))
+        else:
+            out.append(_cap_word(t))
+    return " ".join(out)
+
+
 # ================= AUTO INSERT ' | ' IF USER TERLUPA =================
 def _extract_tail_money(text: str):
     s = (text or "").strip()
@@ -311,10 +338,17 @@ def normalize_detail_line(line: str) -> str:
     # ===== segmen 1: produk/destinasi =====
     first = parts[0]
     best_name, score = best_product_match(first)
+
     if best_name and score >= FUZZY_THRESHOLD:
+        # ✅ PRODUK: guna nama rasmi (jangan usik)
         parts[0] = best_name
     else:
-        parts[0] = first.upper()
+        # ✅ NAMA TEMPAT SAHAJA: huruf depan sahaja (Title Case) jika ini baris kos/transport
+        if is_cost_or_transport_line(line):
+            parts[0] = place_title_case(first)
+        else:
+            # selain tempat (kalau ada), kekalkan uppercase seperti biasa
+            parts[0] = first.upper()
 
     # ===== segmen 2: jenis transport (untuk baris kos/destinasi) =====
     if len(parts) >= 3 and is_cost_or_transport_line(line):
@@ -343,17 +377,16 @@ def calc_total(lines):
 
 def stylize_line_for_caption(line: str) -> str:
     """
-    - Produk: kekal gaya bold biasa (𝗔𝗕𝗖...)
+    - Produk: gaya bold biasa (𝗔𝗕𝗖...)
     - Kos/transport: segmen ke-2 (jenis transport) guna bold2 (𝐀𝐁𝐂...),
       segmen lain kekal bold biasa.
     """
     if is_cost_or_transport_line(line):
         parts = _split_pipes(line)
         if len(parts) >= 3:
-            seg0 = bold(parts[0])        # destinasi
-            seg1 = bold2(parts[1])       # ✅ transport style lain tapi tebal
+            seg0 = bold(parts[0])        # nama tempat (Title Case)
+            seg1 = bold2(parts[1])       # jenis transport (style lain)
             seg_last = bold(parts[-1])   # RMxxx
-            # kalau ada lebih segmen (rare), bold biasa
             mid = []
             if len(parts) > 3:
                 for p in parts[2:-1]:
@@ -361,7 +394,6 @@ def stylize_line_for_caption(line: str) -> str:
             out_parts = [seg0, seg1] + mid + [seg_last]
             return " | ".join(out_parts)
 
-    # default: semuanya bold biasa
     return bold(line)
 
 
