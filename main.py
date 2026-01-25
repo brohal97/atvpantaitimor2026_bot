@@ -62,7 +62,6 @@ PRODUCT_NAMES = [
     "TROLI PLASTIK",
     "TROLI BESI",
 ]
-
 FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.72"))  # produk
 
 
@@ -201,7 +200,130 @@ def is_cost_or_transport_line(line: str) -> bool:
 SEP_10_DASH = "-" * 10
 
 
+# ================= AUTO INSERT ' | ' IF USER TERLUPA =================
+def _extract_tail_money(text: str):
+    """
+    Ambil duit di hujung:
+      "... rm5200" / "... 5200" -> (head, "RM5200")
+    Jika tiada nombor, return (text, None)
+    """
+    s = (text or "").strip()
+    if not s:
+        return s, None
+
+    m = re.search(r"(?i)(?:\brm\b\s*)?([0-9]{1,12})\s*$", s)
+    if not m:
+        return s, None
+
+    num = m.group(1)
+    head = s[:m.start()].strip()
+    return head, f"RM{num}"
+
+
+def _try_parse_product_no_pipes(line: str):
+    """
+    Format tanpa '|':
+      "<produk> <qty> <rm/harga>"
+    contoh: "125ccc full spec 2 rm5200"
+    """
+    head, money = _extract_tail_money(line)
+    if not money:
+        return None
+
+    # qty mesti nombor token terakhir dalam head
+    mqty = re.search(r"\b(\d{1,3})\s*$", head)
+    if not mqty:
+        return None
+
+    qty = mqty.group(1)
+    name_part = head[:mqty.start()].strip()
+    if not name_part:
+        return None
+
+    return f"{name_part} | {qty} | {money}"
+
+
+def _best_transport_suffix(words):
+    """
+    Cari suffix (1-5 perkataan) yang paling hampir dengan 3 jenis transport.
+    Return: (best_transport_name, score, cut_index)
+    cut_index = index mula suffix dalam list words
+    """
+    best_name = None
+    best_score = 0.0
+    best_cut = None
+
+    n = len(words)
+    for L in range(1, min(5, n) + 1):
+        cut = n - L
+        cand = " ".join(words[cut:])
+        name, score = best_transport_match(cand)
+        if name and score > best_score:
+            best_score = score
+            best_name = name
+            best_cut = cut
+
+    return best_name, best_score, best_cut
+
+
+def _try_parse_cost_no_pipes(line: str):
+    """
+    Format tanpa '|':
+      "<destinasi> <jenis transport> <rm/harga>"
+    contoh: "kota bharu lori kita hantar rm50"
+    """
+    head, money = _extract_tail_money(line)
+    if not money:
+        return None
+
+    # pecah words
+    words = [w for w in re.split(r"\s+", head.strip()) if w]
+    if len(words) < 2:
+        return None
+
+    best_t, score, cut = _best_transport_suffix(words)
+    if not best_t or score < TRANSPORT_THRESHOLD:
+        return None
+
+    dest = " ".join(words[:cut]).strip()
+    if not dest:
+        return None
+
+    return f"{dest} | {best_t} | {money}"
+
+
+def auto_insert_pipes_if_missing(line: str) -> str:
+    """
+    Jika user tak letak '|', cuba auto bina:
+      - produk:  name | qty | RMxx
+      - kos:    destinasi | jenis | RMxx
+    Kalau gagal parse, return line asal.
+    """
+    s = (line or "").strip()
+    if not s:
+        return s
+
+    # kalau user dah guna pipe biasa / fullwidth, biar
+    if ("|" in s) or ("｜" in s):
+        return s
+
+    # cuba detect produk dulu (ada qty)
+    as_product = _try_parse_product_no_pipes(s)
+    if as_product:
+        return as_product
+
+    # kemudian cuba detect kos/transport
+    as_cost = _try_parse_cost_no_pipes(s)
+    if as_cost:
+        return as_cost
+
+    return s
+
+
 def normalize_detail_line(line: str) -> str:
+    # ✅ tambahan: auto masukkan "|" bila user terlupa
+    line = auto_insert_pipes_if_missing(line)
+
     if ("|" not in line) and ("｜" not in line):
         return line
 
@@ -217,13 +339,12 @@ def normalize_detail_line(line: str) -> str:
     else:
         parts[0] = first.upper()
 
-    # ===== segmen 2: jenis transport (hanya untuk baris kos/destinasi) =====
-    # format biasa: DESTINASI | <jenis> | RMxxx
+    # ===== segmen 2: jenis transport (untuk baris kos/destinasi) =====
     if len(parts) >= 3 and is_cost_or_transport_line(line):
         user_type = parts[1]
         best_t, tscore = best_transport_match(user_type)
         if best_t and tscore >= TRANSPORT_THRESHOLD:
-            parts[1] = best_t  # kekal ejaan rasmi 3 jenis sahaja
+            parts[1] = best_t
 
     # ===== segmen last: RM =====
     parts[-1] = _normalize_rm_value(parts[-1])
@@ -257,6 +378,7 @@ def build_caption(user_caption: str) -> str:
 
     inserted_sep = False
     for ln in detail_lines:
+        # ✅ Auto letak 10 dash sebelum baris kos/destinasi (sekali sahaja)
         if (not inserted_sep) and is_cost_or_transport_line(ln):
             parts.append(bold(SEP_10_DASH))
             inserted_sep = True
