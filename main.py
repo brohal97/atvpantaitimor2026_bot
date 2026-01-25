@@ -1,36 +1,24 @@
 # =========================
-# ATV PANTAI TIMOR BOT (VERSI PENUH + STABIL + OCR TRIGGER)
+# ATV PANTAI TIMOR BOT (VERSI PENUH + STABIL + OCR REPOST PASTI JADI)
 #
-# ✅ Fungsi utama:
-# 1) Repost gambar produk + caption auto kemas
-# 2) Auto ❓ jika user lupa isi segmen (produk / penghantaran)
-# 3) Jika caption kosong: auto 2 baris:
-#       ❓ | ❓ | ❓   (produk)
-#       ❓ | ❓ | ❓   (penghantaran)
-# 4) Harga TIDAK didarab kuantiti (Total = jumlah semua RM pada baris)
-# 5) Swipe kiri (reply) + upload resit:
-#    bot padam resit asal + padam album lama, repost album baru:
-#    [produk+caption] + [semua resit terkumpul] (repeatable)
+# ✅ Repost produk + caption kemas
+# ✅ Caption kosong auto 2 baris:
+#     ❓ | ❓ | ❓   (produk)
+#     ❓ | ❓ | ❓   (penghantaran)
+# ✅ Harga TIDAK didarab kuantiti (Total = jumlah semua RM pada baris)
+# ✅ Reply (swipe kiri) + upload resit: bot padam resit asal + padam album lama, repost album baru
 #
-# ✅ Fix penting:
-# - Jika user taip penghantaran tanpa tempat: "transport luar 350"
-#   output WAJIB: "❓ | Transport luar | RM350"
-# - Jika user taip produk tanpa qty: "125cc follspek 5900"
-#   output WAJIB: "125CC FULL SPEC | ❓ | RM5900"
-#
-# ✅ OCR TRIGGER:
-# - Staff reply (swipe kiri) pada post produk/album + taip "123" hantar
-# - Hanya berfungsi jika sekurang-kurangnya 1 resit sudah di-upload utk order itu
-# - OCR baca resit terakhir: tarikh@masa + nombor akaun target + total resit
-# - Bila trigger berjaya:
-#   bot PADAM semua album lama dan REPOST semula album baru bersama hasil OCR dalam caption
-#
+# ✅ OCR TRIGGER (PASTI REPOST):
+# - Reply (swipe kiri) pada post produk/album + taip "123" send
+# - Hanya jalan jika sekurang-kurangnya 1 resit sudah di-upload
+# - Bot akan PADAM album lama & REPOST album baru bersama blok OCR
+# - Jika OCR tak aktif / gagal: tetap repost, blok OCR jadi ❓ + nota (supaya nampak punca)
 # =========================
 
-import os, re, io, json, time, asyncio, tempfile
+import os, re, json, time, asyncio, tempfile
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 import pytz
 from pyrogram import Client, filters
@@ -72,57 +60,67 @@ bot = Client(
 
 # ================= GOOGLE CREDS (Railway JSON env -> file) =================
 _OCR_READY = False
+_OCR_INIT_ERROR = ""
 VISION_CLIENT = None
-_GOOGLE_CREDS_TMP_PATH = None
 
-def ensure_google_creds_file():
+def _get_google_json_env_value() -> str:
     """
-    Railway: simpan JSON service account dalam env GOOGLE_APPLICATION_CREDENTIALS_JSON
-    Kita tukar jadi file sementara dan set GOOGLE_APPLICATION_CREDENTIALS.
+    Ambil dari env yang betul.
+    (Saya letak fallback kalau tersalah eja di Railway.)
     """
-    global _GOOGLE_CREDS_TMP_PATH
-    raw = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "") or "").strip()
-    if not raw:
-        return False
-
-    raw = raw.replace("\\n", "\n")  # kalau Railway escape newline
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return False
-
-    fd, path = tempfile.mkstemp(prefix="gcp-", suffix=".json")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
-    _GOOGLE_CREDS_TMP_PATH = path
-    return True
+    candidates = [
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",   # betul
+        "GOOGLE_APPLICATION_CREDENTIALIALS_JSON",# typo biasa
+        "GOOGLE_APPLICATION_CREDENTIALITALS_JSON",# typo biasa
+        "GOOGLE_APPLICATION_CREDENTAILS_JSON",   # typo
+    ]
+    for k in candidates:
+        v = (os.getenv(k, "") or "").strip()
+        if v:
+            return v
+    return ""
 
 def init_vision_client():
-    global _OCR_READY, VISION_CLIENT
+    global _OCR_READY, _OCR_INIT_ERROR, VISION_CLIENT
+    _OCR_READY = False
+    _OCR_INIT_ERROR = ""
+    VISION_CLIENT = None
+
     if vision is None:
-        _OCR_READY = False
-        VISION_CLIENT = None
+        _OCR_INIT_ERROR = "google-cloud-vision belum dipasang"
         return
 
-    ok = ensure_google_creds_file()
-    if not ok:
-        _OCR_READY = False
-        VISION_CLIENT = None
+    raw = _get_google_json_env_value()
+    if not raw:
+        _OCR_INIT_ERROR = "GOOGLE_APPLICATION_CREDENTIALS_JSON kosong / tiada"
+        return
+
+    raw = raw.replace("\\n", "\n")  # Railway escape newline
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        _OCR_INIT_ERROR = f"JSON service account tak valid: {e}"
+        return
+
+    try:
+        fd, path = tempfile.mkstemp(prefix="gcp-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+    except Exception as e:
+        _OCR_INIT_ERROR = f"Gagal create file creds: {e}"
         return
 
     try:
         VISION_CLIENT = vision.ImageAnnotatorClient()
         _OCR_READY = True
-    except Exception:
-        _OCR_READY = False
-        VISION_CLIENT = None
+    except Exception as e:
+        _OCR_INIT_ERROR = f"Vision client gagal init: {e}"
 
 init_vision_client()
 
 
-# ================= BOLD STYLE (UNTUK PRODUK & UMUM) =================
+# ================= BOLD STYLE =================
 BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
@@ -132,7 +130,6 @@ BOLD_MAP = str.maketrans(
 def bold(text: str) -> str:
     return (text or "").translate(BOLD_MAP)
 
-# ================= BOLD STYLE 2 (KHAS UNTUK TEMPAT + JENIS TRANSPORT) =================
 ALT_BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
@@ -261,8 +258,6 @@ def _extract_tail_money(text: str):
     head = s[:m.start()].strip()
     return head, f"RM{num}"
 
-
-# ================= NAMA TEMPAT: Title Case =================
 def _cap_word(w: str) -> str:
     if not w:
         return w
@@ -290,12 +285,7 @@ def place_title_case(s: str) -> str:
             out.append(_cap_word(t))
     return " ".join(out)
 
-
-# ================= DETECT TRANSPORT-LIKE =================
 def is_transport_like_parts(parts) -> bool:
-    """
-    Baris penghantaran jika segmen-2 match jenis transport (walau kos ❓).
-    """
     if not parts or len(parts) < 2:
         return False
     seg2 = (parts[1] or "").strip()
@@ -304,26 +294,17 @@ def is_transport_like_parts(parts) -> bool:
     name, score = best_transport_match(seg2)
     return bool(name and score >= TRANSPORT_THRESHOLD)
 
-
-# ================= AUTO INSERT PIPES (NO PIPES) =================
 def _try_parse_product_no_pipes_strict(line: str):
-    """
-    Accept: "nama qty harga"
-    Reject: "nama harga" (tiada qty) -> akan jadi "nama | ❓ | RMharga"
-    """
     head, money = _extract_tail_money(line)
     if not money:
         return None
-
     mqty = re.search(r"\b(\d{1,3})\s*$", head)
     if not mqty:
         return None
-
     qty = mqty.group(1)
     name_part = head[:mqty.start()].strip()
     if not name_part:
         return None
-
     return f"{name_part} | {qty} | {money}"
 
 def _best_transport_suffix(words):
@@ -340,56 +321,44 @@ def _best_transport_suffix(words):
     return best_name, best_score, best_cut
 
 def _try_parse_cost_no_pipes(line: str):
-    """
-    Accept: "ipoh perak lori kita hantar 350" => "ipoh perak | lori kita hantar | RM350"
-    """
     head, money = _extract_tail_money(line)
     if not money:
         return None
-
     words = [w for w in re.split(r"\s+", head.strip()) if w]
     if len(words) < 2:
         return None
-
     best_t, score, cut = _best_transport_suffix(words)
     if not best_t or score < TRANSPORT_THRESHOLD:
         return None
-
     dest = " ".join(words[:cut]).strip()
     if not dest:
         return None
-
     return f"{dest} | {best_t} | {money}"
 
 def auto_insert_pipes_if_missing(line: str) -> str:
     s = (line or "").strip()
     if not s:
         return "❓ | ❓ | ❓"
-
     if ("|" in s) or ("｜" in s):
         return s
 
-    # 1) produk lengkap (mesti ada qty)
     as_product = _try_parse_product_no_pipes_strict(s)
     if as_product:
         return as_product
 
-    # 2) penghantaran lengkap (dest + type + kos)
     as_cost = _try_parse_cost_no_pipes(s)
     if as_cost:
         return as_cost
 
-    # 3) fallback separa: ada harga di hujung
     head, money = _extract_tail_money(s)
     if money:
         head = head.strip()
 
-        # ✅ FIX: "transport luar 350" -> "❓ | Transport luar | RM350"
+        # FIX transport tanpa tempat: "transport luar 350" -> "❓ | Transport luar | RM350"
         best_t, tscore = best_transport_match(head)
         if best_t and tscore >= TRANSPORT_THRESHOLD:
             return f"❓ | {best_t} | {money}"
 
-        # cuba detect suffix transport (dest + transport)
         words = [w for w in re.split(r"\s+", head) if w]
         if words:
             tname, score, cut = _best_transport_suffix(words)
@@ -399,16 +368,13 @@ def auto_insert_pipes_if_missing(line: str) -> str:
                     return f"❓ | {tname} | {money}"
                 return f"{dest} | {tname} | {money}"
 
-        # default: treat as produk (nama | ❓ | RM)
+        # default: produk tanpa qty -> "nama | ❓ | RM"
         if not head:
             return f"❓ | ❓ | {money}"
         return f"{head} | ❓ | {money}"
 
-    # 4) tiada nombor pun
     return f"{s} | ❓ | ❓"
 
-
-# ================= FILL ❓ SEGMENTS =================
 def fill_missing_segments(parts, want_len=3):
     parts = list(parts or [])
     while len(parts) < want_len:
@@ -430,7 +396,6 @@ def normalize_detail_line(line: str) -> str:
 
     transport_like = is_transport_like_parts(parts)
 
-    # seg1
     if transport_like:
         if parts[0] != "❓":
             parts[0] = place_title_case(parts[0])
@@ -442,13 +407,11 @@ def normalize_detail_line(line: str) -> str:
             else:
                 parts[0] = parts[0].upper()
 
-    # seg2
     if transport_like and parts[1] != "❓":
         best_t, tscore = best_transport_match(parts[1])
         if best_t and tscore >= TRANSPORT_THRESHOLD:
             parts[1] = best_t
 
-    # seg3
     if parts[2] != "❓":
         parts[2] = _normalize_rm_value(parts[2])
 
@@ -468,16 +431,39 @@ def calc_total(lines):
 def stylize_line_for_caption(line: str, force_transport: bool = False) -> str:
     if ("|" in line) or ("｜" in line):
         parts = fill_missing_segments(_split_pipes(line), 3)
-
         if force_transport or is_transport_like_parts(parts):
             return " | ".join([bold2(parts[0]), bold2(parts[1]), bold(parts[2])])
-
         return bold(_join_pipes(parts))
-
     return bold(line)
 
+def build_caption(user_caption: str) -> str:
+    stamp = bold(make_stamp())
+    detail_lines_raw = extract_lines(user_caption)
+    detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
 
-# ================= OCR PARSE HELPERS =================
+    if not detail_lines:
+        detail_lines = [
+            "❓ | ❓ | ❓",
+            "❓ | ❓ | ❓",
+        ]
+
+    total = calc_total(detail_lines)
+
+    parts = [stamp, ""]
+    for idx, ln in enumerate(detail_lines):
+        if not user_caption.strip() and idx == 1:
+            parts.append(stylize_line_for_caption(ln, force_transport=True))
+        else:
+            parts.append(stylize_line_for_caption(ln))
+
+    parts += ["", f"Total keseluruhan : {bold('RM' + str(total))}"]
+    cap = "\n".join(parts)
+    if len(cap) > 1024:
+        cap = cap[:1000] + "\n...(caption terlalu panjang)"
+    return cap
+
+
+# ================= OCR HELPERS =================
 def _clean_ocr_text(t: str) -> str:
     t = t or ""
     t = t.replace("\r", "\n")
@@ -487,8 +473,6 @@ def _clean_ocr_text(t: str) -> str:
 
 def _find_datetime(text: str) -> Optional[str]:
     t = text
-
-    # 20 Jan 2026 10:17:21 AM
     m = re.search(
         r"\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\b",
         t, re.IGNORECASE
@@ -496,7 +480,6 @@ def _find_datetime(text: str) -> Optional[str]:
     if m:
         return m.group(1).strip()
 
-    # 20/01/2026 07:05 AM  or  20-01-2026 07:05
     m = re.search(
         r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*(AM|PM)?\b",
         t, re.IGNORECASE
@@ -506,11 +489,9 @@ def _find_datetime(text: str) -> Optional[str]:
         tm = m.group(2)
         ap = (m.group(3) or "").upper()
         return f"{d} {tm} {ap}".strip()
-
     return None
 
 def _find_total_amount(text: str) -> Optional[str]:
-    # ambil semua RMxxx.xx / RMxxxx
     amts = []
     for m in re.finditer(
         r"(?i)\bRM\s*([0-9]{1,3}(?:[,][0-9]{3})*(?:\.[0-9]{2})?|[0-9]{1,12}(?:\.[0-9]{2})?)\b",
@@ -524,8 +505,7 @@ def _find_total_amount(text: str) -> Optional[str]:
 
     if not amts:
         return None
-
-    mx = max(amts)  # paling selamat untuk resit: ambil nilai terbesar
+    mx = max(amts)
     if float(mx).is_integer():
         return f"RM{int(mx)}"
     return f"RM{mx:.2f}"
@@ -547,28 +527,29 @@ async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
             raise RuntimeError(resp.error.message)
 
         full = ""
-        try:
-            if resp.text_annotations:
-                full = resp.text_annotations[0].description or ""
-        except:
-            pass
+        if resp.text_annotations:
+            full = resp.text_annotations[0].description or ""
         return full
 
     text = await asyncio.to_thread(_run)
     text = _clean_ocr_text(text)
-
     dt = _find_datetime(text)
     total = _find_total_amount(text)
     acc_ok = _target_account_found(text, OCR_TARGET_ACCOUNT)
 
-    return {
-        "raw": text,
-        "datetime": dt,
-        "total": total,
-        "account_ok": acc_ok,
-    }
+    return {"raw": text, "datetime": dt, "total": total, "account_ok": acc_ok}
 
-def build_ocr_paragraph(ocr: Dict[str, Any]) -> str:
+def strip_existing_ocr_block(caption: str) -> str:
+    cap = caption or ""
+    cap = re.sub(
+        r"\n✅ Tarikh@waktu jam[^\n]*\n✅ No akaun[^\n]*\n✅ Total dalam resit[^\n]*(?:\n⚠️[^\n]*)?",
+        "",
+        cap
+    )
+    cap = re.sub(r"\n{3,}", "\n\n", cap)
+    return cap.strip()
+
+def build_ocr_paragraph(ocr: Dict[str, Any], note: str = "") -> str:
     dt = ocr.get("datetime")
     total = ocr.get("total")
     acc_ok = bool(ocr.get("account_ok"))
@@ -586,62 +567,19 @@ def build_ocr_paragraph(ocr: Dict[str, Any]) -> str:
         lines.append("✅ No akaun : ❓")
 
     lines.append(f"✅ Total dalam resit : {bold(total) if total else '❓'}")
+
+    if note:
+        lines.append(f"⚠️ {note}")
+
     return "\n".join(lines)
-
-def strip_existing_ocr_block(caption: str) -> str:
-    cap = caption or ""
-    cap = re.sub(
-        r"\n✅ Tarikh@waktu jam[^\n]*\n✅ No akaun[^\n]*\n✅ Total dalam resit[^\n]*",
-        "",
-        cap
-    )
-    cap = re.sub(r"\n{3,}", "\n\n", cap)
-    return cap.strip()
-
-
-def build_caption(user_caption: str) -> str:
-    stamp = bold(make_stamp())
-    detail_lines_raw = extract_lines(user_caption)
-    detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
-
-    # ✅ jika caption kosong, paksa 2 baris: produk + penghantaran
-    if not detail_lines:
-        detail_lines = [
-            "❓ | ❓ | ❓",  # produk
-            "❓ | ❓ | ❓",  # penghantaran
-        ]
-
-    total = calc_total(detail_lines)
-
-    parts = [stamp, ""]
-    for idx, ln in enumerate(detail_lines):
-        if not user_caption.strip() and idx == 1:
-            parts.append(stylize_line_for_caption(ln, force_transport=True))
-        else:
-            parts.append(stylize_line_for_caption(ln))
-
-    parts += ["", f"Total keseluruhan : {bold('RM' + str(total))}"]
-
-    cap = "\n".join(parts)
-    if len(cap) > 1024:
-        cap = cap[:1000] + "\n...(caption terlalu panjang)"
-    return cap
 
 
 # =========================================================
 # ✅ STATE: PRODUK/ALBUM
 # =========================================================
-STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))  # 24 jam
+STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))
 RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
 
-# state:
-# {
-#   "product_file_id": str,
-#   "caption": str,
-#   "receipts": [file_id...],
-#   "msg_ids": [message_id...],
-#   "ts": epoch
-# }
 ORDER_STATES = {}   # (chat_id, root_id) -> state
 MSGID_TO_STATE = {} # (chat_id, msg_id) -> (chat_id, root_id)
 _state_lock = asyncio.Lock()
@@ -678,20 +616,11 @@ async def _delete_messages_safe(client: Client, chat_id: int, msg_ids):
     except:
         pass
 
-async def _send_album_and_update_state(
-    client: Client,
-    chat_id: int,
-    state_id,
-    product_file_id: str,
-    caption: str,
-    receipts: list
-):
-    # bina media list
+async def _send_album_and_update_state(client: Client, chat_id: int, state_id, product_file_id: str, caption: str, receipts: list):
     media = [InputMediaPhoto(media=product_file_id, caption=caption)]
     for fid in receipts:
         media.append(InputMediaPhoto(media=fid))
 
-    # chunk max 10
     chunks, cur = [], []
     for m in media:
         cur.append(m)
@@ -708,7 +637,6 @@ async def _send_album_and_update_state(
                 ch[0].caption = None
             except:
                 pass
-
         res = await tg_call(client.send_media_group, chat_id=chat_id, media=ch)
         try:
             for m in res:
@@ -716,11 +644,9 @@ async def _send_album_and_update_state(
         except:
             pass
 
-    # update mapping
     for mid in sent_msg_ids:
         MSGID_TO_STATE[(chat_id, mid)] = state_id
 
-    # update state
     ORDER_STATES[state_id] = {
         "product_file_id": product_file_id,
         "caption": caption,
@@ -732,9 +658,9 @@ async def _send_album_and_update_state(
 
 
 # =========================================================
-# ✅ RECEIPT GROUP BUFFER (album user)
+# ✅ RECEIPT GROUP BUFFER
 # =========================================================
-_pending_receipt_groups = {}  # (chat_id, media_group_id, reply_to_id) -> {"msgs":[Message], "task":Task}
+_pending_receipt_groups = {}
 _pending_lock = asyncio.Lock()
 
 def is_reply_to_any_message(message) -> bool:
@@ -766,17 +692,14 @@ async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: 
 
         old_ids = state.get("msg_ids", [])
         await _delete_messages_safe(client, chat_id, old_ids)
-
         for mid in old_ids:
             MSGID_TO_STATE.pop((chat_id, mid), None)
 
         await _send_album_and_update_state(
-            client=client,
-            chat_id=chat_id,
-            state_id=state_id,
-            product_file_id=state["product_file_id"],
-            caption=state.get("caption", ""),
-            receipts=receipts
+            client, chat_id, state_id,
+            state["product_file_id"],
+            state.get("caption", ""),
+            receipts
         )
         return True
 
@@ -803,18 +726,10 @@ async def _process_receipt_group(client: Client, chat_id: int, media_group_id: s
     if merged:
         return
 
-    # fallback: repost resit sahaja sebagai album reply
-    try:
-        medias = [InputMediaPhoto(media=fid) for fid in receipt_file_ids]
-        await tg_call(client.send_media_group, chat_id=chat_id, media=medias, reply_to_message_id=reply_to_id)
-    except:
-        pass
-
 async def handle_receipt_photo(client: Client, message):
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
 
-    # album receipts
     if message.media_group_id:
         key = (chat_id, str(message.media_group_id), reply_to_id)
         async with _pending_lock:
@@ -826,25 +741,16 @@ async def handle_receipt_photo(client: Client, message):
             _pending_receipt_groups[key]["msgs"].append(message)
         return
 
-    # single receipt
     receipt_fid = message.photo.file_id if message.photo else None
     await _delete_message_safe(message)
     if not receipt_fid:
         return
 
-    merged = await _merge_receipts_and_repost(client, chat_id, reply_to_id, [receipt_fid])
-    if merged:
-        return
-
-    # fallback: repost single resit reply
-    try:
-        await tg_call(client.send_photo, chat_id=chat_id, photo=receipt_fid, reply_to_message_id=reply_to_id)
-    except:
-        pass
+    await _merge_receipts_and_repost(client, chat_id, reply_to_id, [receipt_fid])
 
 
 # =========================================================
-# ✅ OCR TRIGGER (reply + "123") -> DELETE ALBUM LAMA + REPOST DGN OCR
+# ✅ OCR TRIGGER: REPOST ALBUM + OCR BLOCK (PASTI)
 # =========================================================
 async def _download_file_bytes(client: Client, file_id: str) -> Optional[bytes]:
     try:
@@ -856,12 +762,8 @@ async def _download_file_bytes(client: Client, file_id: str) -> Optional[bytes]:
     except:
         return None
 
-async def _apply_ocr_to_order(client: Client, chat_id: int, reply_to_id: int) -> bool:
-    # OCR mesti ready
-    if not _OCR_READY or not VISION_CLIENT:
-        return False
-
-    # 1) ambil state + pastikan ada resit
+async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id: int) -> bool:
+    # 1) ambil state
     async with _state_lock:
         _cleanup_states()
         state_id = _get_state_id_from_reply(chat_id, reply_to_id)
@@ -871,53 +773,56 @@ async def _apply_ocr_to_order(client: Client, chat_id: int, reply_to_id: int) ->
 
         receipts = state.get("receipts", [])
         if not receipts:
-            return False  # syarat: mesti ada sekurang-kurangnya 1 resit
+            return False  # ikut syarat: mesti ada resit pertama dulu
 
         product_file_id = state.get("product_file_id")
         caption_now = state.get("caption", "")
         old_ids = list(state.get("msg_ids", []))
         last_receipt = receipts[-1]
 
-    # 2) download resit terakhir -> OCR
-    img_bytes = await _download_file_bytes(client, last_receipt)
-    if not img_bytes:
-        return False
+    # 2) OCR (kalau tak ready/gagal, tetap repost dengan ❓ + nota)
+    note = ""
+    ocr_data = {"datetime": None, "total": None, "account_ok": False}
 
-    try:
-        ocr = await ocr_extract_from_bytes(img_bytes)
-    except:
-        return False
+    if not _OCR_READY or not VISION_CLIENT:
+        note = f"OCR tak aktif ({_OCR_INIT_ERROR})"
+    else:
+        img_bytes = await _download_file_bytes(client, last_receipt)
+        if not img_bytes:
+            note = "OCR gagal (download resit gagal)"
+        else:
+            try:
+                ocr_data = await ocr_extract_from_bytes(img_bytes)
+            except Exception as e:
+                note = f"OCR gagal ({e})"
 
-    # 3) bina caption baru (buang OCR lama, tambah OCR baru)
+    # 3) bina caption baru
     cleaned = strip_existing_ocr_block(caption_now)
-    new_caption = cleaned + build_ocr_paragraph(ocr)
+    new_caption = cleaned + build_ocr_paragraph(ocr_data, note=note)
+
     if len(new_caption) > 1024:
         new_caption = new_caption[:1000] + "\n...(caption terlalu panjang)"
 
-    # 4) delete album lama + repost album baru (produk+caption OCR + semua resit)
+    # 4) PADAM album lama + REPOST album baru
     async with _state_lock:
         _cleanup_states()
         state = ORDER_STATES.get(state_id)
         if not state:
             return False
 
-        # delete album lama
         await _delete_messages_safe(client, chat_id, old_ids)
         for mid in old_ids:
             MSGID_TO_STATE.pop((chat_id, mid), None)
 
-        try:
-            await _send_album_and_update_state(
-                client=client,
-                chat_id=chat_id,
-                state_id=state_id,
-                product_file_id=product_file_id,
-                caption=new_caption,
-                receipts=receipts
-            )
-            return True
-        except:
-            return False
+        await _send_album_and_update_state(
+            client=client,
+            chat_id=chat_id,
+            state_id=state_id,
+            product_file_id=product_file_id,
+            caption=new_caption,
+            receipts=receipts
+        )
+        return True
 
 
 @bot.on_message(filters.text & ~filters.bot)
@@ -933,31 +838,28 @@ async def handle_text_trigger(client: Client, message):
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
 
-    # padam mesej "123" untuk kekalkan chat kemas
+    # padam "123"
     await _delete_message_safe(message)
 
-    # ikut request awak:
-    # jika tak ada resit pertama -> "tidak ada apa2 berlaku"
-    await _apply_ocr_to_order(client, chat_id, reply_to_id)
+    # ikut request awak: kalau belum ada resit -> diam saja
+    await _apply_ocr_and_repost_album(client, chat_id, reply_to_id)
     return
 
 
 # ================= HANDLER PHOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
-    # ✅ receipt mode (reply)
+    # receipt mode
     if is_reply_to_any_message(message):
         await handle_receipt_photo(client, message)
         return
 
-    # ✅ normal mode (repost caption kemas)
     chat_id = message.chat.id
     photo_id = message.photo.file_id
     user_caption = message.caption or ""
 
     new_caption = build_caption(user_caption)
 
-    # padam mesej asal (user)
     try:
         await tg_call(message.delete)
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -965,7 +867,6 @@ async def handle_photo(client, message):
     except:
         pass
 
-    # repost versi kemas (bot)
     sent = await tg_call(
         client.send_photo,
         chat_id=chat_id,
@@ -973,13 +874,11 @@ async def handle_photo(client, message):
         caption=new_caption
     )
 
-    # simpan state awal
     try:
         if sent and sent.photo:
             async with _state_lock:
                 _cleanup_states()
                 state_id = (chat_id, sent.id)
-
                 ORDER_STATES[state_id] = {
                     "product_file_id": sent.photo.file_id,
                     "caption": sent.caption or new_caption,
@@ -994,3 +893,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
