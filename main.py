@@ -214,7 +214,7 @@ def _cap_word(w: str) -> str:
     if w.isdigit():
         return w
     if w.isalpha() and len(w) <= 2:
-        return w.upper()  # contoh: TS
+        return w.upper()
     return w.lower().capitalize()
 
 def place_title_case(s: str) -> str:
@@ -376,24 +376,19 @@ def stylize_line_for_caption(line: str) -> str:
                 for p in parts[2:-1]:
                     mid.append(bold(p))
             return " | ".join([seg0, seg1] + mid + [seg_last])
-
     return bold(line)
 
 
 def build_caption(user_caption: str) -> str:
     stamp = bold(make_stamp())
-
     detail_lines_raw = extract_lines(user_caption)
     detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
     total = calc_total(detail_lines)
 
-    parts = []
-    parts.append(stamp)
-    parts.append("")
+    parts = [stamp, ""]
     for ln in detail_lines:
         parts.append(stylize_line_for_caption(ln))
-    parts.append("")
-    parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
+    parts += ["", f"Total keseluruhan : {bold('RM' + str(total))}"]
 
     cap = "\n".join(parts)
     if len(cap) > 1024:
@@ -402,65 +397,66 @@ def build_caption(user_caption: str) -> str:
 
 
 # =========================================================
-# ✅ STORE POST PRODUK BOT (supaya boleh gabung dgn resit)
+# ✅ STATE: PRODUK/ALBUM (SUPAYA SWIPE KALI KE-2, KE-3 PUN BOLEH)
 # =========================================================
-PRODUCT_TTL_SEC = float(os.getenv("PRODUCT_TTL_SEC", "86400"))  # 24 jam
-PRODUCT_POSTS = {}  # key=(chat_id, msg_id) -> {"photo": file_id, "caption": str, "ts": epoch}
-
-def _cleanup_product_posts():
-    now = time.time()
-    to_del = []
-    for k, v in PRODUCT_POSTS.items():
-        if now - float(v.get("ts", now)) > PRODUCT_TTL_SEC:
-            to_del.append(k)
-    for k in to_del:
-        PRODUCT_POSTS.pop(k, None)
-
-
-# =========================================================
-# ✅ RECEIPT REPLY -> PADAM & REPOST ALBUM BERSAMA PRODUK
-# =========================================================
+STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))  # 24 jam
 RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
 
-_pending_receipt_groups = {}  # key=(chat_id, media_group_id, reply_to_id) -> {"msgs":[Message], "task":Task}
-_pending_lock = asyncio.Lock()
+# state_id = (chat_id, root_id)
+# data = {"product_file_id": str, "caption": str, "receipts": [file_id...], "msg_ids": [message_id...], "ts": epoch}
+ORDER_STATES = {}
 
+# map setiap message_id dalam album -> state_id
+MSGID_TO_STATE = {}
 
-def is_reply_to_any_message(message) -> bool:
+_state_lock = asyncio.Lock()
+
+def _cleanup_states():
+    now = time.time()
+    kill = []
+    for sid, data in ORDER_STATES.items():
+        if now - float(data.get("ts", now)) > STATE_TTL_SEC:
+            kill.append(sid)
+    for sid in kill:
+        data = ORDER_STATES.pop(sid, None)
+        if data:
+            for mid in data.get("msg_ids", []):
+                MSGID_TO_STATE.pop((sid[0], mid), None)
+
+def _get_state_id_from_reply(chat_id: int, reply_to_id: int):
+    # reply boleh pada post single (root) atau mana-mana keping album
+    sid = MSGID_TO_STATE.get((chat_id, reply_to_id))
+    if sid:
+        return sid
+    # kalau belum ada mapping (mungkin reply pada post single yang baru), pakai root = reply_to_id
+    return (chat_id, reply_to_id)
+
+async def _delete_messages_safe(client: Client, chat_id: int, msg_ids):
+    if not msg_ids:
+        return
     try:
-        return bool(message.reply_to_message and message.reply_to_message.id)
-    except:
-        return False
-
-
-async def _delete_message_safe(msg):
-    try:
-        await tg_call(msg.delete)
+        await tg_call(client.delete_messages, chat_id, msg_ids)
     except (MessageDeleteForbidden, ChatAdminRequired):
-        pass
+        # fallback: cuba delete satu-satu
+        for mid in msg_ids:
+            try:
+                await tg_call(client.delete_messages, chat_id, mid)
+            except:
+                pass
     except:
         pass
 
-
-async def _repost_album_with_product(client: Client, chat_id: int, reply_to_id: int, receipt_file_ids: list):
+async def _send_album_and_update_state(client: Client, chat_id: int, state_id, product_file_id: str, caption: str, receipts: list):
     """
-    Padam post produk bot + padam resit, kemudian hantar album:
-    [produk (dengan caption)] + [resit-resit]
+    Send album: [produk+caption] + receipts (cumulative)
+    Update msg_ids & mapping MSGID_TO_STATE
     """
-    _cleanup_product_posts()
-    prod = PRODUCT_POSTS.get((chat_id, reply_to_id))
-    if not prod:
-        return False
-
-    prod_photo = prod["photo"]
-    prod_caption = prod.get("caption", "")
-
-    media = [InputMediaPhoto(media=prod_photo, caption=prod_caption)]
-    for fid in receipt_file_ids:
+    # bina media list
+    media = [InputMediaPhoto(media=product_file_id, caption=caption)]
+    for fid in receipts:
         media.append(InputMediaPhoto(media=fid))
 
-    # Telegram limit media_group = 10 item
-    # Kalau resit banyak, dia akan hantar batch 10-10 (produk batch pertama sahaja).
+    # chunk max 10
     chunks = []
     cur = []
     for m in media:
@@ -471,28 +467,110 @@ async def _repost_album_with_product(client: Client, chat_id: int, reply_to_id: 
     if cur:
         chunks.append(cur)
 
-    # padam post produk bot dulu
+    sent_msg_ids = []
+    # hantar chunk demi chunk
+    for idx, ch in enumerate(chunks):
+        # pastikan caption hanya pada first item of first chunk
+        if idx > 0:
+            # buang caption kalau terbawa
+            try:
+                if ch and hasattr(ch[0], "caption"):
+                    ch[0].caption = None
+            except:
+                pass
+
+        res = await tg_call(client.send_media_group, chat_id=chat_id, media=ch)
+        # pyrogram return list[Message]
+        try:
+            for m in res:
+                sent_msg_ids.append(m.id)
+        except:
+            pass
+
+    # update mapping
+    for mid in sent_msg_ids:
+        MSGID_TO_STATE[(chat_id, mid)] = state_id
+
+    # update state
+    ORDER_STATES[state_id] = {
+        "product_file_id": product_file_id,
+        "caption": caption,
+        "receipts": list(receipts),
+        "msg_ids": list(sent_msg_ids),
+        "ts": time.time(),
+    }
+
+    return sent_msg_ids
+
+
+# =========================================================
+# ✅ RECEIPT GROUP BUFFER (album user)
+# =========================================================
+_pending_receipt_groups = {}  # key=(chat_id, media_group_id, reply_to_id) -> {"msgs":[Message], "task":Task}
+_pending_lock = asyncio.Lock()
+
+def is_reply_to_any_message(message) -> bool:
     try:
-        await tg_call(client.delete_messages, chat_id, reply_to_id)
+        return bool(message.reply_to_message and message.reply_to_message.id)
+    except:
+        return False
+
+async def _delete_message_safe(msg):
+    try:
+        await tg_call(msg.delete)
+    except (MessageDeleteForbidden, ChatAdminRequired):
+        pass
     except:
         pass
 
-    # send batch pertama (ada produk+caption)
-    ok = True
-    for idx, ch in enumerate(chunks):
-        try:
-            await tg_call(client.send_media_group, chat_id=chat_id, media=ch)
-        except:
-            ok = False
-            break
+async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: int, new_receipt_file_ids: list):
+    """
+    Ini yang buat proses berulang:
+    - reply pada single produk (kali pertama) ATAU reply pada album (kali kedua/ketiga...)
+    - tambah receipts (cumulative)
+    - padam album lama / padam post lama
+    - repost album baru
+    """
+    if not new_receipt_file_ids:
+        return
 
-        # batch seterusnya: jangan ulang caption (kalau ada)
-        if idx == 0 and len(chunks) > 1:
-            # buang caption pada first media untuk batch seterusnya (safety)
-            pass
+    async with _state_lock:
+        _cleanup_states()
+        state_id = _get_state_id_from_reply(chat_id, reply_to_id)
+        state = ORDER_STATES.get(state_id)
 
-    return ok
+        # kalau tiada state lagi, ini mungkin reply pada post produk single (bot)
+        if not state:
+            # kita perlukan product file_id + caption daripada message reply itu
+            # sebab tu: reply_to_message ialah message bot (produk) yang ada photo+caption
+            # NOTE: kalau reply pada album tapi state hilang (TTL expired), kita tak boleh recover.
+            return False
 
+        # tambah receipts (cumulative)
+        receipts = state.get("receipts", [])
+        receipts = receipts + list(new_receipt_file_ids)
+
+        # OPTIONAL: elak duplicate yang sama (file_id)
+        # receipts = list(dict.fromkeys(receipts))
+
+        # padam album lama (semua msg_ids)
+        old_ids = state.get("msg_ids", [])
+        await _delete_messages_safe(client, chat_id, old_ids)
+
+        # buang mapping lama
+        for mid in old_ids:
+            MSGID_TO_STATE.pop((chat_id, mid), None)
+
+        # repost album baru & update state
+        await _send_album_and_update_state(
+            client,
+            chat_id,
+            state_id,
+            state["product_file_id"],
+            state.get("caption", ""),
+            receipts
+        )
+        return True
 
 async def _process_receipt_group(client: Client, chat_id: int, media_group_id: str, reply_to_id: int):
     await asyncio.sleep(RECEIPT_DELAY_SEC)
@@ -514,24 +592,23 @@ async def _process_receipt_group(client: Client, chat_id: int, media_group_id: s
     if not receipt_file_ids:
         return
 
-    # cuba gabung bersama produk (kalau reply pada post produk bot)
-    merged = await _repost_album_with_product(client, chat_id, reply_to_id, receipt_file_ids)
+    # try merge (repeatable)
+    merged = await _merge_receipts_and_repost(client, chat_id, reply_to_id, receipt_file_ids)
     if merged:
         return
 
-    # fallback (kalau bukan reply pada post produk bot): repost resit sahaja sebagai album reply
+    # fallback: repost resit sahaja sebagai album reply (kalau tak jumpa state)
     try:
         medias = [InputMediaPhoto(media=fid) for fid in receipt_file_ids]
         await tg_call(client.send_media_group, chat_id=chat_id, media=medias, reply_to_message_id=reply_to_id)
     except:
         pass
 
-
 async def handle_receipt_photo(client: Client, message):
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
 
-    # album
+    # album receipts
     if message.media_group_id:
         key = (chat_id, str(message.media_group_id), reply_to_id)
         async with _pending_lock:
@@ -543,13 +620,13 @@ async def handle_receipt_photo(client: Client, message):
             _pending_receipt_groups[key]["msgs"].append(message)
         return
 
-    # single photo resit
+    # single receipt
     receipt_fid = message.photo.file_id if message.photo else None
     await _delete_message_safe(message)
     if not receipt_fid:
         return
 
-    merged = await _repost_album_with_product(client, chat_id, reply_to_id, [receipt_fid])
+    merged = await _merge_receipts_and_repost(client, chat_id, reply_to_id, [receipt_fid])
     if merged:
         return
 
@@ -564,8 +641,9 @@ async def handle_receipt_photo(client: Client, message):
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
     """
-    1) Jika user reply (swipe kiri) dan hantar resit => padam semua & repost album bersama produk (jika reply pada post bot).
+    1) Jika user reply (swipe kiri) dan hantar resit => proses resit (repeatable, cumulative album).
     2) Kalau bukan reply => post produk biasa => bot format caption & repost.
+       -> simpan state pertama untuk order itu (supaya boleh merge resit kemudian).
     """
     # ✅ receipt mode (reply)
     if is_reply_to_any_message(message):
@@ -587,7 +665,7 @@ async def handle_photo(client, message):
     except:
         pass
 
-    # repost versi kemas (bot) + SIMPAN untuk gabung resit nanti
+    # repost versi kemas (bot)
     sent = await tg_call(
         client.send_photo,
         chat_id=chat_id,
@@ -595,19 +673,24 @@ async def handle_photo(client, message):
         caption=new_caption
     )
 
-    # simpan info post bot
+    # ✅ SIMPAN STATE AWAL (root = sent.id)
     try:
         if sent and sent.photo:
-            PRODUCT_POSTS[(chat_id, sent.id)] = {
-                "photo": sent.photo.file_id,
-                "caption": sent.caption or new_caption,
-                "ts": time.time()
-            }
-            _cleanup_product_posts()
+            async with _state_lock:
+                _cleanup_states()
+                state_id = (chat_id, sent.id)
+
+                ORDER_STATES[state_id] = {
+                    "product_file_id": sent.photo.file_id,
+                    "caption": sent.caption or new_caption,
+                    "receipts": [],
+                    "msg_ids": [sent.id],   # masa ini masih single
+                    "ts": time.time(),
+                }
+                MSGID_TO_STATE[(chat_id, sent.id)] = state_id
     except:
         pass
 
 
 if __name__ == "__main__":
     bot.run()
-
