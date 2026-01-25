@@ -1161,7 +1161,7 @@ async def senarai_produk(client, callback):
         state["ctx"] = {}
 
     await render_order(client, callback, state)
-    await callback.answer()
+    await fast_ack(callback)
 
 
 @bot.on_callback_query(filters.regex(r"^produk_"))
@@ -1279,7 +1279,7 @@ async def harga_digit(client, callback):
         state["ctx"] = ctx
 
     await render_order(client, callback, state)
-    await callback.answer()
+    await fast_ack(callback)
 
 
 @bot.on_callback_query(filters.regex(rf"^{PRICE_PREFIX}_back$"))
@@ -1451,7 +1451,7 @@ async def kos_digit(client, callback):
         state["ctx"] = ctx
 
     await render_order(client, callback, state)
-    await callback.answer()
+    await fast_ack(callback)
 
 
 @bot.on_callback_query(filters.regex(rf"^{KOS_PREFIX}_back$"))
@@ -1694,7 +1694,7 @@ async def pin_press_digit(client, callback):
         )
     except Exception:
         pass
-    await callback.answer()
+    await fast_ack(callback)
 
 
 @bot.on_callback_query(filters.regex(r"^pin_back$"))
@@ -1852,7 +1852,7 @@ async def sp_press_digit(client, callback):
         )
     except Exception:
         pass
-    await callback.answer()
+    await fast_ack(callback)
 
 
 @bot.on_callback_query(filters.regex(r"^sp_back$"))
