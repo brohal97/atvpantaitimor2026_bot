@@ -1349,8 +1349,7 @@ async def harga_okey_set(client, callback):
         state["ctx"] = {}
 
     await render_order(client, callback, state)
-    await callback.answer("Harga diset ✅")
-
+    await fast_ack(callback, "Harga diset ✅")
 
 @bot.on_callback_query(filters.regex(r"^destinasi$"))
 async def buka_destinasi(client, callback):
