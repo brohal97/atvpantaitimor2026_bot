@@ -72,9 +72,63 @@ def extract_lines(text: str):
     return lines
 
 
+def _normalize_rm_value(val: str) -> str:
+    """
+    Jadikan nilai akhir sentiasa format: RM<angka>
+    - "200" -> "RM200"
+    - "rm200" / "Rm 200" -> "RM200"
+    - "RM200" -> "RM200"
+    Jika tak jumpa nombor, pulangkan asal.
+    """
+    s = (val or "").strip()
+    if not s:
+        return s
+
+    # cari nombor pertama (support koma/spasi)
+    m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
+    if not m:
+        # kalau user tulis macam "rm 300." atau ada simbol pelik, cuba cari digits sahaja
+        m2 = re.search(r"([0-9]{1,12})", s)
+        if not m2:
+            return s
+        num = m2.group(1)
+        return f"RM{num}"
+
+    num = m.group(1)
+    return f"RM{num}"
+
+
+def normalize_detail_line(line: str) -> str:
+    """
+    Rules:
+    1) Segmen pertama (nama produk/destinasi) -> UPPERCASE (ikut request: untuk nama produk sahaja,
+       tetapi kita apply pada segmen pertama jika format ada '|', sebab user minta auto huruf besar di situ)
+    2) Segmen terakhir -> pastikan bermula 'RM' uppercase, auto tambah jika user lupa.
+    Contoh:
+      "125cc full spec | 2 | 200"   -> "125CC FULL SPEC | 2 | RM200"
+      "125cc full spec | 2 | rm200" -> "125CC FULL SPEC | 2 | RM200"
+      "Ipoh Perak | Transport luar | rm300" -> "IPOH PERAK | Transport luar | RM300"
+    """
+    if "|" not in line:
+        return line
+
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) < 2:
+        return line
+
+    # segmen pertama: uppercase
+    parts[0] = parts[0].upper()
+
+    # segmen terakhir: normalize RM
+    parts[-1] = _normalize_rm_value(parts[-1])
+
+    return " | ".join(parts)
+
+
 def calc_total(lines):
     total = 0
     for ln in lines:
+        # kira semua nombor selepas RM (case-insensitive)
         nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", ln)
         for n in nums:
             try:
@@ -87,7 +141,10 @@ def calc_total(lines):
 def build_caption(user_caption: str) -> str:
     stamp = bold(make_stamp())
 
-    detail_lines = extract_lines(user_caption)
+    detail_lines_raw = extract_lines(user_caption)
+    # normalize dulu (supaya total kira betul walaupun user tak tulis RM)
+    detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
+
     total = calc_total(detail_lines)
 
     parts = []
@@ -136,4 +193,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
