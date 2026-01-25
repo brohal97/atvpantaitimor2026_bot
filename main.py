@@ -1,8 +1,23 @@
+# =========================
+# ATV PANTAI TIMOR BOT (FULL VERSION)
+# ✅ Repost gambar produk + caption kemas
+# ✅ Bold style (produk) + Bold2 (tempat + jenis penghantaran)
+# ✅ Auto betulkan produk/transport guna fuzzy match
+# ✅ Auto insert ' | ' bila user tak guna pipes
+# ✅ Auto isi ❓ bila user terlupa isi segmen (produk & penghantaran)
+# ✅ RULE PENTING (NO-PIPES):
+#    - "125cc foll sepek 1 5900" => "125CC FULL SPEC | 1 | RM5900"
+#    - "125cc follspek 5900"     => "125CC FULL SPEC | ❓ | RM5900"
+# ✅ Swipe kiri (Reply) upload resit berkali-kali:
+#    - setiap kali user reply & hantar resit (1 keping / album), bot padam resit asal
+#    - bot padam album lama (produk+resit) dan repost semula sebagai album baru (cumulative)
+# =========================
+
 import os, re, asyncio, time
 from datetime import datetime
-import pytz
 from difflib import SequenceMatcher
 
+import pytz
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError, MessageDeleteForbidden, ChatAdminRequired
 from pyrogram.types import InputMediaPhoto
@@ -40,7 +55,7 @@ def bold(text: str) -> str:
     return (text or "").translate(BOLD_MAP)
 
 
-# ================= BOLD STYLE 2 (KHAS UNTUK TEMPAT + JENIS TRANSPORT) =================
+# ================= BOLD STYLE 2 (KHAS TEMPAT + JENIS TRANSPORT) =================
 ALT_BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
@@ -73,10 +88,10 @@ PRODUCT_NAMES = [
     "TROLI PLASTIK",
     "TROLI BESI",
 ]
-FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.72"))  # produk
+FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.72"))
 
 
-# ================= TRANSPORT FIXED TYPES (SEGMENT KE-2) =================
+# ================= TRANSPORT FIXED TYPES =================
 TRANSPORT_TYPES = [
     "Transport luar",
     "Pickup sendiri",
@@ -108,7 +123,6 @@ def best_product_match(user_first_segment: str):
         if score > best_score:
             best_score = score
             best_name = name
-
     return best_name, best_score
 
 
@@ -124,7 +138,6 @@ def best_transport_match(user_transport_segment: str):
         if score > best_score:
             best_score = score
             best_name = name
-
     return best_name, best_score
 
 
@@ -191,15 +204,15 @@ def is_product_line(line: str) -> bool:
     if len(parts) < 3:
         return False
 
-    seg2 = parts[1]
-    if not re.fullmatch(r"\d{1,3}", seg2.strip()):
+    seg2 = (parts[1] or "").strip()
+    if not re.fullmatch(r"\d{1,3}", seg2):
         return False
 
     return _looks_like_money_tail(parts[-1])
 
 
 def is_cost_or_transport_line(line: str) -> bool:
-    # versi strict (digunakan untuk kes total yang betul-betul ada RM)
+    # strict: mesti ada RM di segmen akhir (untuk total)
     if ("|" not in line) and ("｜" not in line):
         return False
     parts = _split_pipes(line)
@@ -210,8 +223,8 @@ def is_cost_or_transport_line(line: str) -> bool:
     return _looks_like_money_tail(parts[-1])
 
 
-# ================= ✅ BARU: DETECT “LINE INI PENGHANTARAN” WALAU HARGA KOSONG =================
 def is_transport_like_parts(parts) -> bool:
+    # detect penghantaran walau kos ❓
     if not parts or len(parts) < 2:
         return False
     seg2 = (parts[1] or "").strip()
@@ -221,7 +234,7 @@ def is_transport_like_parts(parts) -> bool:
     return bool(name and score >= TRANSPORT_THRESHOLD)
 
 
-# ================= NAMA TEMPAT: HURUF DEPAN SAHAJA (Title Case) =================
+# ================= NAMA TEMPAT: Title Case =================
 def _cap_word(w: str) -> str:
     if not w:
         return w
@@ -232,6 +245,7 @@ def _cap_word(w: str) -> str:
     if w.isalpha() and len(w) <= 2:
         return w.upper()
     return w.lower().capitalize()
+
 
 def place_title_case(s: str) -> str:
     s = (s or "").strip()
@@ -250,36 +264,38 @@ def place_title_case(s: str) -> str:
     return " ".join(out)
 
 
-# ================= AUTO INSERT ' | ' IF USER TERLUPA (NO PIPES) =================
-def _extract_tail_money(text: str):
-    s = (text or "").strip()
+# ================= AUTO FILL ❓ FOR PIPES =================
+def fill_missing_segments(parts, want_len=3):
+    parts = list(parts or [])
+    while len(parts) < want_len:
+        parts.append("")
+    out = []
+    for p in parts[:want_len]:
+        p = (p or "").strip()
+        out.append(p if p else "❓")
+    return out
+
+
+# =========================================================
+# ✅ NO-PIPES SMART PARSER (INI YANG AWAK MAHU)
+# =========================================================
+def _last_number_token(s: str):
+    """
+    Ambil nombor terakhir di hujung ayat.
+    Support: "RM5900", "rm 5900", "5900"
+    Return: (head_text, number_str or None)
+    """
+    s = (s or "").strip()
     if not s:
         return s, None
 
-    m = re.search(r"(?i)(?:\brm\b\s*)?([0-9]{1,12})\s*$", s)
+    m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\s*$", s)
     if not m:
         return s, None
 
     num = m.group(1)
     head = s[:m.start()].strip()
-    return head, f"RM{num}"
-
-
-def _try_parse_product_no_pipes(line: str):
-    head, money = _extract_tail_money(line)
-    if not money:
-        return None
-
-    mqty = re.search(r"\b(\d{1,3})\s*$", head)
-    if not mqty:
-        return None
-
-    qty = mqty.group(1)
-    name_part = head[:mqty.start()].strip()
-    if not name_part:
-        return None
-
-    return f"{name_part} | {qty} | {money}"
+    return head, num
 
 
 def _best_transport_suffix(words):
@@ -300,27 +316,113 @@ def _best_transport_suffix(words):
     return best_name, best_score, best_cut
 
 
+def _try_parse_product_no_pipes(line: str):
+    """
+    ✅ BARU (produk):
+    - "nama qty harga"  -> nama | qty | RMharga
+    - "nama harga"      -> nama | ❓ | RMharga   (INI KES 125cc follspek 5900)
+    - "nama qty"        -> nama | qty | ❓
+    - "harga"           -> ❓ | ❓ | RMharga
+    - "nama"            -> nama | ❓ | ❓
+    """
+    s = (line or "").strip()
+    if not s:
+        return None
+
+    head, num = _last_number_token(s)
+
+    if not num:
+        # tiada nombor langsung => nama sahaja
+        return f"{s} | ❓ | ❓"
+
+    n = int(num)
+
+    # heuristic: <=30 dianggap qty
+    if n <= 30:
+        name_part = head.strip()
+        if not name_part:
+            name_part = "❓"
+        return f"{name_part} | {n} | ❓"
+
+    # n > 30 => harga
+    money = f"RM{n}"
+
+    # cuba detect qty di hujung head: "... 1"
+    mqty = re.search(r"\b(\d{1,3})\s*$", head)
+    if mqty:
+        qty = int(mqty.group(1))
+        name_part = head[:mqty.start()].strip()
+        if not name_part:
+            name_part = "❓"
+        return f"{name_part} | {qty} | {money}"
+
+    # tiada qty => auto ❓
+    name_part = head.strip()
+    if not name_part:
+        name_part = "❓"
+    return f"{name_part} | ❓ | {money}"
+
+
 def _try_parse_cost_no_pipes(line: str):
-    head, money = _extract_tail_money(line)
-    if not money:
+    """
+    ✅ BARU (penghantaran):
+    - "tempat jenis kos" -> tempat | jenis | RMkos
+    - "tempat kos"      -> tempat | ❓ | RMkos
+    - "tempat jenis"    -> tempat | jenis | ❓
+    - "jenis kos"       -> ❓ | jenis | RMkos
+    - "kos"             -> ❓ | ❓ | RMkos
+    """
+    s = (line or "").strip()
+    if not s:
         return None
 
-    words = [w for w in re.split(r"\s+", head.strip()) if w]
-    if len(words) < 2:
+    head, num = _last_number_token(s)
+    money = None
+    base = s
+
+    if num:
+        n = int(num)
+        if n > 30:
+            money = f"RM{n}"
+            base = head.strip()
+        else:
+            # nombor kecil biasanya qty, bukan kos => treat kos tiada
+            base = s
+
+    words = [w for w in re.split(r"\s+", base) if w]
+
+    if not words:
+        if money:
+            return f"❓ | ❓ | {money}"
         return None
 
-    best_t, score, cut = _best_transport_suffix(words)
-    if not best_t or score < TRANSPORT_THRESHOLD:
-        return None
+    best_t, best_score, cut = _best_transport_suffix(words)
+    if best_t and best_score >= TRANSPORT_THRESHOLD:
+        dest = " ".join(words[:cut]).strip() if cut is not None else ""
+        if not dest:
+            dest = "❓"
+        if not money:
+            money = "❓"
+        return f"{dest} | {best_t} | {money}"
 
-    dest = " ".join(words[:cut]).strip()
-    if not dest:
-        return None
+    # tiada jenis match, tapi ada kos => tempat | ❓ | kos
+    if money:
+        dest = " ".join(words).strip()
+        if not dest:
+            dest = "❓"
+        return f"{dest} | ❓ | {money}"
 
-    return f"{dest} | {best_t} | {money}"
+    return None
 
 
 def auto_insert_pipes_if_missing(line: str) -> str:
+    """
+    ✅ BARU:
+    Kalau user tak guna '|', kita auto jadikan 3 segmen dan isi ❓ ikut logic.
+    Keutamaan:
+    1) penghantaran
+    2) produk
+    """
     s = (line or "").strip()
     if not s:
         return s
@@ -328,34 +430,18 @@ def auto_insert_pipes_if_missing(line: str) -> str:
     if ("|" in s) or ("｜" in s):
         return s
 
-    as_product = _try_parse_product_no_pipes(s)
-    if as_product:
-        return as_product
-
     as_cost = _try_parse_cost_no_pipes(s)
     if as_cost:
         return as_cost
 
+    as_product = _try_parse_product_no_pipes(s)
+    if as_product:
+        return as_product
+
     return s
 
 
-# ================= ✅ BARU: AUTO ISI ❓ UNTUK SEGMENT KOSONG =================
-def fill_missing_segments(parts, want_len=3):
-    # pad jadi 3 segmen
-    parts = list(parts or [])
-    while len(parts) < want_len:
-        parts.append("")
-    if len(parts) > want_len:
-        # kalau lebih, biar (tapi minimum 3 tetap dipakai)
-        pass
-
-    out = []
-    for p in parts[:want_len]:
-        p = (p or "").strip()
-        out.append(p if p else "❓")
-    return out
-
-
+# ================= NORMALIZE DETAIL LINE =================
 def normalize_detail_line(line: str) -> str:
     line = auto_insert_pipes_if_missing(line)
 
@@ -363,18 +449,15 @@ def normalize_detail_line(line: str) -> str:
         return line
 
     raw_parts = _split_pipes(line)
-    parts = fill_missing_segments(raw_parts, 3)  # ✅ pastikan ada 3, kosong -> ❓
+    parts = fill_missing_segments(raw_parts, 3)  # kosong -> ❓
 
-    # ✅ tentukan ini “penghantaran” atau “produk”
     transport_like = is_transport_like_parts(parts)
 
-    # ===== segmen 1 =====
+    # segmen 1
     if transport_like:
-        # tempat
         if parts[0] != "❓":
             parts[0] = place_title_case(parts[0])
     else:
-        # nama produk
         if parts[0] != "❓":
             best_name, score = best_product_match(parts[0])
             if best_name and score >= FUZZY_THRESHOLD:
@@ -382,19 +465,19 @@ def normalize_detail_line(line: str) -> str:
             else:
                 parts[0] = parts[0].upper()
 
-    # ===== segmen 2 =====
+    # segmen 2
     if transport_like:
         if parts[1] != "❓":
             best_t, tscore = best_transport_match(parts[1])
             if best_t and tscore >= TRANSPORT_THRESHOLD:
                 parts[1] = best_t
     else:
-        # qty produk - kalau user isi, biar (kalau dia isi pelik, tak kacau)
+        # qty produk: biar user, kalau kosong memang dah jadi ❓
         pass
 
-    # ===== segmen 3 =====
+    # segmen 3
     if parts[2] != "❓":
-        parts[2] = _normalize_rm_value(parts[2])  # RM normalize
+        parts[2] = _normalize_rm_value(parts[2])
 
     return _join_pipes(parts)
 
@@ -412,22 +495,12 @@ def calc_total(lines):
 
 
 def stylize_line_for_caption(line: str) -> str:
-    """
-    - Penghantaran: TEMPAT + JENIS guna bold2 (walau kos ❓)
-    - Produk: bold biasa
-    """
+    # Penghantaran: tempat+jenis bold2, kos bold biasa (RMxxx / ❓)
     if ("|" in line) or ("｜" in line):
-        parts = _split_pipes(line)
-        parts = fill_missing_segments(parts, 3)
-
-        # detect penghantaran walau kos ❓
+        parts = fill_missing_segments(_split_pipes(line), 3)
         if is_transport_like_parts(parts):
-            seg0 = bold2(parts[0])           # tempat
-            seg1 = bold2(parts[1])           # jenis
-            seg2 = bold(parts[2])            # kos (RMxxx atau ❓) kekal bold biasa
-            return " | ".join([seg0, seg1, seg2])
-
-    # default: produk / lain-lain
+            return " | ".join([bold2(parts[0]), bold2(parts[1]), bold(parts[2])])
+    # Produk / lain: bold biasa
     return bold(line)
 
 
@@ -451,13 +524,17 @@ def build_caption(user_caption: str) -> str:
 
 
 # =========================================================
-# ✅ STATE: PRODUK/ALBUM (SUPAYA SWIPE KALI KE-2, KE-3 PUN BOLEH)
+# ✅ STATE: PRODUK/ALBUM (SUPAYA SWIPE KE-2, KE-3... BOLEH)
 # =========================================================
-STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))  # 24 jam
-RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
+STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))      # 24 jam
+RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))  # tunggu album resit complete
 
-ORDER_STATES = {}          # (chat_id, root_id) -> state
-MSGID_TO_STATE = {}        # (chat_id, msg_id) -> (chat_id, root_id)
+# state_id = (chat_id, root_id)
+# data = {"product_file_id","caption","receipts":[...],"msg_ids":[...],"ts":epoch}
+ORDER_STATES = {}
+# map message_id -> state_id (supaya reply pada mana-mana keping album pun boleh)
+MSGID_TO_STATE = {}
+
 _state_lock = asyncio.Lock()
 
 
@@ -478,7 +555,17 @@ def _get_state_id_from_reply(chat_id: int, reply_to_id: int):
     sid = MSGID_TO_STATE.get((chat_id, reply_to_id))
     if sid:
         return sid
+    # reply pada root single post (yang baru) => root = reply_to_id
     return (chat_id, reply_to_id)
+
+
+async def _delete_message_safe(msg):
+    try:
+        await tg_call(msg.delete)
+    except (MessageDeleteForbidden, ChatAdminRequired):
+        pass
+    except:
+        pass
 
 
 async def _delete_messages_safe(client: Client, chat_id: int, msg_ids):
@@ -497,12 +584,16 @@ async def _delete_messages_safe(client: Client, chat_id: int, msg_ids):
 
 
 async def _send_album_and_update_state(client: Client, chat_id: int, state_id, product_file_id: str, caption: str, receipts: list):
+    """
+    Hantar album: [produk+caption] + receipts (cumulative)
+    Update msg_ids + MSGID_TO_STATE
+    """
     media = [InputMediaPhoto(media=product_file_id, caption=caption)]
     for fid in receipts:
         media.append(InputMediaPhoto(media=fid))
 
-    chunks = []
-    cur = []
+    # chunk max 10
+    chunks, cur = [], []
     for m in media:
         cur.append(m)
         if len(cur) == 10:
@@ -512,12 +603,15 @@ async def _send_album_and_update_state(client: Client, chat_id: int, state_id, p
         chunks.append(cur)
 
     sent_msg_ids = []
+
     for idx, ch in enumerate(chunks):
+        # pastikan caption hanya pada first item of first chunk
         if idx > 0:
             try:
                 ch[0].caption = None
             except:
                 pass
+
         res = await tg_call(client.send_media_group, chat_id=chat_id, media=ch)
         try:
             for m in res:
@@ -538,30 +632,14 @@ async def _send_album_and_update_state(client: Client, chat_id: int, state_id, p
     return sent_msg_ids
 
 
-# =========================================================
-# ✅ RECEIPT GROUP BUFFER (album user)
-# =========================================================
-_pending_receipt_groups = {}
-_pending_lock = asyncio.Lock()
-
-
-def is_reply_to_any_message(message) -> bool:
-    try:
-        return bool(message.reply_to_message and message.reply_to_message.id)
-    except:
-        return False
-
-
-async def _delete_message_safe(msg):
-    try:
-        await tg_call(msg.delete)
-    except (MessageDeleteForbidden, ChatAdminRequired):
-        pass
-    except:
-        pass
-
-
 async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: int, new_receipt_file_ids: list):
+    """
+    ✅ INI YANG BUAT PROSES BERULANG:
+    - reply pada post produk (kali 1) atau reply pada album (kali 2/3/4...)
+    - tambah resit (cumulative)
+    - padam album lama
+    - repost album baru
+    """
     if not new_receipt_file_ids:
         return False
 
@@ -574,12 +652,15 @@ async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: 
 
         receipts = state.get("receipts", []) + list(new_receipt_file_ids)
 
+        # padam album lama
         old_ids = state.get("msg_ids", [])
         await _delete_messages_safe(client, chat_id, old_ids)
 
+        # buang mapping lama
         for mid in old_ids:
             MSGID_TO_STATE.pop((chat_id, mid), None)
 
+        # repost album baru
         await _send_album_and_update_state(
             client, chat_id, state_id,
             state["product_file_id"],
@@ -589,7 +670,22 @@ async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: 
         return True
 
 
+# =========================================================
+# ✅ RECEIPT GROUP BUFFER (album user)
+# =========================================================
+_pending_receipt_groups = {}  # key=(chat_id, media_group_id, reply_to_id) -> {"msgs":[Message], "task":Task}
+_pending_lock = asyncio.Lock()
+
+
+def is_reply_to_any_message(message) -> bool:
+    try:
+        return bool(message.reply_to_message and message.reply_to_message.id)
+    except:
+        return False
+
+
 async def _process_receipt_group(client: Client, chat_id: int, media_group_id: str, reply_to_id: int):
+    # tunggu sekejap supaya semua keping album resit sampai
     await asyncio.sleep(RECEIPT_DELAY_SEC)
 
     async with _pending_lock:
@@ -602,6 +698,7 @@ async def _process_receipt_group(client: Client, chat_id: int, media_group_id: s
     msgs = sorted(data.get("msgs", []), key=lambda m: m.id)
     receipt_file_ids = [m.photo.file_id for m in msgs if m.photo]
 
+    # padam semua mesej resit user
     for m in msgs:
         await _delete_message_safe(m)
 
@@ -612,6 +709,7 @@ async def _process_receipt_group(client: Client, chat_id: int, media_group_id: s
     if merged:
         return
 
+    # fallback: kalau tak jumpa state, repost resit sahaja (reply)
     try:
         medias = [InputMediaPhoto(media=fid) for fid in receipt_file_ids]
         await tg_call(client.send_media_group, chat_id=chat_id, media=medias, reply_to_message_id=reply_to_id)
@@ -623,6 +721,7 @@ async def handle_receipt_photo(client: Client, message):
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
 
+    # album receipts
     if message.media_group_id:
         key = (chat_id, str(message.media_group_id), reply_to_id)
         async with _pending_lock:
@@ -634,6 +733,7 @@ async def handle_receipt_photo(client: Client, message):
             _pending_receipt_groups[key]["msgs"].append(message)
         return
 
+    # single receipt
     receipt_fid = message.photo.file_id if message.photo else None
     await _delete_message_safe(message)
     if not receipt_fid:
@@ -643,6 +743,7 @@ async def handle_receipt_photo(client: Client, message):
     if merged:
         return
 
+    # fallback: repost single resit reply
     try:
         await tg_call(client.send_photo, chat_id=chat_id, photo=receipt_fid, reply_to_message_id=reply_to_id)
     except:
@@ -652,16 +753,24 @@ async def handle_receipt_photo(client: Client, message):
 # ================= HANDLER (GABUNG) =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
+    """
+    1) Jika user swipe kiri (reply) dan hantar resit => proses resit (repeatable, cumulative album).
+    2) Kalau bukan reply => post produk biasa => format caption & repost.
+       -> simpan state awal (root = sent.id) supaya reply seterusnya boleh merge resit.
+    """
+    # ✅ receipt mode
     if is_reply_to_any_message(message):
         await handle_receipt_photo(client, message)
         return
 
+    # ✅ normal mode (produk)
     chat_id = message.chat.id
     photo_id = message.photo.file_id
     user_caption = message.caption or ""
 
     new_caption = build_caption(user_caption)
 
+    # padam mesej asal (user)
     try:
         await tg_call(message.delete)
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -669,6 +778,7 @@ async def handle_photo(client, message):
     except:
         pass
 
+    # repost versi kemas (bot)
     sent = await tg_call(
         client.send_photo,
         chat_id=chat_id,
@@ -676,6 +786,7 @@ async def handle_photo(client, message):
         caption=new_caption
     )
 
+    # ✅ simpan state awal (supaya swipe/resit boleh merge)
     try:
         if sent and sent.photo:
             async with _state_lock:
@@ -685,7 +796,7 @@ async def handle_photo(client, message):
                     "product_file_id": sent.photo.file_id,
                     "caption": sent.caption or new_caption,
                     "receipts": [],
-                    "msg_ids": [sent.id],
+                    "msg_ids": [sent.id],   # mula-mula masih single
                     "ts": time.time(),
                 }
                 MSGID_TO_STATE[(chat_id, sent.id)] = state_id
