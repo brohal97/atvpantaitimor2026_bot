@@ -84,10 +84,9 @@ def _normalize_rm_value(val: str) -> str:
     if not s:
         return s
 
-    # cari nombor pertama (support koma/spasi)
+    # cari nombor pertama
     m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
     if not m:
-        # kalau user tulis macam "rm 300." atau ada simbol pelik, cuba cari digits sahaja
         m2 = re.search(r"([0-9]{1,12})", s)
         if not m2:
             return s
@@ -120,19 +119,6 @@ def normalize_detail_line(line: str) -> str:
     return " | ".join(parts)
 
 
-# ✅ TAMBAHAN SAHAJA: kesan baris transport + separator 10 dash
-SEP_10_DASH = "-" * 10
-
-def is_transport_line(line: str) -> bool:
-    # Kesan baris seperti: "IPOH PERAK | Transport luar | RM300"
-    if "|" not in (line or ""):
-        return False
-    parts = [p.strip() for p in line.split("|")]
-    if len(parts) < 3:
-        return False
-    return bool(re.search(r"\btransport\b", parts[1], flags=re.IGNORECASE))
-
-
 def calc_total(lines):
     total = 0
     for ln in lines:
@@ -144,6 +130,20 @@ def calc_total(lines):
             except:
                 pass
     return total
+
+
+# ✅ TAMBAHAN SAHAJA: kesan baris transport + separator
+# guna char 'line' supaya Telegram tak buang, dan kita bold-kan nanti
+SEP_10_DASH = "──────────"  # 10 line chars (bukan '-' biasa)
+
+def is_transport_line(line: str) -> bool:
+    # Kesan baris seperti: "IPOH PERAK | Transport luar | RM300"
+    if "|" not in (line or ""):
+        return False
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) < 3:
+        return False
+    return bool(re.search(r"\btransport\b", parts[1], flags=re.IGNORECASE))
 
 
 def build_caption(user_caption: str) -> str:
@@ -161,9 +161,9 @@ def build_caption(user_caption: str) -> str:
 
     inserted_sep = False
     for ln in detail_lines:
-        # ✅ TAMBAHAN SAHAJA: auto letak 10 dash sebelum baris transport (sekali sahaja)
+        # ✅ auto letak separator sebelum baris transport (sekali sahaja)
         if (not inserted_sep) and is_transport_line(ln):
-            parts.append(SEP_10_DASH)
+            parts.append(bold(SEP_10_DASH))
             inserted_sep = True
 
         parts.append(bold(ln))
