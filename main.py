@@ -63,17 +63,10 @@ PRODUCT_NAMES = [
     "TROLI BESI",
 ]
 
-# threshold untuk auto-betulkan (boleh ubah jika perlu)
 FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.72"))  # 0.0 - 1.0
 
 
 def _norm_key(s: str) -> str:
-    """
-    Normalisasi untuk fuzzy match:
-    - uppercase
-    - buang simbol
-    - rapatkan spaces
-    """
     s = (s or "").upper()
     s = re.sub(r"[^A-Z0-9 ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -84,10 +77,6 @@ PRODUCT_KEYS = {name: _norm_key(name) for name in PRODUCT_NAMES}
 
 
 def best_product_match(user_first_segment: str):
-    """
-    Cari nama produk paling hampir.
-    Return: (best_name, score)
-    """
     u = _norm_key(user_first_segment)
     if not u:
         return None, 0.0
@@ -118,7 +107,6 @@ def extract_lines(text: str):
         ln = ln.strip()
         if not ln:
             continue
-        # buang baris total lama kalau ada
         if re.search(r"\btotal\b", ln, flags=re.IGNORECASE):
             continue
         lines.append(ln)
@@ -126,13 +114,6 @@ def extract_lines(text: str):
 
 
 def _normalize_rm_value(val: str) -> str:
-    """
-    Jadikan nilai akhir sentiasa format: RM<angka>
-    - "200" -> "RM200"
-    - "rm200" / "Rm 200" -> "RM200"
-    - "RM200" -> "RM200"
-    Jika tak jumpa nombor, pulangkan asal.
-    """
     s = (val or "").strip()
     if not s:
         return s
@@ -149,28 +130,22 @@ def _normalize_rm_value(val: str) -> str:
     return f"RM{num}"
 
 
-# ✅ separator: 10 line chars (lebih stabil dari '-' biasa)
-SEP_10 = "──────────"
+# ✅ separator 10 unit
+SEP_10 = "----------"  # 10 dash tepat macam request
 
 
 def is_transport_line(line: str) -> bool:
-    # Kesan baris seperti: "IPOH PERAK | Transport luar | RM300"
-    if "|" not in (line or ""):
+    """
+    ✅ FIX: detect TRANSPORT pada keseluruhan line (lebih kebal dari hanya parts[1]).
+    Jadi walau user buat spacing pelik / format lari sikit, separator tetap keluar.
+    """
+    s = (line or "").strip()
+    if not s:
         return False
-    parts = [p.strip() for p in line.split("|")]
-    if len(parts) < 3:
-        return False
-    return bool(re.search(r"\btransport\b", parts[1], flags=re.IGNORECASE))
+    return bool(re.search(r"\btransport\b", s, flags=re.IGNORECASE))
 
 
 def normalize_detail_line(line: str) -> str:
-    """
-    Rules:
-    1) Segmen pertama:
-       - jika mirip salah satu 8 nama produk -> auto betulkan ikut nama rasmi
-       - kalau bukan produk -> uppercase biasa (destinasi)
-    2) Segmen terakhir -> pastikan 'RM' uppercase, auto tambah jika user lupa.
-    """
     if "|" not in line:
         return line
 
@@ -180,15 +155,12 @@ def normalize_detail_line(line: str) -> str:
 
     first = parts[0]
 
-    # fuzzy betulkan nama produk
     best_name, score = best_product_match(first)
     if best_name and score >= FUZZY_THRESHOLD:
-        parts[0] = best_name  # guna nama rasmi
+        parts[0] = best_name
     else:
-        # bukan produk: uppercase biasa (destinasi)
         parts[0] = first.upper()
 
-    # segmen terakhir: normalize RM
     parts[-1] = _normalize_rm_value(parts[-1])
 
     return " | ".join(parts)
@@ -216,18 +188,16 @@ def build_caption(user_caption: str) -> str:
 
     parts = []
     parts.append(stamp)
-    parts.append("")  # perenggan kosong
+    parts.append("")
 
     inserted_sep = False
     for ln in detail_lines:
-        # auto letak separator sebelum baris transport (sekali sahaja)
         if (not inserted_sep) and is_transport_line(ln):
             parts.append(bold(SEP_10))
             inserted_sep = True
-
         parts.append(bold(ln))
 
-    parts.append("")  # perenggan kosong
+    parts.append("")
     parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
 
     cap = "\n".join(parts)
@@ -245,7 +215,6 @@ async def handle_photo(client, message):
 
     new_caption = build_caption(user_caption)
 
-    # padam mesej asal
     try:
         await tg_call(message.delete)
     except (MessageDeleteForbidden, ChatAdminRequired):
@@ -253,7 +222,6 @@ async def handle_photo(client, message):
     except:
         pass
 
-    # repost versi kemas
     await tg_call(
         client.send_photo,
         chat_id=chat_id,
