@@ -1518,8 +1518,7 @@ async def kos_okey_set(client, callback):
         state["ctx"] = {}
 
     await render_order(client, callback, state)
-    await callback.answer("Kos diset ✅")
-
+    await fast_ack(callback, "Kos diset ✅")
 
 @bot.on_callback_query(filters.regex(r"^last_submit$"))
 async def last_submit(client, callback):
