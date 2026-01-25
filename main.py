@@ -28,7 +28,7 @@ TZ = pytz.timezone("Asia/Kuala_Lumpur")
 HARI = ["Isnin", "Selasa", "Rabu", "Khamis", "Jumaat", "Sabtu", "Ahad"]
 
 
-# ================= BOLD STYLE =================
+# ================= BOLD STYLE (UNTUK PRODUK & UMUM) =================
 BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
@@ -38,6 +38,19 @@ BOLD_MAP = str.maketrans(
 
 def bold(text: str) -> str:
     return (text or "").translate(BOLD_MAP)
+
+
+# ================= BOLD STYLE 2 (KHAS UNTUK JENIS TRANSPORT) =================
+# (masih tebal, tapi gaya lain)
+ALT_BOLD_MAP = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
+    "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳"
+    "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"
+)
+
+def bold2(text: str) -> str:
+    return (text or "").translate(ALT_BOLD_MAP)
 
 
 # ================= SAFE TG CALL =================
@@ -198,11 +211,6 @@ def is_cost_or_transport_line(line: str) -> bool:
 
 # ================= AUTO INSERT ' | ' IF USER TERLUPA =================
 def _extract_tail_money(text: str):
-    """
-    Ambil duit di hujung:
-      "... rm5200" / "... 5200" -> (head, "RM5200")
-    Jika tiada nombor, return (text, None)
-    """
     s = (text or "").strip()
     if not s:
         return s, None
@@ -217,11 +225,6 @@ def _extract_tail_money(text: str):
 
 
 def _try_parse_product_no_pipes(line: str):
-    """
-    Format tanpa '|':
-      "<produk> <qty> <rm/harga>"
-    contoh: "125ccc full spec 2 rm5200"
-    """
     head, money = _extract_tail_money(line)
     if not money:
         return None
@@ -239,11 +242,6 @@ def _try_parse_product_no_pipes(line: str):
 
 
 def _best_transport_suffix(words):
-    """
-    Cari suffix (1-5 perkataan) yang paling hampir dengan 3 jenis transport.
-    Return: (best_transport_name, score, cut_index)
-    cut_index = index mula suffix dalam list words
-    """
     best_name = None
     best_score = 0.0
     best_cut = None
@@ -262,11 +260,6 @@ def _best_transport_suffix(words):
 
 
 def _try_parse_cost_no_pipes(line: str):
-    """
-    Format tanpa '|':
-      "<destinasi> <jenis transport> <rm/harga>"
-    contoh: "kota bharu lori kita hantar rm50"
-    """
     head, money = _extract_tail_money(line)
     if not money:
         return None
@@ -287,12 +280,6 @@ def _try_parse_cost_no_pipes(line: str):
 
 
 def auto_insert_pipes_if_missing(line: str) -> str:
-    """
-    Jika user tak letak '|', cuba auto bina:
-      - produk:  name | qty | RMxx
-      - kos:    destinasi | jenis | RMxx
-    Kalau gagal parse, return line asal.
-    """
     s = (line or "").strip()
     if not s:
         return s
@@ -354,6 +341,30 @@ def calc_total(lines):
     return total
 
 
+def stylize_line_for_caption(line: str) -> str:
+    """
+    - Produk: kekal gaya bold biasa (𝗔𝗕𝗖...)
+    - Kos/transport: segmen ke-2 (jenis transport) guna bold2 (𝐀𝐁𝐂...),
+      segmen lain kekal bold biasa.
+    """
+    if is_cost_or_transport_line(line):
+        parts = _split_pipes(line)
+        if len(parts) >= 3:
+            seg0 = bold(parts[0])        # destinasi
+            seg1 = bold2(parts[1])       # ✅ transport style lain tapi tebal
+            seg_last = bold(parts[-1])   # RMxxx
+            # kalau ada lebih segmen (rare), bold biasa
+            mid = []
+            if len(parts) > 3:
+                for p in parts[2:-1]:
+                    mid.append(bold(p))
+            out_parts = [seg0, seg1] + mid + [seg_last]
+            return " | ".join(out_parts)
+
+    # default: semuanya bold biasa
+    return bold(line)
+
+
 def build_caption(user_caption: str) -> str:
     stamp = bold(make_stamp())
 
@@ -366,10 +377,8 @@ def build_caption(user_caption: str) -> str:
     parts.append(stamp)
     parts.append("")
 
-    # ✅ DIBUANG: fungsi insert garis separator
-
     for ln in detail_lines:
-        parts.append(bold(ln))
+        parts.append(stylize_line_for_caption(ln))
 
     parts.append("")
     parts.append(f"Total keseluruhan : {bold('RM' + str(total))}")
