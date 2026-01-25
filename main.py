@@ -13,9 +13,13 @@
 # - Hanya jalan jika sekurang-kurangnya 1 resit sudah di-upload
 # - Bot akan PADAM album lama & REPOST album baru bersama blok OCR
 # - Jika OCR tak aktif / gagal: tetap repost, blok OCR jadi ❓ + nota (supaya nampak punca)
+#
+# ✅ FIX BESAR (OCR):
+# - Auto repair GOOGLE_APPLICATION_CREDENTIALS_JSON jika "private_key" ada newline sebenar (invalid control char)
+# - Support juga optional GOOGLE_APPLICATION_CREDENTIALS_B64 (base64) jika mahu
 # =========================
 
-import os, re, json, time, asyncio, tempfile
+import os, re, json, time, asyncio, tempfile, base64
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Optional, Dict, Any
@@ -65,20 +69,62 @@ VISION_CLIENT = None
 
 def _get_google_json_env_value() -> str:
     """
-    Ambil dari env yang betul.
-    (Saya letak fallback kalau tersalah eja di Railway.)
+    Ambil dari env yang betul (dengan fallback typo).
     """
     candidates = [
-        "GOOGLE_APPLICATION_CREDENTIALS_JSON",   # betul
-        "GOOGLE_APPLICATION_CREDENTIALIALS_JSON",# typo biasa
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",    # betul
+        "GOOGLE_APPLICATION_CREDENTIALIALS_JSON", # typo biasa
         "GOOGLE_APPLICATION_CREDENTIALITALS_JSON",# typo biasa
-        "GOOGLE_APPLICATION_CREDENTAILS_JSON",   # typo
+        "GOOGLE_APPLICATION_CREDENTAILS_JSON",    # typo
     ]
     for k in candidates:
         v = (os.getenv(k, "") or "").strip()
         if v:
             return v
     return ""
+
+def _try_decode_b64_creds() -> str:
+    """
+    Optional: jika user guna GOOGLE_APPLICATION_CREDENTIALS_B64 (base64)
+    """
+    b64 = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS_B64", "") or "").strip()
+    if not b64:
+        return ""
+    try:
+        raw = base64.b64decode(b64).decode("utf-8", errors="strict")
+        return raw.strip()
+    except Exception:
+        return ""
+
+def _repair_private_key_newlines(raw: str) -> str:
+    """
+    Fix error: Invalid control character...
+    Bila private_key dalam env jadi multiline sebenar (newline tak di-escape).
+    Kita tukar newline dalam value private_key -> \\n, supaya JSON valid.
+    """
+    if not raw:
+        return raw
+
+    # Kalau JSON dah ok / tiada masalah, return saja
+    # Tapi kita memang guna try/except di bawah, jadi sini hanya "best effort".
+
+    # Cari blok "private_key": "<MULTILINE>" , "client_email":
+    # Kita replace newline literal dalam bahagian MULTILINE jadi \\n
+    pattern = re.compile(r'("private_key"\s*:\s*")(.+?)("(\s*,\s*"client_email"\s*:))', re.DOTALL)
+    m = pattern.search(raw)
+    if not m:
+        return raw
+
+    before = m.group(1)
+    keyval = m.group(2)
+    after = m.group(3)
+
+    # Buang \r, kemudian tukar newline sebenar jadi \\n
+    keyval = keyval.replace("\r", "")
+    keyval = keyval.replace("\n", "\\n")
+
+    fixed = raw[:m.start()] + before + keyval + after + raw[m.end():]
+    return fixed
 
 def init_vision_client():
     global _OCR_READY, _OCR_INIT_ERROR, VISION_CLIENT
@@ -90,17 +136,41 @@ def init_vision_client():
         _OCR_INIT_ERROR = "google-cloud-vision belum dipasang"
         return
 
-    raw = _get_google_json_env_value()
+    # 1) ambil dari B64 kalau ada
+    raw = _try_decode_b64_creds()
+    if not raw:
+        # 2) kalau tiada, ambil JSON env biasa
+        raw = _get_google_json_env_value()
+
     if not raw:
         _OCR_INIT_ERROR = "GOOGLE_APPLICATION_CREDENTIALS_JSON kosong / tiada"
         return
 
-    raw = raw.replace("\\n", "\n")  # Railway escape newline
+    # Railway kadang escape \n jadi \\n (ok), kadang jadi newline sebenar (problem)
+    # Kita cuba parse; kalau gagal, kita repair private_key.
+    raw1 = raw.replace("\\n", "\n")  # jika env simpan \\n literal, jadikan newline (sebab kita akan dump semula ke file)
+    data = None
+
     try:
-        data = json.loads(raw)
-    except Exception as e:
-        _OCR_INIT_ERROR = f"JSON service account tak valid: {e}"
-        return
+        data = json.loads(raw1)
+    except Exception:
+        # cuba repair JSON broken sebab newline dalam string private_key
+        raw_fixed = _repair_private_key_newlines(raw1)
+        try:
+            data = json.loads(raw_fixed)
+        except Exception as e:
+            _OCR_INIT_ERROR = f"JSON service account tak valid: {e}"
+            return
+
+    # Pastikan private_key betul (kunci biasanya ada \n escape)
+    try:
+        pk = data.get("private_key", "")
+        if isinstance(pk, str):
+            # Jika pk mengandungi newline sebenar, Vision masih ok, tapi kita rapikan ke format standard
+            # (file json boleh simpan dengan newline juga, tetap ok)
+            data["private_key"] = pk.replace("\\n", "\n")
+    except Exception:
+        pass
 
     try:
         fd, path = tempfile.mkstemp(prefix="gcp-", suffix=".json")
@@ -555,7 +625,7 @@ def build_ocr_paragraph(ocr: Dict[str, Any], note: str = "") -> str:
     acc_ok = bool(ocr.get("account_ok"))
 
     lines = []
-    lines.append("")  # satu perenggan kosong
+    lines.append("")
     lines.append(f"✅ Tarikh@waktu jam : {bold(dt) if dt else '❓'}")
 
     if OCR_TARGET_ACCOUNT:
@@ -722,9 +792,7 @@ async def _process_receipt_group(client: Client, chat_id: int, media_group_id: s
     if not receipt_file_ids:
         return
 
-    merged = await _merge_receipts_and_repost(client, chat_id, reply_to_id, receipt_file_ids)
-    if merged:
-        return
+    await _merge_receipts_and_repost(client, chat_id, reply_to_id, receipt_file_ids)
 
 async def handle_receipt_photo(client: Client, message):
     chat_id = message.chat.id
@@ -893,4 +961,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
