@@ -196,10 +196,6 @@ def is_cost_or_transport_line(line: str) -> bool:
     return _looks_like_money_tail(parts[-1])
 
 
-# ✅ separator: tepat 10 dash
-SEP_10_DASH = "-" * 10
-
-
 # ================= AUTO INSERT ' | ' IF USER TERLUPA =================
 def _extract_tail_money(text: str):
     """
@@ -230,7 +226,6 @@ def _try_parse_product_no_pipes(line: str):
     if not money:
         return None
 
-    # qty mesti nombor token terakhir dalam head
     mqty = re.search(r"\b(\d{1,3})\s*$", head)
     if not mqty:
         return None
@@ -276,7 +271,6 @@ def _try_parse_cost_no_pipes(line: str):
     if not money:
         return None
 
-    # pecah words
     words = [w for w in re.split(r"\s+", head.strip()) if w]
     if len(words) < 2:
         return None
@@ -303,16 +297,13 @@ def auto_insert_pipes_if_missing(line: str) -> str:
     if not s:
         return s
 
-    # kalau user dah guna pipe biasa / fullwidth, biar
     if ("|" in s) or ("｜" in s):
         return s
 
-    # cuba detect produk dulu (ada qty)
     as_product = _try_parse_product_no_pipes(s)
     if as_product:
         return as_product
 
-    # kemudian cuba detect kos/transport
     as_cost = _try_parse_cost_no_pipes(s)
     if as_cost:
         return as_cost
@@ -321,7 +312,6 @@ def auto_insert_pipes_if_missing(line: str) -> str:
 
 
 def normalize_detail_line(line: str) -> str:
-    # ✅ tambahan: auto masukkan "|" bila user terlupa
     line = auto_insert_pipes_if_missing(line)
 
     if ("|" not in line) and ("｜" not in line):
@@ -376,13 +366,9 @@ def build_caption(user_caption: str) -> str:
     parts.append(stamp)
     parts.append("")
 
-    inserted_sep = False
-    for ln in detail_lines:
-        # ✅ Auto letak 10 dash sebelum baris kos/destinasi (sekali sahaja)
-        if (not inserted_sep) and is_cost_or_transport_line(ln):
-            parts.append(bold(SEP_10_DASH))
-            inserted_sep = True
+    # ✅ DIBUANG: fungsi insert garis separator
 
+    for ln in detail_lines:
         parts.append(bold(ln))
 
     parts.append("")
@@ -420,4 +406,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
