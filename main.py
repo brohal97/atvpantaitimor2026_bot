@@ -1421,7 +1421,7 @@ async def buka_kos_transport_keypad(client, callback):
         state["ctx"] = {"num_buf": ""}
 
     await render_order(client, callback, state)
-    await callback.answer("Masukkan kos transport")
+    await fast_ack(callback, "Masukkan kos transport")
 
 
 @bot.on_callback_query(filters.regex(rf"^{KOS_PREFIX}_[0-9]$"))
