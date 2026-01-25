@@ -1143,7 +1143,7 @@ async def nav_back(client, callback):
             return
 
     await render_order(client, callback, state)
-    await callback.answer("Undo ✅")
+    await fast_ack(callback, "Undo ✅")
 
 
 # ================= CALLBACKS: ORDER FLOW =================
@@ -1178,7 +1178,7 @@ async def pilih_kuantiti(client, callback):
         state["ctx"] = {"produk_key": produk_key}
 
     await render_order(client, callback, state)
-    await callback.answer("Pilih kuantiti")
+    await fast_ack(callback, "Pilih kuantiti")
 
 
 @bot.on_callback_query(filters.regex(r"^qty_"))
@@ -1213,8 +1213,7 @@ async def simpan_qty(client, callback):
         state["ctx"] = {}
 
     await render_order(client, callback, state)
-    await callback.answer("Disimpan")
-
+    await fast_ack(callback, "Disimpan")
 
 @bot.on_callback_query(filters.regex(r"^submit$"))
 async def submit_order(client, callback):
@@ -1233,7 +1232,7 @@ async def submit_order(client, callback):
         state["ctx"] = {}
 
     await render_order(client, callback, state)
-    await callback.answer("Set harga")
+    await fast_ack(callback, "Set harga")
 
 
 @bot.on_callback_query(filters.regex(r"^harga_"))
@@ -1251,7 +1250,7 @@ async def buka_harga_keypad(client, callback):
         state["ctx"] = {"produk_key": produk_key, "num_buf": ""}
 
     await render_order(client, callback, state)
-    await callback.answer("Masukkan harga")
+    await fast_ack(callback, "Masukkan harga")
 
 
 @bot.on_callback_query(filters.regex(rf"^{PRICE_PREFIX}_[0-9]$"))
