@@ -74,40 +74,29 @@ def extract_lines(text: str):
 
 def _normalize_rm_value(val: str) -> str:
     """
-    Jadikan nilai akhir sentiasa format: RM<angka>
+    Pastikan nilai akhir format RM<angka> (RM huruf besar).
     - "200" -> "RM200"
     - "rm200" / "Rm 200" -> "RM200"
     - "RM200" -> "RM200"
-    Jika tak jumpa nombor, pulangkan asal.
     """
     s = (val or "").strip()
     if not s:
         return s
 
-    # cari nombor pertama (support koma/spasi)
     m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
     if not m:
-        # kalau user tulis macam "rm 300." atau ada simbol pelik, cuba cari digits sahaja
         m2 = re.search(r"([0-9]{1,12})", s)
         if not m2:
             return s
-        num = m2.group(1)
-        return f"RM{num}"
+        return f"RM{m2.group(1)}"
 
-    num = m.group(1)
-    return f"RM{num}"
+    return f"RM{m.group(1)}"
 
 
 def normalize_detail_line(line: str) -> str:
     """
-    Rules:
-    1) Segmen pertama (nama produk/destinasi) -> UPPERCASE (ikut request: untuk nama produk sahaja,
-       tetapi kita apply pada segmen pertama jika format ada '|', sebab user minta auto huruf besar di situ)
-    2) Segmen terakhir -> pastikan bermula 'RM' uppercase, auto tambah jika user lupa.
-    Contoh:
-      "125cc full spec | 2 | 200"   -> "125CC FULL SPEC | 2 | RM200"
-      "125cc full spec | 2 | rm200" -> "125CC FULL SPEC | 2 | RM200"
-      "Ipoh Perak | Transport luar | rm300" -> "IPOH PERAK | Transport luar | RM300"
+    - Segmen pertama (nama produk) -> UPPERCASE
+    - Segmen terakhir -> auto RM huruf besar + auto tambah RM jika user lupa
     """
     if "|" not in line:
         return line
@@ -116,19 +105,52 @@ def normalize_detail_line(line: str) -> str:
     if len(parts) < 2:
         return line
 
-    # segmen pertama: uppercase
+    # segmen pertama uppercase
     parts[0] = parts[0].upper()
 
-    # segmen terakhir: normalize RM
+    # segmen terakhir normalize RM
     parts[-1] = _normalize_rm_value(parts[-1])
 
     return " | ".join(parts)
 
 
+def is_transport_line(line: str) -> bool:
+    """
+    Kesan baris transport:
+    contoh: "IPOH PERAK | Transport luar | RM300"
+    Kita check segmen tengah ada perkataan 'transport'
+    """
+    if "|" not in line:
+        return False
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) < 3:
+        return False
+    mid = parts[1]
+    return bool(re.search(r"transport", mid, flags=re.IGNORECASE))
+
+
+def make_separator_for_line(line: str) -> str:
+    """
+    Buat garisan sama panjang dengan line transport (ikut hujung RMxxx).
+    Nota: Telegram font bukan monospaced 100%, tapi biasanya nampak kemas.
+    """
+    # Clamp supaya tak jadi terlalu panjang / pendek kalau user buat line pelik
+    MIN_SEP = int(os.getenv("MIN_SEP_LEN", "12"))
+    MAX_SEP = int(os.getenv("MAX_SEP_LEN", "80"))
+
+    ln = (line or "").strip()
+    n = len(ln)
+    if n < MIN_SEP:
+        n = MIN_SEP
+    if n > MAX_SEP:
+        n = MAX_SEP
+
+    return "─" * n
+
+
 def calc_total(lines):
     total = 0
     for ln in lines:
-        # kira semua nombor selepas RM (case-insensitive)
         nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", ln)
         for n in nums:
             try:
@@ -141,17 +163,26 @@ def calc_total(lines):
 def build_caption(user_caption: str) -> str:
     stamp = bold(make_stamp())
 
-    detail_lines_raw = extract_lines(user_caption)
-    # normalize dulu (supaya total kira betul walaupun user tak tulis RM)
-    detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
-
+    raw_lines = extract_lines(user_caption)
+    # normalize dulu supaya RM auto masuk & uppercase product
+    detail_lines = [normalize_detail_line(x) for x in raw_lines]
     total = calc_total(detail_lines)
+
+    # cari baris transport terakhir (kalau ada)
+    transport_idx = None
+    for i, ln in enumerate(detail_lines):
+        if is_transport_line(ln):
+            transport_idx = i
 
     parts = []
     parts.append(stamp)
     parts.append("")  # perenggan kosong
 
-    for ln in detail_lines:
+    for i, ln in enumerate(detail_lines):
+        # sebelum baris transport, letak separator auto panjang sama hujung RM
+        if transport_idx is not None and i == transport_idx:
+            parts.append(make_separator_for_line(ln))
+
         parts.append(bold(ln))
 
     parts.append("")  # perenggan kosong
