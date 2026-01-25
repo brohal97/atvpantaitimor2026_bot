@@ -1571,7 +1571,7 @@ async def last_submit(client, callback):
         state["control_msg_id"] = None
         state["anchor_msg_id"] = msg.id
 
-    await callback.answer("Last submit ✅")
+    await fast_ack(callback, "Last submit ✅")
 
     caption_baru = build_caption(
         state["base_caption"],
