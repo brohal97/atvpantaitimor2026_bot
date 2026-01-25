@@ -735,15 +735,14 @@ async def render_order(client: Client, callback, state: Dict[str, Any]):
         return new_msg
 
 
-async def deny_if_locked(state: Optional[Dict[str, Any]], callback) -> bool:
+async def deny_if_locked(state, callback) -> bool:
     if not state:
-        await callback.answer("Rekod tidak dijumpai.", show_alert=True)
+        await fast_ack(callback, "Rekod tidak dijumpai.", alert=True)
         return False
     if state.get("locked"):
-        await callback.answer("Order ini sudah LAST SUBMIT (LOCK).", show_alert=True)
+        await fast_ack(callback, "Order ini sudah LAST SUBMIT (LOCK).", alert=True)
         return False
     return True
-
 
 # ================= OCR skrip (helpers) =================
 def normalize_for_text(s: str) -> str:
