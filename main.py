@@ -1371,7 +1371,7 @@ async def buka_destinasi(client, callback):
         state["ctx"] = {}
 
     await render_order(client, callback, state)
-    await callback.answer("Pilih destinasi")
+    await fast_ack(callback, "Pilih destinasi")
 
 
 @bot.on_callback_query(filters.regex(r"^setdest_"))
