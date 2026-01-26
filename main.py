@@ -1,34 +1,15 @@
 # =========================
 # ATV PANTAI TIMOR BOT (VERSI PENUH + STABIL + OCR REPOST PASTI JADI)
 #
-# ✅ Repost produk + caption kemas
-# ✅ Caption kosong auto 2 baris:
-#     ❓ | ❓ | ❓   (produk)
-#     ❓ | ❓ | ❓   (penghantaran)
-# ✅ Harga TIDAK didarab kuantiti (Total = jumlah semua RM pada baris)
-# ✅ Reply (swipe kiri) + upload resit: bot padam resit asal + padam album lama, repost album baru
+# ✅ CLEAN TEXT DALAM GROUP:
+# 1) Mana-mana user hantar TEXT sahaja (bukan reply) -> bot PADAM serta-merta
+# 2) Reply (swipe kiri) tapi belum upload resit -> apa-apa text termasuk 123 -> bot PADAM serta-merta
+# 3) Resit dah ada tapi password SALAH / text lain -> bot PADAM serta-merta
+# 4) Hanya user ALLOW + password BETUL + resit ADA:
+#    - Kalau OCR belum dibuat -> OCR + repost album
+#    - Kalau OCR sudah dibuat -> FINALIZE: hantar album ke channel + padam semua dalam group
 #
-# ✅ OCR TRIGGER (PASTI REPOST):
-# - Reply (swipe kiri) pada post produk/album + taip "123" send
-# - Hanya jalan jika sekurang-kurangnya 1 resit sudah di-upload
-# - Bot akan PADAM album lama & REPOST album baru bersama blok OCR
-#
-# ✅ UPGRADE BARU (PERMINTAAN AWAK) - FIX ALBUM KE CHANNEL:
-# - SELEPAS OCR RESULT KELUAR, HANYA USER ALLOW SAHAJA BOLEH "FINALIZE"
-# - User allow reply (swipe kiri) pada post yang ADA blok OCR + taip "123" send
-# - Bot akan HANTAR KE CHANNEL RASMI DALAM BENTUK ALBUM (send_media_group)
-#   -> Sama rupa dalam group, sama rupa dalam channel (album bersama)
-# - Lepas berjaya, bot PADAM semua message album dalam group + buang state (anggap selesai)
-#
-# ✅ FIX BESAR (OCR):
-# - Auto repair GOOGLE_APPLICATION_CREDENTIALS_JSON jika "private_key" ada newline sebenar
-# - Support optional GOOGLE_APPLICATION_CREDENTIALS_B64 (base64)
-#
-# ✅ OCR PARSING:
-# - Tarikh & masa: support Januari/January + format pelik, output tetap: ✅ 01/01/2026 | 4:39pm
-# - Akaun: support jarak pelik "8 6 0 6..." etc → match digit sama, auto label: "8606018423 CIMB BANK"
-# - Amaun/total: support RM / MYR / 897myr / rm20.00 / myr10 / Amount / Total / Jumlah / Transfer amount
-# - Banyak resit: OCR scan SEMUA resit dalam album + papar blok setiap resit
+# ⚠️ BOT MESTI ADMIN group/supergroup + permission Delete messages
 # =========================
 
 import os, re, json, time, asyncio, tempfile, base64
@@ -42,7 +23,6 @@ from pyrogram.errors import FloodWait, RPCError, MessageDeleteForbidden, ChatAdm
 from pyrogram.types import InputMediaPhoto
 
 # ===== OCR (Google Vision) =====
-# pip install google-cloud-vision
 try:
     from google.cloud import vision
 except Exception:
@@ -59,15 +39,10 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
 
 OCR_TRIGGER_CODE = os.getenv("OCR_TRIGGER_CODE", "123").strip()
 
-# Akaun target yang awak nak detect (digits sahaja disimpan)
 OCR_TARGET_ACCOUNT = re.sub(r"\D", "", os.getenv("OCR_TARGET_ACCOUNT", "8606018423").strip())
-
-# Bila jumpa akaun target, auto label bank
 OCR_TARGET_BANK_LABEL = os.getenv("OCR_TARGET_BANK_LABEL", "CIMB BANK").strip()
-
 OCR_LANG_HINTS = [x.strip() for x in os.getenv("OCR_LANG_HINTS", "ms,en").split(",") if x.strip()]
 
-# ✅ USER ALLOW + CHANNEL RASMI (hardcode ikut list awak)
 ALLOWED_USER_IDS = {
     1150078068,
     6897594281,
@@ -87,7 +62,6 @@ def is_allowed_user(message) -> bool:
         return False
 
 
-# ================= BOT =================
 bot = Client(
     "atv_bot_detail_repost",
     api_id=API_ID,
@@ -95,8 +69,7 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-
-# ================= GOOGLE CREDS (Railway JSON env -> file) =================
+# ================= GOOGLE CREDS =================
 _OCR_READY = False
 _OCR_INIT_ERROR = ""
 VISION_CLIENT = None
@@ -195,7 +168,26 @@ def init_vision_client():
 init_vision_client()
 
 
-# ================= BOLD STYLE =================
+# ================= SAFE TG CALL =================
+async def tg_call(fn, *args, **kwargs):
+    while True:
+        try:
+            return await fn(*args, **kwargs)
+        except FloodWait as e:
+            await asyncio.sleep(int(getattr(e, "value", 1)) + 1)
+        except RPCError:
+            await asyncio.sleep(0.2)
+
+async def _delete_message_safe(msg):
+    try:
+        await tg_call(msg.delete)
+    except (MessageDeleteForbidden, ChatAdminRequired):
+        pass
+    except:
+        pass
+
+
+# ================= BOLD STYLE (keep your original) =================
 BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
@@ -215,37 +207,14 @@ def bold2(text: str) -> str:
     return (text or "").translate(ALT_BOLD_MAP)
 
 
-# ================= SAFE TG CALL =================
-async def tg_call(fn, *args, **kwargs):
-    while True:
-        try:
-            return await fn(*args, **kwargs)
-        except FloodWait as e:
-            await asyncio.sleep(int(getattr(e, "value", 1)) + 1)
-        except RPCError:
-            await asyncio.sleep(0.2)
-
-
-# ================= FIXED NAMES =================
+# ================= CAPTION (ringkas: guna code asal awak jika perlu) =================
 PRODUCT_NAMES = [
-    "125CC FULL SPEC",
-    "125CC BIG BODY",
-    "YAMA SPORT",
-    "GY6 200CC",
-    "HAMMER ARMOUR",
-    "BIG HAMMER",
-    "TROLI PLASTIK",
-    "TROLI BESI",
+    "125CC FULL SPEC", "125CC BIG BODY", "YAMA SPORT", "GY6 200CC",
+    "HAMMER ARMOUR", "BIG HAMMER", "TROLI PLASTIK", "TROLI BESI",
 ]
 FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.72"))
-
-TRANSPORT_TYPES = [
-    "Transport luar",
-    "Pickup sendiri",
-    "Lori kita hantar",
-]
+TRANSPORT_TYPES = ["Transport luar", "Pickup sendiri", "Lori kita hantar"]
 TRANSPORT_THRESHOLD = float(os.getenv("TRANSPORT_THRESHOLD", "0.70"))
-
 
 def _norm_key(s: str) -> str:
     s = (s or "").upper()
@@ -258,30 +227,24 @@ TRANSPORT_KEYS = {name: _norm_key(name) for name in TRANSPORT_TYPES}
 
 def best_product_match(user_first_segment: str):
     u = _norm_key(user_first_segment)
-    if not u:
-        return None, 0.0
+    if not u: return None, 0.0
     best_name, best_score = None, 0.0
     for name, key in PRODUCT_KEYS.items():
         score = SequenceMatcher(None, u, key).ratio()
         if score > best_score:
-            best_score = score
-            best_name = name
+            best_score, best_name = score, name
     return best_name, best_score
 
 def best_transport_match(user_transport_segment: str):
     u = _norm_key(user_transport_segment)
-    if not u:
-        return None, 0.0
+    if not u: return None, 0.0
     best_name, best_score = None, 0.0
     for name, key in TRANSPORT_KEYS.items():
         score = SequenceMatcher(None, u, key).ratio()
         if score > best_score:
-            best_score = score
-            best_name = name
+            best_score, best_name = score, name
     return best_name, best_score
 
-
-# ================= CORE CAPTION LOGIC =================
 def make_stamp() -> str:
     now = datetime.now(TZ)
     hari = HARI[now.weekday()]
@@ -293,10 +256,8 @@ def extract_lines(text: str):
     lines = []
     for ln in (text or "").splitlines():
         ln = ln.strip()
-        if not ln:
-            continue
-        if re.search(r"\btotal\b", ln, flags=re.IGNORECASE):
-            continue
+        if not ln: continue
+        if re.search(r"\btotal\b", ln, flags=re.IGNORECASE): continue
         lines.append(ln)
     return lines
 
@@ -310,143 +271,14 @@ def _join_pipes(parts):
 
 def _normalize_rm_value(val: str) -> str:
     s = (val or "").strip()
-    if not s:
-        return s
-    if s == "❓":
-        return "❓"
+    if not s: return s
+    if s == "❓": return "❓"
     m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
     if not m:
         m2 = re.search(r"([0-9]{1,12})", s)
-        if not m2:
-            return s
+        if not m2: return s
         return f"RM{m2.group(1)}"
     return f"RM{m.group(1)}"
-
-def _extract_tail_money(text: str):
-    s = (text or "").strip()
-    if not s:
-        return s, None
-    m = re.search(r"(?i)(?:\brm\b\s*)?([0-9]{1,12})\s*$", s)
-    if not m:
-        return s, None
-    num = m.group(1)
-    head = s[:m.start()].strip()
-    return head, f"RM{num}"
-
-def _cap_word(w: str) -> str:
-    if not w:
-        return w
-    if w == "❓":
-        return "❓"
-    if w.isdigit():
-        return w
-    if w.isalpha() and len(w) <= 2:
-        return w.upper()
-    return w.lower().capitalize()
-
-def place_title_case(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return s
-    if s == "❓":
-        return "❓"
-    tokens = [t for t in re.split(r"\s+", s) if t]
-    out = []
-    for t in tokens:
-        if "-" in t:
-            parts = t.split("-")
-            out.append("-".join(_cap_word(p) for p in parts))
-        else:
-            out.append(_cap_word(t))
-    return " ".join(out)
-
-def is_transport_like_parts(parts) -> bool:
-    if not parts or len(parts) < 2:
-        return False
-    seg2 = (parts[1] or "").strip()
-    if not seg2 or seg2 == "❓":
-        return False
-    name, score = best_transport_match(seg2)
-    return bool(name and score >= TRANSPORT_THRESHOLD)
-
-def _try_parse_product_no_pipes_strict(line: str):
-    head, money = _extract_tail_money(line)
-    if not money:
-        return None
-    mqty = re.search(r"\b(\d{1,3})\s*$", head)
-    if not mqty:
-        return None
-    qty = mqty.group(1)
-    name_part = head[:mqty.start()].strip()
-    if not name_part:
-        return None
-    return f"{name_part} | {qty} | {money}"
-
-def _best_transport_suffix(words):
-    best_name, best_score, best_cut = None, 0.0, None
-    n = len(words)
-    for L in range(1, min(5, n) + 1):
-        cut = n - L
-        cand = " ".join(words[cut:])
-        name, score = best_transport_match(cand)
-        if name and score > best_score:
-            best_score = score
-            best_name = name
-            best_cut = cut
-    return best_name, best_score, best_cut
-
-def _try_parse_cost_no_pipes(line: str):
-    head, money = _extract_tail_money(line)
-    if not money:
-        return None
-    words = [w for w in re.split(r"\s+", head.strip()) if w]
-    if len(words) < 2:
-        return None
-    best_t, score, cut = _best_transport_suffix(words)
-    if not best_t or score < TRANSPORT_THRESHOLD:
-        return None
-    dest = " ".join(words[:cut]).strip()
-    if not dest:
-        return None
-    return f"{dest} | {best_t} | {money}"
-
-def auto_insert_pipes_if_missing(line: str) -> str:
-    s = (line or "").strip()
-    if not s:
-        return "❓ | ❓ | ❓"
-    if ("|" in s) or ("｜" in s):
-        return s
-
-    as_product = _try_parse_product_no_pipes_strict(s)
-    if as_product:
-        return as_product
-
-    as_cost = _try_parse_cost_no_pipes(s)
-    if as_cost:
-        return as_cost
-
-    head, money = _extract_tail_money(s)
-    if money:
-        head = head.strip()
-
-        best_t, tscore = best_transport_match(head)
-        if best_t and tscore >= TRANSPORT_THRESHOLD:
-            return f"❓ | {best_t} | {money}"
-
-        words = [w for w in re.split(r"\s+", head) if w]
-        if words:
-            tname, score, cut = _best_transport_suffix(words)
-            if tname and score >= TRANSPORT_THRESHOLD:
-                dest = " ".join(words[:cut]).strip()
-                if not dest:
-                    return f"❓ | {tname} | {money}"
-                return f"{dest} | {tname} | {money}"
-
-        if not head:
-            return f"❓ | ❓ | {money}"
-        return f"{head} | ❓ | {money}"
-
-    return f"{s} | ❓ | ❓"
 
 def fill_missing_segments(parts, want_len=3):
     parts = list(parts or [])
@@ -458,27 +290,33 @@ def fill_missing_segments(parts, want_len=3):
         out.append(p if p else "❓")
     return out
 
-def normalize_detail_line(line: str) -> str:
-    line = auto_insert_pipes_if_missing(line)
+def is_transport_like_parts(parts) -> bool:
+    if not parts or len(parts) < 2: return False
+    seg2 = (parts[1] or "").strip()
+    if not seg2 or seg2 == "❓": return False
+    name, score = best_transport_match(seg2)
+    return bool(name and score >= TRANSPORT_THRESHOLD)
 
-    if ("|" not in line) and ("｜" not in line):
+def normalize_detail_line(line: str) -> str:
+    line = (line or "").strip()
+    if not line:
         return "❓ | ❓ | ❓"
+    if ("|" not in line) and ("｜" not in line):
+        # fallback auto insert
+        return f"{line} | ❓ | ❓"
 
     raw_parts = _split_pipes(line)
     parts = fill_missing_segments(raw_parts, 3)
 
     transport_like = is_transport_like_parts(parts)
-
     if transport_like:
+        # destination/title-case (simple)
         if parts[0] != "❓":
-            parts[0] = place_title_case(parts[0])
+            parts[0] = parts[0].title()
     else:
         if parts[0] != "❓":
             best_name, score = best_product_match(parts[0])
-            if best_name and score >= FUZZY_THRESHOLD:
-                parts[0] = best_name
-            else:
-                parts[0] = parts[0].upper()
+            parts[0] = best_name if best_name and score >= FUZZY_THRESHOLD else parts[0].upper()
 
     if transport_like and parts[1] != "❓":
         best_t, tscore = best_transport_match(parts[1])
@@ -495,10 +333,8 @@ def calc_total(lines):
     for ln in lines:
         nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", ln)
         for n in nums:
-            try:
-                total += int(n)
-            except:
-                pass
+            try: total += int(n)
+            except: pass
     return total
 
 def stylize_line_for_caption(line: str, force_transport: bool = False) -> str:
@@ -515,10 +351,7 @@ def build_caption(user_caption: str) -> str:
     detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
 
     if not detail_lines:
-        detail_lines = [
-            "❓ | ❓ | ❓",
-            "❓ | ❓ | ❓",
-        ]
+        detail_lines = ["❓ | ❓ | ❓", "❓ | ❓ | ❓"]
 
     total = calc_total(detail_lines)
 
@@ -529,88 +362,57 @@ def build_caption(user_caption: str) -> str:
         else:
             parts.append(stylize_line_for_caption(ln))
 
-    parts += ["", f"Total keseluruhan : {bold('RM' + str(total))}"]
+    parts += ["", f"𝖳𝗈𝗍𝖺𝗅 𝗄𝖾𝗌𝖾𝗅𝗎𝗋𝗎𝗁𝖺𝗇 : {bold('RM' + str(total))}"]
     cap = "\n".join(parts)
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
     return cap
 
 
-# ================= OCR HELPERS =================
+# ================= OCR (reuse your original parsing) =================
 def _clean_ocr_text(t: str) -> str:
-    t = t or ""
-    t = t.replace("\r", "\n")
+    t = (t or "").replace("\r", "\n")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
 _MONTH_MAP = {
-    "JAN": 1, "JANUARY": 1,
-    "FEB": 2, "FEBRUARY": 2,
-    "MAR": 3, "MARCH": 3,
+    "JAN": 1, "JANUARY": 1, "JANUARI": 1,
+    "FEB": 2, "FEBRUARY": 2, "FEBRUARI": 2,
+    "MAR": 3, "MARCH": 3, "MAC": 3,
     "APR": 4, "APRIL": 4,
-    "MAY": 5,
+    "MAY": 5, "MEI": 5,
     "JUN": 6, "JUNE": 6,
-    "JUL": 7, "JULY": 7,
-    "AUG": 8, "AUGUST": 8,
+    "JUL": 7, "JULY": 7, "JULAI": 7,
+    "AUG": 8, "AUGUST": 8, "OGOS": 8,
     "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
-    "OCT": 10, "OCTOBER": 10,
+    "OCT": 10, "OCTOBER": 10, "OKTOBER": 10,
     "NOV": 11, "NOVEMBER": 11,
-    "DEC": 12, "DECEMBER": 12,
-
-    "JANUARI": 1,
-    "FEBRUARI": 2,
-    "MAC": 3,
-    "APRIL": 4,
-    "MEI": 5,
-    "JUN": 6,
-    "JULAI": 7,
-    "OGOS": 8,
-    "SEPTEMBER": 9,
-    "OKTOBER": 10,
-    "NOVEMBER": 11,
-    "DISEMBER": 12,
+    "DEC": 12, "DECEMBER": 12, "DISEMBER": 12,
 }
 
 def _fmt_dt(day: int, month: int, year: int, hour: int, minute: int, ampm: Optional[str]) -> Optional[str]:
-    if not (1 <= day <= 31 and 1 <= month <= 12 and year >= 1900):
-        return None
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
+    if not (1 <= day <= 31 and 1 <= month <= 12 and year >= 1900): return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59): return None
 
     ap = (ampm or "").strip().lower().replace(".", "")
-    if ap in ["a", "am"]:
-        ap = "am"
-    elif ap in ["p", "pm"]:
-        ap = "pm"
-    else:
-        ap = ""
+    if ap in ["a", "am"]: ap = "am"
+    elif ap in ["p", "pm"]: ap = "pm"
+    else: ap = ""
 
     if not ap:
-        if hour == 0:
-            hour12, ap = 12, "am"
-        elif 1 <= hour <= 11:
-            hour12, ap = hour, "am"
-        elif hour == 12:
-            hour12, ap = 12, "pm"
-        else:
-            hour12, ap = hour - 12, "pm"
+        if hour == 0: hour12, ap = 12, "am"
+        elif 1 <= hour <= 11: hour12, ap = hour, "am"
+        elif hour == 12: hour12, ap = 12, "pm"
+        else: hour12, ap = hour - 12, "pm"
     else:
         h = hour
-        if ap == "am":
-            if h == 12:
-                h = 0
-        elif ap == "pm":
-            if 1 <= h <= 11:
-                h = h + 12
-        if h == 0:
-            hour12, ap = 12, "am"
-        elif 1 <= h <= 11:
-            hour12, ap = h, "am"
-        elif h == 12:
-            hour12, ap = 12, "pm"
-        else:
-            hour12, ap = h - 12, "pm"
+        if ap == "am" and h == 12: h = 0
+        if ap == "pm" and 1 <= h <= 11: h += 12
+        if h == 0: hour12, ap = 12, "am"
+        elif 1 <= h <= 11: hour12, ap = h, "am"
+        elif h == 12: hour12, ap = 12, "pm"
+        else: hour12, ap = h - 12, "pm"
 
     return f"{day:02d}/{month:02d}/{year:04d} | {hour12}:{minute:02d}{ap}"
 
@@ -627,13 +429,8 @@ def _find_datetime(text: str) -> Optional[str]:
         mon_txt = m.group("m").upper()
         mon = _MONTH_MAP.get(mon_txt) or _MONTH_MAP.get(mon_txt[:3])
         if mon:
-            year = int(m.group("y"))
-            hour = int(m.group("h"))
-            minute = int(m.group("mn"))
-            ap = m.group("ap")
-            out = _fmt_dt(day, mon, year, hour, minute, ap)
-            if out:
-                return out
+            out = _fmt_dt(day, mon, int(m.group("y")), int(m.group("h")), int(m.group("mn")), m.group("ap"))
+            if out: return out
 
     pat2 = re.compile(
         r"\b(?P<d>\d{1,2})[\/\-.](?P<m>\d{1,2})[\/\-.](?P<y>\d{2,4})\s*,?\s*"
@@ -641,67 +438,10 @@ def _find_datetime(text: str) -> Optional[str]:
     )
     m = pat2.search(t)
     if m:
-        day = int(m.group("d"))
-        mon = int(m.group("m"))
         yraw = m.group("y")
         year = int(yraw) + 2000 if len(yraw) == 2 else int(yraw)
-        hour = int(m.group("h"))
-        minute = int(m.group("mn"))
-        ap = m.group("ap")
-        out = _fmt_dt(day, mon, year, hour, minute, ap)
-        if out:
-            return out
-
-    pat3 = re.compile(
-        r"\b(?P<y>\d{4})[\/\-.](?P<m>\d{1,2})[\/\-.](?P<d>\d{1,2})\s*,?\s*"
-        r"(?P<h>\d{1,2})[:.](?P<mn>\d{2})(?:[:.]\d{2})?\s*(?P<ap>AM|PM|am|pm)?\b"
-    )
-    m = pat3.search(t)
-    if m:
-        year = int(m.group("y"))
-        mon = int(m.group("m"))
-        day = int(m.group("d"))
-        hour = int(m.group("h"))
-        minute = int(m.group("mn"))
-        ap = m.group("ap")
-        out = _fmt_dt(day, mon, year, hour, minute, ap)
-        if out:
-            return out
-
-    date_only = None
-    time_only = None
-
-    md = re.search(r"\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b", t)
-    if md:
-        d = int(md.group(1))
-        mth = int(md.group(2))
-        yraw = md.group(3)
-        y = int(yraw) + 2000 if len(yraw) == 2 else int(yraw)
-        date_only = (d, mth, y)
-
-    if not date_only:
-        md2 = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,12})\s+(\d{4})\b", t)
-        if md2:
-            d = int(md2.group(1))
-            mon_txt = md2.group(2).upper()
-            mth = _MONTH_MAP.get(mon_txt) or _MONTH_MAP.get(mon_txt[:3])
-            if mth:
-                y = int(md2.group(3))
-                date_only = (d, mth, y)
-
-    mt = re.search(r"\b(\d{1,2})[:.](\d{2})\s*(AM|PM|am|pm)?\b", t)
-    if mt:
-        hh = int(mt.group(1))
-        mn = int(mt.group(2))
-        ap = mt.group(3)
-        time_only = (hh, mn, ap)
-
-    if date_only and time_only:
-        d, mth, y = date_only
-        hh, mn, ap = time_only
-        out = _fmt_dt(d, mth, y, hh, mn, ap)
-        if out:
-            return out
+        out = _fmt_dt(int(m.group("d")), int(m.group("m")), year, int(m.group("h")), int(m.group("mn")), m.group("ap"))
+        if out: return out
 
     return None
 
@@ -709,8 +449,7 @@ def _digits_all(text: str) -> str:
     return re.sub(r"\D", "", text or "")
 
 def _find_account_and_label(text: str) -> Optional[str]:
-    if not OCR_TARGET_ACCOUNT:
-        return None
+    if not OCR_TARGET_ACCOUNT: return None
     digits = _digits_all(text)
     if OCR_TARGET_ACCOUNT in digits:
         return f"{OCR_TARGET_ACCOUNT} {OCR_TARGET_BANK_LABEL}".strip()
@@ -725,8 +464,7 @@ def _extract_amount_candidates(text: str) -> List[Tuple[float, str]]:
     )
     for m in money_pat.finditer(t):
         num = m.group(1) or m.group(2)
-        if not num:
-            continue
+        if not num: continue
         raw = num.replace(",", "")
         try:
             val = float(raw)
@@ -740,33 +478,11 @@ def _extract_amount_candidates(text: str) -> List[Tuple[float, str]]:
 
 def _find_total_amount(text: str) -> Optional[str]:
     t = text or ""
-    key_pat = re.compile(r"(?i)\b(amount|transfer amount|jumlah|total|paid|payment|amaun|rm)\b")
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-
-    best: Optional[Tuple[float, str]] = None
-
-    def consider(val: float, pretty: str, boost: float = 0.0):
-        nonlocal best
-        score = val + boost
-        if best is None or score > best[0]:
-            best = (score, pretty)
-
-    for ln in lines:
-        if not key_pat.search(ln):
-            continue
-        cands = _extract_amount_candidates(ln)
-        for v, p in cands:
-            b = 1000000.0 if re.search(r"(?i)\b(amount|transfer amount)\b", ln) else 200000.0
-            consider(v, p, boost=b)
-
-    if best is None:
-        cands = _extract_amount_candidates(t)
-        if cands:
-            v, p = max(cands, key=lambda x: x[0])
-            return p
+    cands = _extract_amount_candidates(t)
+    if not cands:
         return None
-
-    return best[1]
+    v, p = max(cands, key=lambda x: x[0])
+    return p
 
 async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
     def _run():
@@ -777,19 +493,14 @@ async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
         )
         if resp.error.message:
             raise RuntimeError(resp.error.message)
-
         full = ""
         try:
             if resp.full_text_annotation and resp.full_text_annotation.text:
                 full = resp.full_text_annotation.text
         except:
             full = ""
-
         if not full:
-            resp2 = VISION_CLIENT.text_detection(
-                image=image,
-                image_context={"language_hints": OCR_LANG_HINTS}
-            )
+            resp2 = VISION_CLIENT.text_detection(image=image, image_context={"language_hints": OCR_LANG_HINTS})
             if resp2.error.message:
                 raise RuntimeError(resp2.error.message)
             if resp2.text_annotations:
@@ -802,29 +513,17 @@ async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
     dt = _find_datetime(text)
     total = _find_total_amount(text)
     acc_label = _find_account_and_label(text)
-
     return {"raw": text, "datetime": dt, "total": total, "account_label": acc_label}
-
-def strip_existing_ocr_block(caption: str) -> str:
-    cap = caption or ""
-    cap = re.sub(r"\n✅\s*\d{2}\/\d{2}\/\d{4}\s*\|\s*[0-9:apm]+\s*\n✅.*?\n✅.*?(?=\n\n✅|\Z)", "", cap, flags=re.DOTALL)
-    cap = re.sub(
-        r"\n✅ Tarikh@waktu jam[^\n]*\n✅ No akaun[^\n]*\n✅ Total dalam resit[^\n]*(?:\n⚠️[^\n]*)?",
-        "",
-        cap
-    )
-    cap = re.sub(r"\n{3,}", "\n\n", cap)
-    return cap.strip()
 
 def build_ocr_block_one(ocr: Dict[str, Any], note: str = "") -> str:
     dt = ocr.get("datetime")
     acc_label = ocr.get("account_label")
     total = ocr.get("total")
-
-    lines = []
-    lines.append(f"✅ {bold(dt) if dt else '❓'}")
-    lines.append(f"✅ {bold(acc_label) if acc_label else '❓'}")
-    lines.append(f"✅ {bold(total) if total else '❓'}")
+    lines = [
+        f"✅ {bold(dt) if dt else '❓'}",
+        f"✅ {bold(acc_label) if acc_label else '❓'}",
+        f"✅ {bold(total) if total else '❓'}",
+    ]
     if note:
         lines.append(f"⚠️ {note}")
     return "\n".join(lines)
@@ -832,9 +531,15 @@ def build_ocr_block_one(ocr: Dict[str, Any], note: str = "") -> str:
 def build_ocr_paragraph_multi(all_blocks: List[str]) -> str:
     return "\n\n".join(all_blocks)
 
+def strip_existing_ocr_block(caption: str) -> str:
+    cap = caption or ""
+    cap = re.sub(r"\n✅\s*\d{2}\/\d{2}\/\d{4}\s*\|\s*[0-9:apm]+\s*\n✅.*?\n✅.*?(?=\n\n✅|\Z)", "", cap, flags=re.DOTALL)
+    cap = re.sub(r"\n{3,}", "\n\n", cap)
+    return cap.strip()
+
 
 # =========================================================
-# ✅ STATE: PRODUK/ALBUM
+# ✅ STATE
 # =========================================================
 STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))
 RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
@@ -876,10 +581,6 @@ async def _delete_messages_safe(client: Client, chat_id: int, msg_ids):
         pass
 
 async def _send_media_group_in_chunks(client: Client, chat_id: int, media: List[InputMediaPhoto]) -> List[int]:
-    """
-    Helper generic: hantar media group (album) pecah chunk 10.
-    Return msg_ids yang dihantar.
-    """
     chunks, cur = [], []
     for m in media:
         cur.append(m)
@@ -891,7 +592,6 @@ async def _send_media_group_in_chunks(client: Client, chat_id: int, media: List[
 
     sent_msg_ids: List[int] = []
     for idx, ch in enumerate(chunks):
-        # Telegram: caption cuma boleh ada pada elemen pertama album pertama
         if idx > 0:
             try:
                 ch[0].caption = None
@@ -905,15 +605,7 @@ async def _send_media_group_in_chunks(client: Client, chat_id: int, media: List[
             pass
     return sent_msg_ids
 
-async def _send_album_and_update_state(
-    client: Client,
-    chat_id: int,
-    state_id,
-    product_file_id: str,
-    caption: str,
-    receipts: list,
-    ocr_applied: bool
-):
+async def _send_album_and_update_state(client, chat_id, state_id, product_file_id, caption, receipts, ocr_applied):
     media = [InputMediaPhoto(media=product_file_id, caption=caption)]
     for fid in receipts:
         media.append(InputMediaPhoto(media=fid))
@@ -933,22 +625,11 @@ async def _send_album_and_update_state(
     }
     return sent_msg_ids
 
-async def _send_album_to_channel(
-    client: Client,
-    channel_id: int,
-    product_file_id: str,
-    caption: str,
-    receipts: list
-) -> bool:
-    """
-    ✅ FIX: hantar ke CHANNEL dalam bentuk ALBUM (send_media_group),
-    sama macam dalam group.
-    """
+async def _send_album_to_channel(client, channel_id, product_file_id, caption, receipts) -> bool:
     try:
         media = [InputMediaPhoto(media=product_file_id, caption=caption)]
         for fid in receipts:
             media.append(InputMediaPhoto(media=fid))
-
         await _send_media_group_in_chunks(client, channel_id, media)
         return True
     except Exception:
@@ -956,7 +637,7 @@ async def _send_album_to_channel(
 
 
 # =========================================================
-# ✅ RECEIPT GROUP BUFFER
+# ✅ RECEIPT BUFFER
 # =========================================================
 _pending_receipt_groups = {}
 _pending_lock = asyncio.Lock()
@@ -966,14 +647,6 @@ def is_reply_to_any_message(message) -> bool:
         return bool(message.reply_to_message and message.reply_to_message.id)
     except:
         return False
-
-async def _delete_message_safe(msg):
-    try:
-        await tg_call(msg.delete)
-    except (MessageDeleteForbidden, ChatAdminRequired):
-        pass
-    except:
-        pass
 
 async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: int, new_receipt_file_ids: list):
     if not new_receipt_file_ids:
@@ -998,13 +671,12 @@ async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: 
             state["product_file_id"],
             state.get("caption", ""),
             receipts,
-            ocr_applied=False  # ✅ bila tambah resit baru, OCR dianggap belum final lagi
+            ocr_applied=False
         )
         return True
 
 async def _process_receipt_group(client: Client, chat_id: int, media_group_id: str, reply_to_id: int):
     await asyncio.sleep(RECEIPT_DELAY_SEC)
-
     async with _pending_lock:
         key = (chat_id, media_group_id, reply_to_id)
         data = _pending_receipt_groups.pop(key, None)
@@ -1047,7 +719,7 @@ async def handle_receipt_photo(client: Client, message):
 
 
 # =========================================================
-# ✅ OCR TRIGGER: REPOST ALBUM + OCR BLOCK (SCAN SEMUA RESIT)
+# ✅ OCR APPLY
 # =========================================================
 async def _download_file_bytes(client: Client, file_id: str) -> Optional[bytes]:
     try:
@@ -1083,20 +755,18 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
             blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=note))
     else:
         for fid in receipts:
-            note = ""
             img_bytes = await _download_file_bytes(client, fid)
             if not img_bytes:
                 blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note="OCR gagal (download resit gagal)"))
                 continue
             try:
                 ocr_data = await ocr_extract_from_bytes(img_bytes)
-                blocks.append(build_ocr_block_one(ocr_data, note=note))
+                blocks.append(build_ocr_block_one(ocr_data, note=""))
             except Exception as e:
                 blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=f"OCR gagal ({e})"))
 
     cleaned = strip_existing_ocr_block(caption_now)
-    ocr_para = build_ocr_paragraph_multi(blocks)
-    new_caption = (cleaned + "\n\n" + ocr_para).strip()
+    new_caption = (cleaned + "\n\n" + build_ocr_paragraph_multi(blocks)).strip()
 
     if len(new_caption) > 1024:
         new_caption = new_caption[:1000] + "\n...(caption terlalu panjang)"
@@ -1118,13 +788,13 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
             product_file_id=product_file_id,
             caption=new_caption,
             receipts=receipts,
-            ocr_applied=True  # ✅ ini penting untuk "FINALIZE" step
+            ocr_applied=True
         )
         return True
 
 
 # =========================================================
-# ✅ FINALIZE: HANTAR ALBUM KE CHANNEL + PADAM SEMUA DALAM GROUP
+# ✅ FINALIZE
 # =========================================================
 async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to_id: int) -> bool:
     async with _state_lock:
@@ -1133,29 +803,18 @@ async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to
         state = ORDER_STATES.get(state_id)
         if not state:
             return False
-
         if not state.get("ocr_applied", False):
-            return False  # hanya boleh finalize lepas OCR dah keluar
+            return False
 
-        # ✅ Ambil info album daripada state (bukan copy_message msg_ids)
         product_file_id = state.get("product_file_id")
         caption = state.get("caption", "")
         receipts = list(state.get("receipts", []))
         group_msg_ids = list(state.get("msg_ids", []))
 
-    # ✅ Hantar ke channel dalam bentuk album (media group)
-    ok = await _send_album_to_channel(
-        client=client,
-        channel_id=OFFICIAL_CHANNEL_ID,
-        product_file_id=product_file_id,
-        caption=caption,
-        receipts=receipts
-    )
-
+    ok = await _send_album_to_channel(client, OFFICIAL_CHANNEL_ID, product_file_id, caption, receipts)
     if not ok:
         return False
 
-    # Lepas berjaya hantar album ke channel, padam semua dari group + clear state
     async with _state_lock:
         _cleanup_states()
         state = ORDER_STATES.get(state_id)
@@ -1166,55 +825,67 @@ async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to
         await _delete_messages_safe(client, chat_id, msg_ids)
         for mid in msg_ids:
             MSGID_TO_STATE.pop((chat_id, mid), None)
-
         ORDER_STATES.pop(state_id, None)
 
     return True
 
 
 # =========================================================
-# ✅ TEXT TRIGGER: 123 (OCR atau FINALIZE)
+# ✅ PENTING: TEXT CLEANER (GROUP/SUPERGROUP)
+# - INI YANG BUAT PADAM TEXT SERTA-MERTA
+# - group=0 supaya dia jalan awal
 # =========================================================
-@bot.on_message(filters.text & ~filters.bot)
-async def handle_text_trigger(client: Client, message):
-    if not is_reply_to_any_message(message):
-        return
-
+@bot.on_message((filters.group | filters.supergroup) & filters.text & ~filters.bot, group=0)
+async def group_text_cleaner_and_trigger(client: Client, message):
     txt = (message.text or "").strip()
-    if txt != OCR_TRIGGER_CODE:
-        return
 
-    # padam mesej "123" supaya clean
-    await _delete_message_safe(message)
-
-    # ✅ hanya user allow boleh buat trigger ini (OCR & FINALIZE)
-    if not is_allowed_user(message):
+    # 1) Kalau bukan reply -> padam terus
+    if not is_reply_to_any_message(message):
+        await _delete_message_safe(message)
         return
 
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
 
-    # Tentukan mode:
-    # - kalau state belum OCR -> buat OCR repost
-    # - kalau state dah OCR -> buat FINALIZE (album ke channel + padam semua)
+    # cari state berdasarkan reply target
     async with _state_lock:
         _cleanup_states()
         sid = _get_state_id_from_reply(chat_id, reply_to_id)
         st = ORDER_STATES.get(sid)
 
+    # 2) Reply tapi bukan reply pada order/album -> padam terus
     if not st:
+        await _delete_message_safe(message)
         return
 
+    # 3) Reply pada order, kalau password salah / text lain -> padam terus
+    if txt != OCR_TRIGGER_CODE:
+        await _delete_message_safe(message)
+        return
+
+    # password betul -> tetap padam text tersebut dulu (clean)
+    await _delete_message_safe(message)
+
+    # hanya user allow
+    if not is_allowed_user(message):
+        return
+
+    # mesti ada sekurang-kurangnya 1 resit
+    receipts = list(st.get("receipts", []) or [])
+    if not receipts:
+        return
+
+    # mode: OCR dulu, kemudian finalize
     if st.get("ocr_applied", False):
         await _finalize_to_channel_and_delete(client, chat_id, reply_to_id)
     else:
         await _apply_ocr_and_repost_album(client, chat_id, reply_to_id)
 
 
-# ================= HANDLER PHOTO =================
+# ================= PHOTO HANDLER =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
-    # jika reply pada album/order -> ini resit
+    # kalau reply pada album/order -> ini resit
     if is_reply_to_any_message(message):
         await handle_receipt_photo(client, message)
         return
@@ -1232,12 +903,7 @@ async def handle_photo(client, message):
     except:
         pass
 
-    sent = await tg_call(
-        client.send_photo,
-        chat_id=chat_id,
-        photo=photo_id,
-        caption=new_caption
-    )
+    sent = await tg_call(client.send_photo, chat_id=chat_id, photo=photo_id, caption=new_caption)
 
     try:
         if sent and sent.photo:
