@@ -493,7 +493,7 @@ def build_caption(user_caption: str) -> str:
         else:
             parts.append(stylize_line_for_caption(ln))
 
-    parts += ["", f"𝖳𝗈𝗍𝖺𝗅 𝗄𝖾𝗌𝖾𝗅𝗎𝗋𝗎𝗁𝖺𝗇 : {bold('RM' + str(total))}"]
+    parts += ["", f"𝑻𝒐𝒕𝒂𝒍 𝒌𝒆𝒔𝒆𝒍𝒖𝒓𝒖𝒉𝒂𝒏 : {bold('RM' + str(total))}"]
     cap = "\n".join(parts)
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
