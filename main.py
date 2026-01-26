@@ -17,12 +17,19 @@
 # ✅ FIX BESAR (OCR):
 # - Auto repair GOOGLE_APPLICATION_CREDENTIALS_JSON jika "private_key" ada newline sebenar (invalid control char)
 # - Support juga optional GOOGLE_APPLICATION_CREDENTIALS_B64 (base64) jika mahu
+#
+# ✅ UPGRADE (PERMINTAAN AWAK):
+# - Tarikh & masa: support Januari/January + format pelik, output tetap: ✅ 01/01/2026 | 4:39pm
+# - Akaun: support "8 6 0 6..." / "86 06 01 84 23" / apa-apa jarak → match digit sama
+#   bila jumpa akaun target → auto papar: "8606018423 CIMB BANK"
+# - Amaun/total: support RM / MYR / 897myr / rm20.00 / myr10 / Amount / Total / Jumlah / Transfer amount
+# - Banyak resit: OCR scan SEMUA resit dalam album (bukan last sahaja) + papar blok setiap resit
 # =========================
 
 import os, re, json, time, asyncio, tempfile, base64
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import pytz
 from pyrogram import Client, filters
@@ -46,7 +53,13 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Missing API_ID / API_HASH / BOT_TOKEN")
 
 OCR_TRIGGER_CODE = os.getenv("OCR_TRIGGER_CODE", "123").strip()
-OCR_TARGET_ACCOUNT = os.getenv("OCR_TARGET_ACCOUNT", "8606018423").strip()
+
+# Akaun target yang awak nak detect (digits sahaja disimpan)
+OCR_TARGET_ACCOUNT = re.sub(r"\D", "", os.getenv("OCR_TARGET_ACCOUNT", "8606018423").strip())
+
+# Bila jumpa akaun target, auto label bank
+OCR_TARGET_BANK_LABEL = os.getenv("OCR_TARGET_BANK_LABEL", "CIMB BANK").strip()
+
 OCR_LANG_HINTS = [x.strip() for x in os.getenv("OCR_LANG_HINTS", "ms,en").split(",") if x.strip()]
 
 TZ = pytz.timezone("Asia/Kuala_Lumpur")
@@ -68,14 +81,11 @@ _OCR_INIT_ERROR = ""
 VISION_CLIENT = None
 
 def _get_google_json_env_value() -> str:
-    """
-    Ambil dari env yang betul (dengan fallback typo).
-    """
     candidates = [
-        "GOOGLE_APPLICATION_CREDENTIALS_JSON",    # betul
-        "GOOGLE_APPLICATION_CREDENTIALIALS_JSON", # typo biasa
-        "GOOGLE_APPLICATION_CREDENTIALITALS_JSON",# typo biasa
-        "GOOGLE_APPLICATION_CREDENTAILS_JSON",    # typo
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+        "GOOGLE_APPLICATION_CREDENTIALIALS_JSON",
+        "GOOGLE_APPLICATION_CREDENTIALITALS_JSON",
+        "GOOGLE_APPLICATION_CREDENTAILS_JSON",
     ]
     for k in candidates:
         v = (os.getenv(k, "") or "").strip()
@@ -84,9 +94,6 @@ def _get_google_json_env_value() -> str:
     return ""
 
 def _try_decode_b64_creds() -> str:
-    """
-    Optional: jika user guna GOOGLE_APPLICATION_CREDENTIALS_B64 (base64)
-    """
     b64 = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS_B64", "") or "").strip()
     if not b64:
         return ""
@@ -97,32 +104,17 @@ def _try_decode_b64_creds() -> str:
         return ""
 
 def _repair_private_key_newlines(raw: str) -> str:
-    """
-    Fix error: Invalid control character...
-    Bila private_key dalam env jadi multiline sebenar (newline tak di-escape).
-    Kita tukar newline dalam value private_key -> \\n, supaya JSON valid.
-    """
     if not raw:
         return raw
-
-    # Kalau JSON dah ok / tiada masalah, return saja
-    # Tapi kita memang guna try/except di bawah, jadi sini hanya "best effort".
-
-    # Cari blok "private_key": "<MULTILINE>" , "client_email":
-    # Kita replace newline literal dalam bahagian MULTILINE jadi \\n
     pattern = re.compile(r'("private_key"\s*:\s*")(.+?)("(\s*,\s*"client_email"\s*:))', re.DOTALL)
     m = pattern.search(raw)
     if not m:
         return raw
-
     before = m.group(1)
     keyval = m.group(2)
     after = m.group(3)
-
-    # Buang \r, kemudian tukar newline sebenar jadi \\n
     keyval = keyval.replace("\r", "")
     keyval = keyval.replace("\n", "\\n")
-
     fixed = raw[:m.start()] + before + keyval + after + raw[m.end():]
     return fixed
 
@@ -136,25 +128,20 @@ def init_vision_client():
         _OCR_INIT_ERROR = "google-cloud-vision belum dipasang"
         return
 
-    # 1) ambil dari B64 kalau ada
     raw = _try_decode_b64_creds()
     if not raw:
-        # 2) kalau tiada, ambil JSON env biasa
         raw = _get_google_json_env_value()
 
     if not raw:
         _OCR_INIT_ERROR = "GOOGLE_APPLICATION_CREDENTIALS_JSON kosong / tiada"
         return
 
-    # Railway kadang escape \n jadi \\n (ok), kadang jadi newline sebenar (problem)
-    # Kita cuba parse; kalau gagal, kita repair private_key.
-    raw1 = raw.replace("\\n", "\n")  # jika env simpan \\n literal, jadikan newline (sebab kita akan dump semula ke file)
+    raw1 = raw.replace("\\n", "\n")
     data = None
 
     try:
         data = json.loads(raw1)
     except Exception:
-        # cuba repair JSON broken sebab newline dalam string private_key
         raw_fixed = _repair_private_key_newlines(raw1)
         try:
             data = json.loads(raw_fixed)
@@ -162,12 +149,9 @@ def init_vision_client():
             _OCR_INIT_ERROR = f"JSON service account tak valid: {e}"
             return
 
-    # Pastikan private_key betul (kunci biasanya ada \n escape)
     try:
         pk = data.get("private_key", "")
         if isinstance(pk, str):
-            # Jika pk mengandungi newline sebenar, Vision masih ok, tapi kita rapikan ke format standard
-            # (file json boleh simpan dengan newline juga, tetap ok)
             data["private_key"] = pk.replace("\\n", "\n")
     except Exception:
         pass
@@ -195,7 +179,7 @@ BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
     "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
-    "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"
+    "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝗷𝟴𝟵".replace("𝗷", "𝟯")  # tiny patch if font glitch; safe fallback
 )
 def bold(text: str) -> str:
     return (text or "").translate(BOLD_MAP)
@@ -203,8 +187,8 @@ def bold(text: str) -> str:
 ALT_BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
-    "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳"
-    "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"
+    "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝘂𝘃𝘄𝘅𝘆𝘇"
+    "𝟎𝟏𝟐𝟑𝟒𝟓𝟲𝟕𝟖𝟗"
 )
 def bold2(text: str) -> str:
     return (text or "").translate(ALT_BOLD_MAP)
@@ -424,7 +408,6 @@ def auto_insert_pipes_if_missing(line: str) -> str:
     if money:
         head = head.strip()
 
-        # FIX transport tanpa tempat: "transport luar 350" -> "❓ | Transport luar | RM350"
         best_t, tscore = best_transport_match(head)
         if best_t and tscore >= TRANSPORT_THRESHOLD:
             return f"❓ | {best_t} | {money}"
@@ -438,7 +421,6 @@ def auto_insert_pipes_if_missing(line: str) -> str:
                     return f"❓ | {tname} | {money}"
                 return f"{dest} | {tname} | {money}"
 
-        # default: produk tanpa qty -> "nama | ❓ | RM"
         if not head:
             return f"❓ | ❓ | {money}"
         return f"{head} | ❓ | {money}"
@@ -541,55 +523,262 @@ def _clean_ocr_text(t: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
-def _find_datetime(text: str) -> Optional[str]:
-    t = text
-    m = re.search(
-        r"\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\b",
-        t, re.IGNORECASE
-    )
-    if m:
-        return m.group(1).strip()
+# ---- Month map (BM + EN) ----
+_MONTH_MAP = {
+    # EN
+    "JAN": 1, "JANUARY": 1,
+    "FEB": 2, "FEBRUARY": 2,
+    "MAR": 3, "MARCH": 3,
+    "APR": 4, "APRIL": 4,
+    "MAY": 5,
+    "JUN": 6, "JUNE": 6,
+    "JUL": 7, "JULY": 7,
+    "AUG": 8, "AUGUST": 8,
+    "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10,
+    "NOV": 11, "NOVEMBER": 11,
+    "DEC": 12, "DECEMBER": 12,
+    # BM
+    "JANUARI": 1,
+    "FEBRUARI": 2,
+    "MAC": 3,
+    "APRIL": 4,
+    "MEI": 5,
+    "JUN": 6,
+    "JULAI": 7,
+    "OGOS": 8,
+    "SEPTEMBER": 9,
+    "OKTOBER": 10,
+    "NOVEMBER": 11,
+    "DISEMBER": 12,
+}
 
-    m = re.search(
-        r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*(AM|PM)?\b",
-        t, re.IGNORECASE
+def _fmt_dt(day: int, month: int, year: int, hour: int, minute: int, ampm: Optional[str]) -> Optional[str]:
+    if not (1 <= day <= 31 and 1 <= month <= 12 and year >= 1900):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    ap = (ampm or "").strip().lower().replace(".", "")
+    # normalize am/pm
+    if ap in ["a", "am"]:
+        ap = "am"
+    elif ap in ["p", "pm"]:
+        ap = "pm"
+    else:
+        ap = ""
+
+    # if no am/pm, assume 24h; convert to 12h with am/pm
+    if not ap:
+        if hour == 0:
+            hour12, ap = 12, "am"
+        elif 1 <= hour <= 11:
+            hour12, ap = hour, "am"
+        elif hour == 12:
+            hour12, ap = 12, "pm"
+        else:
+            hour12, ap = hour - 12, "pm"
+    else:
+        # am/pm exists; interpret hour as 1-12 (but OCR kadang 00/13 pun keluar)
+        h = hour
+        if ap == "am":
+            if h == 12:
+                h = 0
+        elif ap == "pm":
+            if 1 <= h <= 11:
+                h = h + 12
+        # now convert to 12h display
+        if h == 0:
+            hour12, ap = 12, "am"
+        elif 1 <= h <= 11:
+            hour12, ap = h, "am"
+        elif h == 12:
+            hour12, ap = 12, "pm"
+        else:
+            hour12, ap = h - 12, "pm"
+
+    return f"{day:02d}/{month:02d}/{year:04d} | {hour12}:{minute:02d}{ap}"
+
+def _find_datetime(text: str) -> Optional[str]:
+    t = text or ""
+    t = t.replace("—", "-").replace("–", "-")
+
+    # 1) Format: 20 Jan 2026, 05:36 PM  (comma optional)
+    pat1 = re.compile(
+        r"\b(?P<d>\d{1,2})\s+(?P<m>[A-Za-z]{3,12})\s+(?P<y>\d{4})\s*,?\s*"
+        r"(?P<h>\d{1,2})[:.](?P<mn>\d{2})(?:[:.]\d{2})?\s*(?P<ap>AM|PM|am|pm)?\b"
     )
+    m = pat1.search(t)
     if m:
-        d = m.group(1)
-        tm = m.group(2)
-        ap = (m.group(3) or "").upper()
-        return f"{d} {tm} {ap}".strip()
+        day = int(m.group("d"))
+        mon_txt = m.group("m").upper()
+        mon = _MONTH_MAP.get(mon_txt) or _MONTH_MAP.get(mon_txt[:3])
+        if mon:
+            year = int(m.group("y"))
+            hour = int(m.group("h"))
+            minute = int(m.group("mn"))
+            ap = m.group("ap")
+            out = _fmt_dt(day, mon, year, hour, minute, ap)
+            if out:
+                return out
+
+    # 2) Format numeric: 01/01/2026 4:39pm  OR 01-01-2026, 16:39
+    pat2 = re.compile(
+        r"\b(?P<d>\d{1,2})[\/\-.](?P<m>\d{1,2})[\/\-.](?P<y>\d{2,4})\s*,?\s*"
+        r"(?P<h>\d{1,2})[:.](?P<mn>\d{2})(?:[:.]\d{2})?\s*(?P<ap>AM|PM|am|pm)?\b"
+    )
+    m = pat2.search(t)
+    if m:
+        day = int(m.group("d"))
+        mon = int(m.group("m"))
+        yraw = m.group("y")
+        year = int(yraw) + 2000 if len(yraw) == 2 else int(yraw)
+        hour = int(m.group("h"))
+        minute = int(m.group("mn"))
+        ap = m.group("ap")
+        out = _fmt_dt(day, mon, year, hour, minute, ap)
+        if out:
+            return out
+
+    # 3) Format: 2026-01-20 05:36 PM
+    pat3 = re.compile(
+        r"\b(?P<y>\d{4})[\/\-.](?P<m>\d{1,2})[\/\-.](?P<d>\d{1,2})\s*,?\s*"
+        r"(?P<h>\d{1,2})[:.](?P<mn>\d{2})(?:[:.]\d{2})?\s*(?P<ap>AM|PM|am|pm)?\b"
+    )
+    m = pat3.search(t)
+    if m:
+        year = int(m.group("y"))
+        mon = int(m.group("m"))
+        day = int(m.group("d"))
+        hour = int(m.group("h"))
+        minute = int(m.group("mn"))
+        ap = m.group("ap")
+        out = _fmt_dt(day, mon, year, hour, minute, ap)
+        if out:
+            return out
+
+    # 4) Fallback: cari tarikh sahaja + masa sahaja (berasingan) dalam jarak dekat
+    date_only = None
+    time_only = None
+
+    md = re.search(r"\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b", t)
+    if md:
+        d = int(md.group(1))
+        mth = int(md.group(2))
+        yraw = md.group(3)
+        y = int(yraw) + 2000 if len(yraw) == 2 else int(yraw)
+        date_only = (d, mth, y)
+
+    if not date_only:
+        md2 = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,12})\s+(\d{4})\b", t)
+        if md2:
+            d = int(md2.group(1))
+            mon_txt = md2.group(2).upper()
+            mth = _MONTH_MAP.get(mon_txt) or _MONTH_MAP.get(mon_txt[:3])
+            if mth:
+                y = int(md2.group(3))
+                date_only = (d, mth, y)
+
+    mt = re.search(r"\b(\d{1,2})[:.](\d{2})\s*(AM|PM|am|pm)?\b", t)
+    if mt:
+        hh = int(mt.group(1))
+        mn = int(mt.group(2))
+        ap = mt.group(3)
+        time_only = (hh, mn, ap)
+
+    if date_only and time_only:
+        d, mth, y = date_only
+        hh, mn, ap = time_only
+        out = _fmt_dt(d, mth, y, hh, mn, ap)
+        if out:
+            return out
+
     return None
 
-def _find_total_amount(text: str) -> Optional[str]:
-    amts = []
-    for m in re.finditer(
-        r"(?i)\bRM\s*([0-9]{1,3}(?:[,][0-9]{3})*(?:\.[0-9]{2})?|[0-9]{1,12}(?:\.[0-9]{2})?)\b",
-        text
-    ):
-        raw = m.group(1).replace(",", "")
-        try:
-            amts.append(float(raw))
-        except:
-            pass
+def _digits_all(text: str) -> str:
+    return re.sub(r"\D", "", text or "")
 
-    if not amts:
+def _find_account_and_label(text: str) -> Optional[str]:
+    if not OCR_TARGET_ACCOUNT:
         return None
-    mx = max(amts)
-    if float(mx).is_integer():
-        return f"RM{int(mx)}"
-    return f"RM{mx:.2f}"
+    digits = _digits_all(text)
+    if OCR_TARGET_ACCOUNT in digits:
+        return f"{OCR_TARGET_ACCOUNT} {OCR_TARGET_BANK_LABEL}".strip()
+    return None
 
-def _target_account_found(text: str, target: str) -> bool:
-    if not target:
-        return False
-    digits = re.sub(r"\D", "", text or "")
-    return target in digits
+def _extract_amount_candidates(text: str) -> List[Tuple[float, str]]:
+    """
+    Collect candidates with context keyword preference.
+    Returns list of (value, pretty_string).
+    """
+    t = text or ""
+    out: List[Tuple[float, str]] = []
+
+    # Standard patterns: RM / MYR prefix OR suffix
+    # capture like: RM 3,600.00 / RM3600 / 897myr / myr10 / RM3,600
+    money_pat = re.compile(
+        r"(?i)\b(?:rm|myr)\s*([0-9]{1,3}(?:[,][0-9]{3})*(?:\.[0-9]{2})?|[0-9]{1,12}(?:\.[0-9]{2})?)\b"
+        r"|\b([0-9]{1,3}(?:[,][0-9]{3})*(?:\.[0-9]{2})?|[0-9]{1,12}(?:\.[0-9]{2})?)\s*(?:rm|myr)\b"
+    )
+
+    for m in money_pat.finditer(t):
+        num = m.group(1) or m.group(2)
+        if not num:
+            continue
+        raw = num.replace(",", "")
+        try:
+            val = float(raw)
+        except:
+            continue
+        # filter crazy big values (avoid ref id / account)
+        if val <= 0 or val > 100000000:
+            continue
+        # pretty keep 2 decimals
+        pretty = f"RM{val:,.2f}".replace(",", "")
+        out.append((val, pretty))
+
+    return out
+
+def _find_total_amount(text: str) -> Optional[str]:
+    t = text or ""
+    # Prefer lines with these keywords
+    key_pat = re.compile(r"(?i)\b(amount|transfer amount|jumlah|total|paid|payment|amaun|rm)\b")
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+
+    best: Optional[Tuple[float, str]] = None
+
+    def consider(val: float, pretty: str, boost: float = 0.0):
+        nonlocal best
+        score = val + boost  # simple scoring: bigger + keyword boost
+        if best is None or score > (best[0] + 0.0001):
+            best = (score, pretty)
+
+    # 1) keyword lines first
+    for ln in lines:
+        if not key_pat.search(ln):
+            continue
+        cands = _extract_amount_candidates(ln)
+        for v, p in cands:
+            # strong boost if line contains "amount" or "transfer"
+            b = 1000000.0 if re.search(r"(?i)\b(amount|transfer amount)\b", ln) else 200000.0
+            consider(v, p, boost=b)
+
+    # 2) fallback: anywhere, choose max
+    if best is None:
+        cands = _extract_amount_candidates(t)
+        if cands:
+            v, p = max(cands, key=lambda x: x[0])
+            return p
+        return None
+
+    return best[1]
 
 async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
     def _run():
         image = vision.Image(content=img_bytes)
-        resp = VISION_CLIENT.text_detection(
+
+        # document_text_detection usually lebih padu untuk resit (layout)
+        resp = VISION_CLIENT.document_text_detection(
             image=image,
             image_context={"language_hints": OCR_LANG_HINTS}
         )
@@ -597,20 +786,38 @@ async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
             raise RuntimeError(resp.error.message)
 
         full = ""
-        if resp.text_annotations:
-            full = resp.text_annotations[0].description or ""
+        try:
+            if resp.full_text_annotation and resp.full_text_annotation.text:
+                full = resp.full_text_annotation.text
+        except:
+            full = ""
+
+        # fallback kalau kosong
+        if not full:
+            resp2 = VISION_CLIENT.text_detection(
+                image=image,
+                image_context={"language_hints": OCR_LANG_HINTS}
+            )
+            if resp2.error.message:
+                raise RuntimeError(resp2.error.message)
+            if resp2.text_annotations:
+                full = resp2.text_annotations[0].description or ""
         return full
 
     text = await asyncio.to_thread(_run)
     text = _clean_ocr_text(text)
-    dt = _find_datetime(text)
-    total = _find_total_amount(text)
-    acc_ok = _target_account_found(text, OCR_TARGET_ACCOUNT)
 
-    return {"raw": text, "datetime": dt, "total": total, "account_ok": acc_ok}
+    dt = _find_datetime(text)                 # ✅ output sudah jadi dd/mm/yyyy | h:mmap
+    total = _find_total_amount(text)          # ✅ output RMxxx.xx
+    acc_label = _find_account_and_label(text) # ✅ "8606018423 CIMB BANK" jika match
+
+    return {"raw": text, "datetime": dt, "total": total, "account_label": acc_label}
 
 def strip_existing_ocr_block(caption: str) -> str:
     cap = caption or ""
+    # buang semua blok OCR lama (multi resit pun)
+    cap = re.sub(r"\n✅\s*\d{2}\/\d{2}\/\d{4}\s*\|\s*[0-9:apm]+\s*\n✅.*?\n✅.*?(?=\n\n✅|\Z)", "", cap, flags=re.DOTALL)
+    # buang format lama juga
     cap = re.sub(
         r"\n✅ Tarikh@waktu jam[^\n]*\n✅ No akaun[^\n]*\n✅ Total dalam resit[^\n]*(?:\n⚠️[^\n]*)?",
         "",
@@ -619,29 +826,22 @@ def strip_existing_ocr_block(caption: str) -> str:
     cap = re.sub(r"\n{3,}", "\n\n", cap)
     return cap.strip()
 
-def build_ocr_paragraph(ocr: Dict[str, Any], note: str = "") -> str:
-    dt = ocr.get("datetime")
+def build_ocr_block_one(ocr: Dict[str, Any], note: str = "") -> str:
+    dt = ocr.get("datetime")          # already normalized
+    acc_label = ocr.get("account_label")
     total = ocr.get("total")
-    acc_ok = bool(ocr.get("account_ok"))
 
     lines = []
-    lines.append("")
-    lines.append(f"✅ Tarikh@waktu jam : {bold(dt) if dt else '❓'}")
-
-    if OCR_TARGET_ACCOUNT:
-        if acc_ok:
-            lines.append(f"✅ No akaun : {bold(OCR_TARGET_ACCOUNT)}")
-        else:
-            lines.append(f"✅ No akaun : {bold(OCR_TARGET_ACCOUNT)} (❌ tak jumpa)")
-    else:
-        lines.append("✅ No akaun : ❓")
-
-    lines.append(f"✅ Total dalam resit : {bold(total) if total else '❓'}")
-
+    lines.append(f"✅ {bold(dt) if dt else '❓'}")
+    lines.append(f"✅ {bold(acc_label) if acc_label else '❓'}")
+    lines.append(f"✅ {bold(total) if total else '❓'}")
     if note:
         lines.append(f"⚠️ {note}")
-
     return "\n".join(lines)
+
+def build_ocr_paragraph_multi(all_blocks: List[str]) -> str:
+    # join dengan 1 perenggan kosong
+    return "\n\n".join(all_blocks)
 
 
 # =========================================================
@@ -650,8 +850,8 @@ def build_ocr_paragraph(ocr: Dict[str, Any], note: str = "") -> str:
 STATE_TTL_SEC = float(os.getenv("STATE_TTL_SEC", "86400"))
 RECEIPT_DELAY_SEC = float(os.getenv("RECEIPT_DELAY_SEC", "1.0"))
 
-ORDER_STATES = {}   # (chat_id, root_id) -> state
-MSGID_TO_STATE = {} # (chat_id, msg_id) -> (chat_id, root_id)
+ORDER_STATES = {}    # (chat_id, root_id) -> state
+MSGID_TO_STATE = {}  # (chat_id, msg_id) -> (chat_id, root_id)
 _state_lock = asyncio.Lock()
 
 def _cleanup_states():
@@ -818,7 +1018,7 @@ async def handle_receipt_photo(client: Client, message):
 
 
 # =========================================================
-# ✅ OCR TRIGGER: REPOST ALBUM + OCR BLOCK (PASTI)
+# ✅ OCR TRIGGER: REPOST ALBUM + OCR BLOCK (SCAN SEMUA RESIT)
 # =========================================================
 async def _download_file_bytes(client: Client, file_id: str) -> Optional[bytes]:
     try:
@@ -831,7 +1031,6 @@ async def _download_file_bytes(client: Client, file_id: str) -> Optional[bytes]:
         return None
 
 async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id: int) -> bool:
-    # 1) ambil state
     async with _state_lock:
         _cleanup_states()
         state_id = _get_state_id_from_reply(chat_id, reply_to_id)
@@ -839,39 +1038,43 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
         if not state:
             return False
 
-        receipts = state.get("receipts", [])
+        receipts = list(state.get("receipts", []))
         if not receipts:
-            return False  # ikut syarat: mesti ada resit pertama dulu
+            return False  # mesti ada resit dulu
 
         product_file_id = state.get("product_file_id")
         caption_now = state.get("caption", "")
         old_ids = list(state.get("msg_ids", []))
-        last_receipt = receipts[-1]
 
-    # 2) OCR (kalau tak ready/gagal, tetap repost dengan ❓ + nota)
-    note = ""
-    ocr_data = {"datetime": None, "total": None, "account_ok": False}
+    blocks: List[str] = []
 
     if not _OCR_READY or not VISION_CLIENT:
+        # OCR tak aktif, tapi tetap papar placeholder untuk setiap resit
         note = f"OCR tak aktif ({_OCR_INIT_ERROR})"
+        for _ in receipts:
+            blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=note))
     else:
-        img_bytes = await _download_file_bytes(client, last_receipt)
-        if not img_bytes:
-            note = "OCR gagal (download resit gagal)"
-        else:
+        # OCR setiap resit
+        for idx, fid in enumerate(receipts, start=1):
+            note = ""
+            img_bytes = await _download_file_bytes(client, fid)
+            if not img_bytes:
+                note = "OCR gagal (download resit gagal)"
+                blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=note))
+                continue
             try:
                 ocr_data = await ocr_extract_from_bytes(img_bytes)
+                blocks.append(build_ocr_block_one(ocr_data, note=note))
             except Exception as e:
-                note = f"OCR gagal ({e})"
+                blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=f"OCR gagal ({e})"))
 
-    # 3) bina caption baru
     cleaned = strip_existing_ocr_block(caption_now)
-    new_caption = cleaned + build_ocr_paragraph(ocr_data, note=note)
+    ocr_para = build_ocr_paragraph_multi(blocks)
+    new_caption = (cleaned + "\n\n" + ocr_para).strip()
 
     if len(new_caption) > 1024:
         new_caption = new_caption[:1000] + "\n...(caption terlalu panjang)"
 
-    # 4) PADAM album lama + REPOST album baru
     async with _state_lock:
         _cleanup_states()
         state = ORDER_STATES.get(state_id)
@@ -895,7 +1098,6 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
 
 @bot.on_message(filters.text & ~filters.bot)
 async def handle_text_trigger(client: Client, message):
-    # mesti reply
     if not is_reply_to_any_message(message):
         return
 
@@ -903,13 +1105,10 @@ async def handle_text_trigger(client: Client, message):
     if txt != OCR_TRIGGER_CODE:
         return
 
-    chat_id = message.chat.id
-    reply_to_id = message.reply_to_message.id
-
-    # padam "123"
     await _delete_message_safe(message)
 
-    # ikut request awak: kalau belum ada resit -> diam saja
+    chat_id = message.chat.id
+    reply_to_id = message.reply_to_message.id
     await _apply_ocr_and_repost_album(client, chat_id, reply_to_id)
     return
 
@@ -917,7 +1116,6 @@ async def handle_text_trigger(client: Client, message):
 # ================= HANDLER PHOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
-    # receipt mode
     if is_reply_to_any_message(message):
         await handle_receipt_photo(client, message)
         return
