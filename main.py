@@ -835,7 +835,7 @@ async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to
 # - INI YANG BUAT PADAM TEXT SERTA-MERTA
 # - group=0 supaya dia jalan awal
 # =========================================================
-@bot.on_message((filters.group | filters.supergroup) & filters.text & ~filters.bot, group=0)
+@bot.on_message(filters.group & filters.text & ~filters.bot, group=0)
 async def group_text_cleaner_and_trigger(client: Client, message):
     txt = (message.text or "").strip()
 
