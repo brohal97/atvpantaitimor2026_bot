@@ -12,18 +12,22 @@
 # - Reply (swipe kiri) pada post produk/album + taip "123" send
 # - Hanya jalan jika sekurang-kurangnya 1 resit sudah di-upload
 # - Bot akan PADAM album lama & REPOST album baru bersama blok OCR
-# - Jika OCR tak aktif / gagal: tetap repost, blok OCR jadi ❓ + nota (supaya nampak punca)
+#
+# ✅ UPGRADE BARU (PERMINTAAN AWAK):
+# - SELEPAS OCR RESULT KELUAR, HANYA USER ALLOW SAHAJA BOLEH "FINALIZE"
+# - User allow reply (swipe kiri) pada post yang ADA blok OCR + taip "123" send
+# - Bot akan COPY semua message album itu ke CHANNEL RASMI
+# - Lepas berjaya, bot PADAM semua message album dalam group + buang state (anggap selesai)
 #
 # ✅ FIX BESAR (OCR):
-# - Auto repair GOOGLE_APPLICATION_CREDENTIALS_JSON jika "private_key" ada newline sebenar (invalid control char)
-# - Support juga optional GOOGLE_APPLICATION_CREDENTIALS_B64 (base64) jika mahu
+# - Auto repair GOOGLE_APPLICATION_CREDENTIALS_JSON jika "private_key" ada newline sebenar
+# - Support optional GOOGLE_APPLICATION_CREDENTIALS_B64 (base64)
 #
-# ✅ UPGRADE (PERMINTAAN AWAK):
+# ✅ OCR PARSING:
 # - Tarikh & masa: support Januari/January + format pelik, output tetap: ✅ 01/01/2026 | 4:39pm
-# - Akaun: support "8 6 0 6..." / "86 06 01 84 23" / apa-apa jarak → match digit sama
-#   bila jumpa akaun target → auto papar: "8606018423 CIMB BANK"
+# - Akaun: support jarak pelik "8 6 0 6..." etc → match digit sama, auto label: "8606018423 CIMB BANK"
 # - Amaun/total: support RM / MYR / 897myr / rm20.00 / myr10 / Amount / Total / Jumlah / Transfer amount
-# - Banyak resit: OCR scan SEMUA resit dalam album (bukan last sahaja) + papar blok setiap resit
+# - Banyak resit: OCR scan SEMUA resit dalam album + papar blok setiap resit
 # =========================
 
 import os, re, json, time, asyncio, tempfile, base64
@@ -62,8 +66,24 @@ OCR_TARGET_BANK_LABEL = os.getenv("OCR_TARGET_BANK_LABEL", "CIMB BANK").strip()
 
 OCR_LANG_HINTS = [x.strip() for x in os.getenv("OCR_LANG_HINTS", "ms,en").split(",") if x.strip()]
 
+# ✅ USER ALLOW + CHANNEL RASMI (hardcode ikut list awak)
+ALLOWED_USER_IDS = {
+    1150078068,
+    6897594281,
+    1198935605,
+}
+OFFICIAL_CHANNEL_ID = -1003573894188
+
 TZ = pytz.timezone("Asia/Kuala_Lumpur")
 HARI = ["Isnin", "Selasa", "Rabu", "Khamis", "Jumaat", "Sabtu", "Ahad"]
+
+
+def is_allowed_user(message) -> bool:
+    try:
+        uid = int(message.from_user.id)
+        return uid in ALLOWED_USER_IDS
+    except Exception:
+        return False
 
 
 # ================= BOT =================
@@ -179,7 +199,7 @@ BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
     "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
-    "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝗷𝟴𝟵".replace("𝗷", "𝟯")  # tiny patch if font glitch; safe fallback
+    "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝗷𝟴𝟵".replace("𝗷", "𝟯")
 )
 def bold(text: str) -> str:
     return (text or "").translate(BOLD_MAP)
@@ -188,7 +208,7 @@ ALT_BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
     "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝘂𝘃𝘄𝘅𝘆𝘇"
-    "𝟎𝟏𝟐𝟑𝟒𝟓𝟲𝟕𝟖𝟗"
+    "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"
 )
 def bold2(text: str) -> str:
     return (text or "").translate(ALT_BOLD_MAP)
@@ -523,9 +543,7 @@ def _clean_ocr_text(t: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
-# ---- Month map (BM + EN) ----
 _MONTH_MAP = {
-    # EN
     "JAN": 1, "JANUARY": 1,
     "FEB": 2, "FEBRUARY": 2,
     "MAR": 3, "MARCH": 3,
@@ -538,7 +556,7 @@ _MONTH_MAP = {
     "OCT": 10, "OCTOBER": 10,
     "NOV": 11, "NOVEMBER": 11,
     "DEC": 12, "DECEMBER": 12,
-    # BM
+
     "JANUARI": 1,
     "FEBRUARI": 2,
     "MAC": 3,
@@ -560,7 +578,6 @@ def _fmt_dt(day: int, month: int, year: int, hour: int, minute: int, ampm: Optio
         return None
 
     ap = (ampm or "").strip().lower().replace(".", "")
-    # normalize am/pm
     if ap in ["a", "am"]:
         ap = "am"
     elif ap in ["p", "pm"]:
@@ -568,7 +585,6 @@ def _fmt_dt(day: int, month: int, year: int, hour: int, minute: int, ampm: Optio
     else:
         ap = ""
 
-    # if no am/pm, assume 24h; convert to 12h with am/pm
     if not ap:
         if hour == 0:
             hour12, ap = 12, "am"
@@ -579,7 +595,6 @@ def _fmt_dt(day: int, month: int, year: int, hour: int, minute: int, ampm: Optio
         else:
             hour12, ap = hour - 12, "pm"
     else:
-        # am/pm exists; interpret hour as 1-12 (but OCR kadang 00/13 pun keluar)
         h = hour
         if ap == "am":
             if h == 12:
@@ -587,7 +602,6 @@ def _fmt_dt(day: int, month: int, year: int, hour: int, minute: int, ampm: Optio
         elif ap == "pm":
             if 1 <= h <= 11:
                 h = h + 12
-        # now convert to 12h display
         if h == 0:
             hour12, ap = 12, "am"
         elif 1 <= h <= 11:
@@ -600,10 +614,8 @@ def _fmt_dt(day: int, month: int, year: int, hour: int, minute: int, ampm: Optio
     return f"{day:02d}/{month:02d}/{year:04d} | {hour12}:{minute:02d}{ap}"
 
 def _find_datetime(text: str) -> Optional[str]:
-    t = text or ""
-    t = t.replace("—", "-").replace("–", "-")
+    t = (text or "").replace("—", "-").replace("–", "-")
 
-    # 1) Format: 20 Jan 2026, 05:36 PM  (comma optional)
     pat1 = re.compile(
         r"\b(?P<d>\d{1,2})\s+(?P<m>[A-Za-z]{3,12})\s+(?P<y>\d{4})\s*,?\s*"
         r"(?P<h>\d{1,2})[:.](?P<mn>\d{2})(?:[:.]\d{2})?\s*(?P<ap>AM|PM|am|pm)?\b"
@@ -622,7 +634,6 @@ def _find_datetime(text: str) -> Optional[str]:
             if out:
                 return out
 
-    # 2) Format numeric: 01/01/2026 4:39pm  OR 01-01-2026, 16:39
     pat2 = re.compile(
         r"\b(?P<d>\d{1,2})[\/\-.](?P<m>\d{1,2})[\/\-.](?P<y>\d{2,4})\s*,?\s*"
         r"(?P<h>\d{1,2})[:.](?P<mn>\d{2})(?:[:.]\d{2})?\s*(?P<ap>AM|PM|am|pm)?\b"
@@ -640,7 +651,6 @@ def _find_datetime(text: str) -> Optional[str]:
         if out:
             return out
 
-    # 3) Format: 2026-01-20 05:36 PM
     pat3 = re.compile(
         r"\b(?P<y>\d{4})[\/\-.](?P<m>\d{1,2})[\/\-.](?P<d>\d{1,2})\s*,?\s*"
         r"(?P<h>\d{1,2})[:.](?P<mn>\d{2})(?:[:.]\d{2})?\s*(?P<ap>AM|PM|am|pm)?\b"
@@ -657,7 +667,6 @@ def _find_datetime(text: str) -> Optional[str]:
         if out:
             return out
 
-    # 4) Fallback: cari tarikh sahaja + masa sahaja (berasingan) dalam jarak dekat
     date_only = None
     time_only = None
 
@@ -707,20 +716,12 @@ def _find_account_and_label(text: str) -> Optional[str]:
     return None
 
 def _extract_amount_candidates(text: str) -> List[Tuple[float, str]]:
-    """
-    Collect candidates with context keyword preference.
-    Returns list of (value, pretty_string).
-    """
     t = text or ""
     out: List[Tuple[float, str]] = []
-
-    # Standard patterns: RM / MYR prefix OR suffix
-    # capture like: RM 3,600.00 / RM3600 / 897myr / myr10 / RM3,600
     money_pat = re.compile(
         r"(?i)\b(?:rm|myr)\s*([0-9]{1,3}(?:[,][0-9]{3})*(?:\.[0-9]{2})?|[0-9]{1,12}(?:\.[0-9]{2})?)\b"
         r"|\b([0-9]{1,3}(?:[,][0-9]{3})*(?:\.[0-9]{2})?|[0-9]{1,12}(?:\.[0-9]{2})?)\s*(?:rm|myr)\b"
     )
-
     for m in money_pat.finditer(t):
         num = m.group(1) or m.group(2)
         if not num:
@@ -730,18 +731,14 @@ def _extract_amount_candidates(text: str) -> List[Tuple[float, str]]:
             val = float(raw)
         except:
             continue
-        # filter crazy big values (avoid ref id / account)
         if val <= 0 or val > 100000000:
             continue
-        # pretty keep 2 decimals
         pretty = f"RM{val:,.2f}".replace(",", "")
         out.append((val, pretty))
-
     return out
 
 def _find_total_amount(text: str) -> Optional[str]:
     t = text or ""
-    # Prefer lines with these keywords
     key_pat = re.compile(r"(?i)\b(amount|transfer amount|jumlah|total|paid|payment|amaun|rm)\b")
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
 
@@ -749,21 +746,18 @@ def _find_total_amount(text: str) -> Optional[str]:
 
     def consider(val: float, pretty: str, boost: float = 0.0):
         nonlocal best
-        score = val + boost  # simple scoring: bigger + keyword boost
-        if best is None or score > (best[0] + 0.0001):
+        score = val + boost
+        if best is None or score > best[0]:
             best = (score, pretty)
 
-    # 1) keyword lines first
     for ln in lines:
         if not key_pat.search(ln):
             continue
         cands = _extract_amount_candidates(ln)
         for v, p in cands:
-            # strong boost if line contains "amount" or "transfer"
             b = 1000000.0 if re.search(r"(?i)\b(amount|transfer amount)\b", ln) else 200000.0
             consider(v, p, boost=b)
 
-    # 2) fallback: anywhere, choose max
     if best is None:
         cands = _extract_amount_candidates(t)
         if cands:
@@ -776,8 +770,6 @@ def _find_total_amount(text: str) -> Optional[str]:
 async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
     def _run():
         image = vision.Image(content=img_bytes)
-
-        # document_text_detection usually lebih padu untuk resit (layout)
         resp = VISION_CLIENT.document_text_detection(
             image=image,
             image_context={"language_hints": OCR_LANG_HINTS}
@@ -792,7 +784,6 @@ async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
         except:
             full = ""
 
-        # fallback kalau kosong
         if not full:
             resp2 = VISION_CLIENT.text_detection(
                 image=image,
@@ -807,17 +798,15 @@ async def ocr_extract_from_bytes(img_bytes: bytes) -> Dict[str, Any]:
     text = await asyncio.to_thread(_run)
     text = _clean_ocr_text(text)
 
-    dt = _find_datetime(text)                 # ✅ output sudah jadi dd/mm/yyyy | h:mmap
-    total = _find_total_amount(text)          # ✅ output RMxxx.xx
-    acc_label = _find_account_and_label(text) # ✅ "8606018423 CIMB BANK" jika match
+    dt = _find_datetime(text)
+    total = _find_total_amount(text)
+    acc_label = _find_account_and_label(text)
 
     return {"raw": text, "datetime": dt, "total": total, "account_label": acc_label}
 
 def strip_existing_ocr_block(caption: str) -> str:
     cap = caption or ""
-    # buang semua blok OCR lama (multi resit pun)
     cap = re.sub(r"\n✅\s*\d{2}\/\d{2}\/\d{4}\s*\|\s*[0-9:apm]+\s*\n✅.*?\n✅.*?(?=\n\n✅|\Z)", "", cap, flags=re.DOTALL)
-    # buang format lama juga
     cap = re.sub(
         r"\n✅ Tarikh@waktu jam[^\n]*\n✅ No akaun[^\n]*\n✅ Total dalam resit[^\n]*(?:\n⚠️[^\n]*)?",
         "",
@@ -827,7 +816,7 @@ def strip_existing_ocr_block(caption: str) -> str:
     return cap.strip()
 
 def build_ocr_block_one(ocr: Dict[str, Any], note: str = "") -> str:
-    dt = ocr.get("datetime")          # already normalized
+    dt = ocr.get("datetime")
     acc_label = ocr.get("account_label")
     total = ocr.get("total")
 
@@ -840,7 +829,6 @@ def build_ocr_block_one(ocr: Dict[str, Any], note: str = "") -> str:
     return "\n".join(lines)
 
 def build_ocr_paragraph_multi(all_blocks: List[str]) -> str:
-    # join dengan 1 perenggan kosong
     return "\n\n".join(all_blocks)
 
 
@@ -886,7 +874,15 @@ async def _delete_messages_safe(client: Client, chat_id: int, msg_ids):
     except:
         pass
 
-async def _send_album_and_update_state(client: Client, chat_id: int, state_id, product_file_id: str, caption: str, receipts: list):
+async def _send_album_and_update_state(
+    client: Client,
+    chat_id: int,
+    state_id,
+    product_file_id: str,
+    caption: str,
+    receipts: list,
+    ocr_applied: bool
+):
     media = [InputMediaPhoto(media=product_file_id, caption=caption)]
     for fid in receipts:
         media.append(InputMediaPhoto(media=fid))
@@ -922,6 +918,7 @@ async def _send_album_and_update_state(client: Client, chat_id: int, state_id, p
         "caption": caption,
         "receipts": list(receipts),
         "msg_ids": list(sent_msg_ids),
+        "ocr_applied": bool(ocr_applied),
         "ts": time.time(),
     }
     return sent_msg_ids
@@ -969,7 +966,8 @@ async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: 
             client, chat_id, state_id,
             state["product_file_id"],
             state.get("caption", ""),
-            receipts
+            receipts,
+            ocr_applied=False  # ✅ bila tambah resit baru, OCR dianggap belum final lagi
         )
         return True
 
@@ -1040,7 +1038,7 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
 
         receipts = list(state.get("receipts", []))
         if not receipts:
-            return False  # mesti ada resit dulu
+            return False
 
         product_file_id = state.get("product_file_id")
         caption_now = state.get("caption", "")
@@ -1049,18 +1047,15 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
     blocks: List[str] = []
 
     if not _OCR_READY or not VISION_CLIENT:
-        # OCR tak aktif, tapi tetap papar placeholder untuk setiap resit
         note = f"OCR tak aktif ({_OCR_INIT_ERROR})"
         for _ in receipts:
             blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=note))
     else:
-        # OCR setiap resit
-        for idx, fid in enumerate(receipts, start=1):
+        for fid in receipts:
             note = ""
             img_bytes = await _download_file_bytes(client, fid)
             if not img_bytes:
-                note = "OCR gagal (download resit gagal)"
-                blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=note))
+                blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note="OCR gagal (download resit gagal)"))
                 continue
             try:
                 ocr_data = await ocr_extract_from_bytes(img_bytes)
@@ -1091,11 +1086,62 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
             state_id=state_id,
             product_file_id=product_file_id,
             caption=new_caption,
-            receipts=receipts
+            receipts=receipts,
+            ocr_applied=True  # ✅ ini penting untuk "FINALIZE" step
         )
         return True
 
 
+# =========================================================
+# ✅ FINALIZE: COPY KE CHANNEL + PADAM SEMUA DALAM GROUP
+# =========================================================
+async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to_id: int) -> bool:
+    async with _state_lock:
+        _cleanup_states()
+        state_id = _get_state_id_from_reply(chat_id, reply_to_id)
+        state = ORDER_STATES.get(state_id)
+        if not state:
+            return False
+
+        if not state.get("ocr_applied", False):
+            return False  # hanya boleh finalize lepas OCR dah keluar
+
+        msg_ids = list(state.get("msg_ids", []))
+
+    # COPY satu-satu ke channel rasmi (bot jadi sender, caption kekal)
+    ok_any = False
+    for mid in msg_ids:
+        try:
+            await tg_call(client.copy_message, chat_id=OFFICIAL_CHANNEL_ID, from_chat_id=chat_id, message_id=mid)
+            ok_any = True
+        except Exception:
+            # kalau bot tak ada akses channel, ia akan fail di sini
+            ok_any = False
+            break
+
+    if not ok_any:
+        return False
+
+    # Lepas berjaya copy semua, padam semua dari group + clear state
+    async with _state_lock:
+        _cleanup_states()
+        state = ORDER_STATES.get(state_id)
+        if not state:
+            return True
+
+        msg_ids = list(state.get("msg_ids", []))
+        await _delete_messages_safe(client, chat_id, msg_ids)
+        for mid in msg_ids:
+            MSGID_TO_STATE.pop((chat_id, mid), None)
+
+        ORDER_STATES.pop(state_id, None)
+
+    return True
+
+
+# =========================================================
+# ✅ TEXT TRIGGER: 123 (OCR atau FINALIZE)
+# =========================================================
 @bot.on_message(filters.text & ~filters.bot)
 async def handle_text_trigger(client: Client, message):
     if not is_reply_to_any_message(message):
@@ -1105,17 +1151,37 @@ async def handle_text_trigger(client: Client, message):
     if txt != OCR_TRIGGER_CODE:
         return
 
+    # padam mesej "123" supaya clean
     await _delete_message_safe(message)
+
+    # ✅ hanya user allow boleh buat trigger ini (OCR & FINALIZE)
+    if not is_allowed_user(message):
+        return
 
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
-    await _apply_ocr_and_repost_album(client, chat_id, reply_to_id)
-    return
+
+    # Tentukan mode:
+    # - kalau state belum OCR -> buat OCR repost
+    # - kalau state dah OCR -> buat FINALIZE (copy ke channel + padam semua)
+    async with _state_lock:
+        _cleanup_states()
+        sid = _get_state_id_from_reply(chat_id, reply_to_id)
+        st = ORDER_STATES.get(sid)
+
+    if not st:
+        return
+
+    if st.get("ocr_applied", False):
+        await _finalize_to_channel_and_delete(client, chat_id, reply_to_id)
+    else:
+        await _apply_ocr_and_repost_album(client, chat_id, reply_to_id)
 
 
 # ================= HANDLER PHOTO =================
 @bot.on_message(filters.photo & ~filters.bot)
 async def handle_photo(client, message):
+    # jika reply pada album/order -> ini resit
     if is_reply_to_any_message(message):
         await handle_receipt_photo(client, message)
         return
@@ -1150,6 +1216,7 @@ async def handle_photo(client, message):
                     "caption": sent.caption or new_caption,
                     "receipts": [],
                     "msg_ids": [sent.id],
+                    "ocr_applied": False,
                     "ts": time.time(),
                 }
                 MSGID_TO_STATE[(chat_id, sent.id)] = state_id
@@ -1159,4 +1226,5 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
 
