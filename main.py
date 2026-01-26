@@ -245,6 +245,7 @@ def best_transport_match(user_transport_segment: str):
             best_score, best_name = score, name
     return best_name, best_score
 
+# ================= CORE CAPTION LOGIC =================
 def make_stamp() -> str:
     now = datetime.now(TZ)
     hari = HARI[now.weekday()]
@@ -256,8 +257,10 @@ def extract_lines(text: str):
     lines = []
     for ln in (text or "").splitlines():
         ln = ln.strip()
-        if not ln: continue
-        if re.search(r"\btotal\b", ln, flags=re.IGNORECASE): continue
+        if not ln:
+            continue
+        if re.search(r"\btotal\b", ln, flags=re.IGNORECASE):
+            continue
         lines.append(ln)
     return lines
 
@@ -271,14 +274,143 @@ def _join_pipes(parts):
 
 def _normalize_rm_value(val: str) -> str:
     s = (val or "").strip()
-    if not s: return s
-    if s == "❓": return "❓"
+    if not s:
+        return s
+    if s == "❓":
+        return "❓"
     m = re.search(r"(?i)\b(?:rm)?\s*([0-9]{1,12})\b", s)
     if not m:
         m2 = re.search(r"([0-9]{1,12})", s)
-        if not m2: return s
+        if not m2:
+            return s
         return f"RM{m2.group(1)}"
     return f"RM{m.group(1)}"
+
+def _extract_tail_money(text: str):
+    s = (text or "").strip()
+    if not s:
+        return s, None
+    m = re.search(r"(?i)(?:\brm\b\s*)?([0-9]{1,12})\s*$", s)
+    if not m:
+        return s, None
+    num = m.group(1)
+    head = s[:m.start()].strip()
+    return head, f"RM{num}"
+
+def _cap_word(w: str) -> str:
+    if not w:
+        return w
+    if w == "❓":
+        return "❓"
+    if w.isdigit():
+        return w
+    if w.isalpha() and len(w) <= 2:
+        return w.upper()
+    return w.lower().capitalize()
+
+def place_title_case(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    if s == "❓":
+        return "❓"
+    tokens = [t for t in re.split(r"\s+", s) if t]
+    out = []
+    for t in tokens:
+        if "-" in t:
+            parts = t.split("-")
+            out.append("-".join(_cap_word(p) for p in parts))
+        else:
+            out.append(_cap_word(t))
+    return " ".join(out)
+
+def is_transport_like_parts(parts) -> bool:
+    if not parts or len(parts) < 2:
+        return False
+    seg2 = (parts[1] or "").strip()
+    if not seg2 or seg2 == "❓":
+        return False
+    name, score = best_transport_match(seg2)
+    return bool(name and score >= TRANSPORT_THRESHOLD)
+
+def _try_parse_product_no_pipes_strict(line: str):
+    head, money = _extract_tail_money(line)
+    if not money:
+        return None
+    mqty = re.search(r"\b(\d{1,3})\s*$", head)
+    if not mqty:
+        return None
+    qty = mqty.group(1)
+    name_part = head[:mqty.start()].strip()
+    if not name_part:
+        return None
+    return f"{name_part} | {qty} | {money}"
+
+def _best_transport_suffix(words):
+    best_name, best_score, best_cut = None, 0.0, None
+    n = len(words)
+    for L in range(1, min(5, n) + 1):
+        cut = n - L
+        cand = " ".join(words[cut:])
+        name, score = best_transport_match(cand)
+        if name and score > best_score:
+            best_score = score
+            best_name = name
+            best_cut = cut
+    return best_name, best_score, best_cut
+
+def _try_parse_cost_no_pipes(line: str):
+    head, money = _extract_tail_money(line)
+    if not money:
+        return None
+    words = [w for w in re.split(r"\s+", head.strip()) if w]
+    if len(words) < 2:
+        return None
+    best_t, score, cut = _best_transport_suffix(words)
+    if not best_t or score < TRANSPORT_THRESHOLD:
+        return None
+    dest = " ".join(words[:cut]).strip()
+    if not dest:
+        return None
+    return f"{dest} | {best_t} | {money}"
+
+def auto_insert_pipes_if_missing(line: str) -> str:
+    s = (line or "").strip()
+    if not s:
+        return "❓ | ❓ | ❓"
+    if ("|" in s) or ("｜" in s):
+        return s
+
+    as_product = _try_parse_product_no_pipes_strict(s)
+    if as_product:
+        return as_product
+
+    as_cost = _try_parse_cost_no_pipes(s)
+    if as_cost:
+        return as_cost
+
+    head, money = _extract_tail_money(s)
+    if money:
+        head = head.strip()
+
+        best_t, tscore = best_transport_match(head)
+        if best_t and tscore >= TRANSPORT_THRESHOLD:
+            return f"❓ | {best_t} | {money}"
+
+        words = [w for w in re.split(r"\s+", head) if w]
+        if words:
+            tname, score, cut = _best_transport_suffix(words)
+            if tname and score >= TRANSPORT_THRESHOLD:
+                dest = " ".join(words[:cut]).strip()
+                if not dest:
+                    return f"❓ | {tname} | {money}"
+                return f"{dest} | {tname} | {money}"
+
+        if not head:
+            return f"❓ | ❓ | {money}"
+        return f"{head} | ❓ | {money}"
+
+    return f"{s} | ❓ | ❓"
 
 def fill_missing_segments(parts, want_len=3):
     parts = list(parts or [])
@@ -290,33 +422,27 @@ def fill_missing_segments(parts, want_len=3):
         out.append(p if p else "❓")
     return out
 
-def is_transport_like_parts(parts) -> bool:
-    if not parts or len(parts) < 2: return False
-    seg2 = (parts[1] or "").strip()
-    if not seg2 or seg2 == "❓": return False
-    name, score = best_transport_match(seg2)
-    return bool(name and score >= TRANSPORT_THRESHOLD)
-
 def normalize_detail_line(line: str) -> str:
-    line = (line or "").strip()
-    if not line:
-        return "❓ | ❓ | ❓"
+    line = auto_insert_pipes_if_missing(line)
+
     if ("|" not in line) and ("｜" not in line):
-        # fallback auto insert
-        return f"{line} | ❓ | ❓"
+        return "❓ | ❓ | ❓"
 
     raw_parts = _split_pipes(line)
     parts = fill_missing_segments(raw_parts, 3)
 
     transport_like = is_transport_like_parts(parts)
+
     if transport_like:
-        # destination/title-case (simple)
         if parts[0] != "❓":
-            parts[0] = parts[0].title()
+            parts[0] = place_title_case(parts[0])
     else:
         if parts[0] != "❓":
             best_name, score = best_product_match(parts[0])
-            parts[0] = best_name if best_name and score >= FUZZY_THRESHOLD else parts[0].upper()
+            if best_name and score >= FUZZY_THRESHOLD:
+                parts[0] = best_name
+            else:
+                parts[0] = parts[0].upper()
 
     if transport_like and parts[1] != "❓":
         best_t, tscore = best_transport_match(parts[1])
@@ -333,8 +459,10 @@ def calc_total(lines):
     for ln in lines:
         nums = re.findall(r"(?i)\bRM\s*([0-9]{1,12})\b", ln)
         for n in nums:
-            try: total += int(n)
-            except: pass
+            try:
+                total += int(n)
+            except:
+                pass
     return total
 
 def stylize_line_for_caption(line: str, force_transport: bool = False) -> str:
@@ -351,7 +479,10 @@ def build_caption(user_caption: str) -> str:
     detail_lines = [normalize_detail_line(x) for x in detail_lines_raw]
 
     if not detail_lines:
-        detail_lines = ["❓ | ❓ | ❓", "❓ | ❓ | ❓"]
+        detail_lines = [
+            "❓ | ❓ | ❓",
+            "❓ | ❓ | ❓",
+        ]
 
     total = calc_total(detail_lines)
 
@@ -362,12 +493,11 @@ def build_caption(user_caption: str) -> str:
         else:
             parts.append(stylize_line_for_caption(ln))
 
-    parts += ["", f"𝖳𝗈𝗍𝖺𝗅 𝗄𝖾𝗌𝖾𝗅𝗎𝗋𝗎𝗁𝖺𝗇 : {bold('RM' + str(total))}"]
+    parts += ["", f"Total keseluruhan : {bold('RM' + str(total))}"]
     cap = "\n".join(parts)
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
     return cap
-
 
 # ================= OCR (reuse your original parsing) =================
 def _clean_ocr_text(t: str) -> str:
