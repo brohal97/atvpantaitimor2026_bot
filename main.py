@@ -13,10 +13,11 @@
 # - Hanya jalan jika sekurang-kurangnya 1 resit sudah di-upload
 # - Bot akan PADAM album lama & REPOST album baru bersama blok OCR
 #
-# ✅ UPGRADE BARU (PERMINTAAN AWAK):
+# ✅ UPGRADE BARU (PERMINTAAN AWAK) - FIX ALBUM KE CHANNEL:
 # - SELEPAS OCR RESULT KELUAR, HANYA USER ALLOW SAHAJA BOLEH "FINALIZE"
 # - User allow reply (swipe kiri) pada post yang ADA blok OCR + taip "123" send
-# - Bot akan COPY semua message album itu ke CHANNEL RASMI
+# - Bot akan HANTAR KE CHANNEL RASMI DALAM BENTUK ALBUM (send_media_group)
+#   -> Sama rupa dalam group, sama rupa dalam channel (album bersama)
 # - Lepas berjaya, bot PADAM semua message album dalam group + buang state (anggap selesai)
 #
 # ✅ FIX BESAR (OCR):
@@ -207,7 +208,7 @@ def bold(text: str) -> str:
 ALT_BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
-    "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝘂𝘃𝘄𝘅𝘆𝘇"
+    "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
     "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"
 )
 def bold2(text: str) -> str:
@@ -874,6 +875,36 @@ async def _delete_messages_safe(client: Client, chat_id: int, msg_ids):
     except:
         pass
 
+async def _send_media_group_in_chunks(client: Client, chat_id: int, media: List[InputMediaPhoto]) -> List[int]:
+    """
+    Helper generic: hantar media group (album) pecah chunk 10.
+    Return msg_ids yang dihantar.
+    """
+    chunks, cur = [], []
+    for m in media:
+        cur.append(m)
+        if len(cur) == 10:
+            chunks.append(cur)
+            cur = []
+    if cur:
+        chunks.append(cur)
+
+    sent_msg_ids: List[int] = []
+    for idx, ch in enumerate(chunks):
+        # Telegram: caption cuma boleh ada pada elemen pertama album pertama
+        if idx > 0:
+            try:
+                ch[0].caption = None
+            except:
+                pass
+        res = await tg_call(client.send_media_group, chat_id=chat_id, media=ch)
+        try:
+            for m in res:
+                sent_msg_ids.append(m.id)
+        except:
+            pass
+    return sent_msg_ids
+
 async def _send_album_and_update_state(
     client: Client,
     chat_id: int,
@@ -887,28 +918,7 @@ async def _send_album_and_update_state(
     for fid in receipts:
         media.append(InputMediaPhoto(media=fid))
 
-    chunks, cur = [], []
-    for m in media:
-        cur.append(m)
-        if len(cur) == 10:
-            chunks.append(cur)
-            cur = []
-    if cur:
-        chunks.append(cur)
-
-    sent_msg_ids = []
-    for idx, ch in enumerate(chunks):
-        if idx > 0:
-            try:
-                ch[0].caption = None
-            except:
-                pass
-        res = await tg_call(client.send_media_group, chat_id=chat_id, media=ch)
-        try:
-            for m in res:
-                sent_msg_ids.append(m.id)
-        except:
-            pass
+    sent_msg_ids = await _send_media_group_in_chunks(client, chat_id, media)
 
     for mid in sent_msg_ids:
         MSGID_TO_STATE[(chat_id, mid)] = state_id
@@ -922,6 +932,27 @@ async def _send_album_and_update_state(
         "ts": time.time(),
     }
     return sent_msg_ids
+
+async def _send_album_to_channel(
+    client: Client,
+    channel_id: int,
+    product_file_id: str,
+    caption: str,
+    receipts: list
+) -> bool:
+    """
+    ✅ FIX: hantar ke CHANNEL dalam bentuk ALBUM (send_media_group),
+    sama macam dalam group.
+    """
+    try:
+        media = [InputMediaPhoto(media=product_file_id, caption=caption)]
+        for fid in receipts:
+            media.append(InputMediaPhoto(media=fid))
+
+        await _send_media_group_in_chunks(client, channel_id, media)
+        return True
+    except Exception:
+        return False
 
 
 # =========================================================
@@ -1093,7 +1124,7 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
 
 
 # =========================================================
-# ✅ FINALIZE: COPY KE CHANNEL + PADAM SEMUA DALAM GROUP
+# ✅ FINALIZE: HANTAR ALBUM KE CHANNEL + PADAM SEMUA DALAM GROUP
 # =========================================================
 async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to_id: int) -> bool:
     async with _state_lock:
@@ -1106,30 +1137,32 @@ async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to
         if not state.get("ocr_applied", False):
             return False  # hanya boleh finalize lepas OCR dah keluar
 
-        msg_ids = list(state.get("msg_ids", []))
+        # ✅ Ambil info album daripada state (bukan copy_message msg_ids)
+        product_file_id = state.get("product_file_id")
+        caption = state.get("caption", "")
+        receipts = list(state.get("receipts", []))
+        group_msg_ids = list(state.get("msg_ids", []))
 
-    # COPY satu-satu ke channel rasmi (bot jadi sender, caption kekal)
-    ok_any = False
-    for mid in msg_ids:
-        try:
-            await tg_call(client.copy_message, chat_id=OFFICIAL_CHANNEL_ID, from_chat_id=chat_id, message_id=mid)
-            ok_any = True
-        except Exception:
-            # kalau bot tak ada akses channel, ia akan fail di sini
-            ok_any = False
-            break
+    # ✅ Hantar ke channel dalam bentuk album (media group)
+    ok = await _send_album_to_channel(
+        client=client,
+        channel_id=OFFICIAL_CHANNEL_ID,
+        product_file_id=product_file_id,
+        caption=caption,
+        receipts=receipts
+    )
 
-    if not ok_any:
+    if not ok:
         return False
 
-    # Lepas berjaya copy semua, padam semua dari group + clear state
+    # Lepas berjaya hantar album ke channel, padam semua dari group + clear state
     async with _state_lock:
         _cleanup_states()
         state = ORDER_STATES.get(state_id)
         if not state:
             return True
 
-        msg_ids = list(state.get("msg_ids", []))
+        msg_ids = list(state.get("msg_ids", group_msg_ids))
         await _delete_messages_safe(client, chat_id, msg_ids)
         for mid in msg_ids:
             MSGID_TO_STATE.pop((chat_id, mid), None)
@@ -1163,7 +1196,7 @@ async def handle_text_trigger(client: Client, message):
 
     # Tentukan mode:
     # - kalau state belum OCR -> buat OCR repost
-    # - kalau state dah OCR -> buat FINALIZE (copy ke channel + padam semua)
+    # - kalau state dah OCR -> buat FINALIZE (album ke channel + padam semua)
     async with _state_lock:
         _cleanup_states()
         sid = _get_state_id_from_reply(chat_id, reply_to_id)
