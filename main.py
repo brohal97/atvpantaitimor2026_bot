@@ -20,13 +20,15 @@
 #   -> Sama rupa dalam group, sama rupa dalam channel (album bersama)
 # - Lepas berjaya, bot PADAM semua message album dalam group + buang state (anggap selesai)
 #
-# ✅ TAMBAHAN BARU (PERMINTAAN AWAK) - CLEAN TEXT DALAM GROUP:
-# 1) Mana-mana user hantar TEXT sahaja (bukan reply) -> bot PADAM serta-merta
-# 2) User reply (swipe kiri) tapi belum upload resit -> apa-apa text termasuk 123 -> bot PADAM serta-merta (tiada action)
-# 3) Walaupun resit dah ada, kalau password SALAH / text lain -> bot PADAM serta-merta (tiada action)
+# ✅ FIX BESAR (OCR):
+# - Auto repair GOOGLE_APPLICATION_CREDENTIALS_JSON jika "private_key" ada newline sebenar
+# - Support optional GOOGLE_APPLICATION_CREDENTIALS_B64 (base64)
 #
-# ⚠️ NOTE PENTING:
-# - Bot MESTI jadi admin dalam group + ada permission "Delete messages"
+# ✅ OCR PARSING:
+# - Tarikh & masa: support Januari/January + format pelik, output tetap: ✅ 01/01/2026 | 4:39pm
+# - Akaun: support jarak pelik "8 6 0 6..." etc → match digit sama, auto label: "8606018423 CIMB BANK"
+# - Amaun/total: support RM / MYR / 897myr / rm20.00 / myr10 / Amount / Total / Jumlah / Transfer amount
+# - Banyak resit: OCR scan SEMUA resit dalam album + papar blok setiap resit
 # =========================
 
 import os, re, json, time, asyncio, tempfile, base64
@@ -527,7 +529,7 @@ def build_caption(user_caption: str) -> str:
         else:
             parts.append(stylize_line_for_caption(ln))
 
-    parts += ["", f"𝖳𝗈𝗍𝖺𝗅 𝗄𝖾𝗌𝖾𝗅𝗎𝗋𝗎𝗁𝖺𝗇 : {bold('RM' + str(total))}"]
+    parts += ["", f"Total keseluruhan : {bold('RM' + str(total))}"]
     cap = "\n".join(parts)
     if len(cap) > 1024:
         cap = cap[:1000] + "\n...(caption terlalu panjang)"
@@ -889,6 +891,7 @@ async def _send_media_group_in_chunks(client: Client, chat_id: int, media: List[
 
     sent_msg_ids: List[int] = []
     for idx, ch in enumerate(chunks):
+        # Telegram: caption cuma boleh ada pada elemen pertama album pertama
         if idx > 0:
             try:
                 ch[0].caption = None
@@ -995,7 +998,7 @@ async def _merge_receipts_and_repost(client: Client, chat_id: int, reply_to_id: 
             state["product_file_id"],
             state.get("caption", ""),
             receipts,
-            ocr_applied=False
+            ocr_applied=False  # ✅ bila tambah resit baru, OCR dianggap belum final lagi
         )
         return True
 
@@ -1080,13 +1083,14 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
             blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=note))
     else:
         for fid in receipts:
+            note = ""
             img_bytes = await _download_file_bytes(client, fid)
             if not img_bytes:
                 blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note="OCR gagal (download resit gagal)"))
                 continue
             try:
                 ocr_data = await ocr_extract_from_bytes(img_bytes)
-                blocks.append(build_ocr_block_one(ocr_data, note=""))
+                blocks.append(build_ocr_block_one(ocr_data, note=note))
             except Exception as e:
                 blocks.append(build_ocr_block_one({"datetime": None, "total": None, "account_label": None}, note=f"OCR gagal ({e})"))
 
@@ -1114,7 +1118,7 @@ async def _apply_ocr_and_repost_album(client: Client, chat_id: int, reply_to_id:
             product_file_id=product_file_id,
             caption=new_caption,
             receipts=receipts,
-            ocr_applied=True
+            ocr_applied=True  # ✅ ini penting untuk "FINALIZE" step
         )
         return True
 
@@ -1131,13 +1135,15 @@ async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to
             return False
 
         if not state.get("ocr_applied", False):
-            return False
+            return False  # hanya boleh finalize lepas OCR dah keluar
 
+        # ✅ Ambil info album daripada state (bukan copy_message msg_ids)
         product_file_id = state.get("product_file_id")
         caption = state.get("caption", "")
         receipts = list(state.get("receipts", []))
         group_msg_ids = list(state.get("msg_ids", []))
 
+    # ✅ Hantar ke channel dalam bentuk album (media group)
     ok = await _send_album_to_channel(
         client=client,
         channel_id=OFFICIAL_CHANNEL_ID,
@@ -1145,9 +1151,11 @@ async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to
         caption=caption,
         receipts=receipts
     )
+
     if not ok:
         return False
 
+    # Lepas berjaya hantar album ke channel, padam semua dari group + clear state
     async with _state_lock:
         _cleanup_states()
         state = ORDER_STATES.get(state_id)
@@ -1165,71 +1173,38 @@ async def _finalize_to_channel_and_delete(client: Client, chat_id: int, reply_to
 
 
 # =========================================================
-# ✅ NEW: CLEAN TEXT DALAM GROUP (PADAM SERTA-MERTA)
-# - Semua text user dalam group akan dipadam.
-# - HANYA reply "123" pada post/album yang VALID + ada resit + user allow -> akan trigger OCR/FINALIZE.
+# ✅ TEXT TRIGGER: 123 (OCR atau FINALIZE)
 # =========================================================
-def _is_group_chat(message) -> bool:
-    try:
-        return bool(message.chat and message.chat.type in ["group", "supergroup"])
-    except:
-        return False
-
-@bot.on_message(filters.group & filters.text & ~filters.bot)
-async def handle_group_text_clean_and_trigger(client: Client, message):
-    """
-    RULES (group sahaja):
-    1) Text bukan reply -> delete terus.
-    2) Text reply tapi tiada state/order -> delete terus.
-    3) Text reply ada state tapi:
-       - jika bukan password betul -> delete terus.
-       - jika password betul tapi resit belum ada -> delete terus (no action).
-    4) Password betul + resit ada + user allow:
-       - kalau ocr_applied False -> OCR repost
-       - kalau ocr_applied True  -> FINALIZE (hantar album ke channel + delete group)
-    """
-    if not _is_group_chat(message):
+@bot.on_message(filters.text & ~filters.bot)
+async def handle_text_trigger(client: Client, message):
+    if not is_reply_to_any_message(message):
         return
 
     txt = (message.text or "").strip()
+    if txt != OCR_TRIGGER_CODE:
+        return
 
-    # 1) Bukan reply? delete serta-merta
-    if not is_reply_to_any_message(message):
-        await _delete_message_safe(message)
+    # padam mesej "123" supaya clean
+    await _delete_message_safe(message)
+
+    # ✅ hanya user allow boleh buat trigger ini (OCR & FINALIZE)
+    if not is_allowed_user(message):
         return
 
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
 
-    # Cari state/order berdasarkan reply target
+    # Tentukan mode:
+    # - kalau state belum OCR -> buat OCR repost
+    # - kalau state dah OCR -> buat FINALIZE (album ke channel + padam semua)
     async with _state_lock:
         _cleanup_states()
         sid = _get_state_id_from_reply(chat_id, reply_to_id)
         st = ORDER_STATES.get(sid)
 
-    # 2) Reply tapi bukan reply pada post/album order -> delete serta-merta
     if not st:
-        await _delete_message_safe(message)
         return
 
-    # 3) Reply pada order, tapi password salah / text lain -> delete serta-merta
-    if txt != OCR_TRIGGER_CODE:
-        await _delete_message_safe(message)
-        return
-
-    # Password betul -> delete dulu supaya "serta-merta" bersih
-    await _delete_message_safe(message)
-
-    # ✅ hanya user allow boleh trigger (OCR & FINALIZE)
-    if not is_allowed_user(message):
-        return
-
-    # ✅ mesti ada sekurang-kurangnya 1 resit dulu
-    receipts = list(st.get("receipts", []) or [])
-    if not receipts:
-        return
-
-    # Mode:
     if st.get("ocr_applied", False):
         await _finalize_to_channel_and_delete(client, chat_id, reply_to_id)
     else:
@@ -1284,3 +1259,4 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
+
