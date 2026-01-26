@@ -9,6 +9,11 @@
 #    - Kalau OCR belum dibuat -> OCR + repost album
 #    - Kalau OCR sudah dibuat -> FINALIZE: hantar album ke channel + padam semua dalam group
 #
+# ✅ PERUBAHAN PENTING (YANG ANDA MINTA):
+# - Selepas OCR berjaya dipaparkan (ocr_applied=True),
+#   jika user cuba tambah gambar resit baru (reply photo),
+#   bot akan PADAM serta-merta & gambar itu TIDAK DIKIRA / TIDAK MERGE / TIDAK ALBUM.
+#
 # ⚠️ BOT MESTI ADMIN group/supergroup + permission Delete messages
 # =========================
 
@@ -200,7 +205,7 @@ def bold(text: str) -> str:
 ALT_BOLD_MAP = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
-    "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
+    "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
     "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"
 )
 def bold2(text: str) -> str:
@@ -829,6 +834,21 @@ async def handle_receipt_photo(client: Client, message):
     chat_id = message.chat.id
     reply_to_id = message.reply_to_message.id
 
+    # =========================================================
+    # ✅ PERUBAHAN PENTING:
+    # Jika OCR sudah dibuat untuk order ini, apa-apa resit baru yang reply
+    # akan dipadam serta-merta dan TIDAK DIKIRA / TIDAK MERGE.
+    # =========================================================
+    async with _state_lock:
+        _cleanup_states()
+        sid = _get_state_id_from_reply(chat_id, reply_to_id)
+        st = ORDER_STATES.get(sid)
+
+    if st and st.get("ocr_applied", False):
+        # padam terus (termasuk kalau dia hantar album/media_group)
+        await _delete_message_safe(message)
+        return
+
     if message.media_group_id:
         key = (chat_id, str(message.media_group_id), reply_to_id)
         async with _pending_lock:
@@ -1055,4 +1075,3 @@ async def handle_photo(client, message):
 
 if __name__ == "__main__":
     bot.run()
-
