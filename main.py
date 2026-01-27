@@ -1014,23 +1014,23 @@ async def group_text_cleaner_and_trigger(client: Client, message):
         return
 
     # password betul -> tetap padam text tersebut dulu (clean)
+        # password betul -> padam text tersebut dulu (clean)
     await _delete_message_safe(message)
-
-    # hanya user allow
-    if not is_allowed_user(message):
-        return
 
     # mesti ada sekurang-kurangnya 1 resit
     receipts = list(st.get("receipts", []) or [])
     if not receipts:
         return
 
-    # mode: OCR dulu, kemudian finalize
+    # ✅ MODE:
+    # - Kalau OCR belum dibuat: semua orang boleh apply OCR
+    # - Kalau OCR sudah dibuat: hanya user allow boleh finalize ke channel
     if st.get("ocr_applied", False):
+        if not is_allowed_user(message):
+            return
         await _finalize_to_channel_and_delete(client, chat_id, reply_to_id)
     else:
         await _apply_ocr_and_repost_album(client, chat_id, reply_to_id)
-
 
 # ================= PHOTO HANDLER =================
 @bot.on_message(filters.photo & ~filters.bot)
